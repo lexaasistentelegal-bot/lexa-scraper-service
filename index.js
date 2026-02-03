@@ -1,10 +1,11 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.9.0 - MODULAR
+ * LEXA SCRAPER SERVICE v4.9.1 - FIX CASILLAS
  * ============================================================
  * 
  * ARCHIVO MODIFICABLE - Contiene:
  *   - analizarResultadoLogin (FIX v4.9.0)
+ *   - navegarACasillas (FIX v4.9.1)
  *   - Navegación SINOE post-login
  *   - Endpoints HTTP
  *   - Servidor Express
@@ -12,9 +13,13 @@
  * Las funciones base están en core.js (NO TOCAR)
  * ============================================================
  * 
+ * CAMBIOS v4.9.1:
+ *   ✓ FIX: navegarACasillas ya no aborta si textoExiste=false
+ *   ✓ NUEVA estrategia: busca span.txtredbtn con "Casillas"
+ *   ✓ Mejor detección del enlace padre desde el span
+ * 
  * CAMBIOS v4.9.0:
  *   ✓ FIX: analizarResultadoLogin ya no confunde login.xhtml
- *     con login exitoso
  *   ✓ Código dividido en módulos para fácil mantenimiento
  * ============================================================
  */
@@ -166,7 +171,7 @@ function analizarResultadoLogin(url, contenido, urlAntes) {
 async function navegarACasillas(page, requestId) {
   log('info', `CASILLAS:${requestId}`, 'Iniciando navegación a Casillas Electrónicas...');
   
-  // PASO 1: DIAGNÓSTICO
+  // PASO 1: DIAGNÓSTICO (solo informativo, NO aborta)
   let diagnostico = null;
   
   try {
@@ -177,7 +182,8 @@ async function navegarACasillas(page, requestId) {
         enlacesCommandlink: document.querySelectorAll('a.ui-commandlink').length,
         enlacesConOnclick: document.querySelectorAll('a[onclick]').length,
         enlacesFrmNuevo: document.querySelectorAll('a[id*="frmNuevo"]').length,
-        divsBtnservicios: document.querySelectorAll('.btnservicios').length,
+        divsBtnservicios: document.querySelectorAll('.btnservicios, .bggradient').length,
+        spansTxtredbtn: document.querySelectorAll('span.txtredbtn').length,
         textoExiste: document.body.innerText.toLowerCase().includes('casillas electr'),
         extractoBody: (document.body.innerText || '').substring(0, 200).replace(/\s+/g, ' ')
       };
@@ -186,80 +192,84 @@ async function navegarACasillas(page, requestId) {
     log('error', `CASILLAS:${requestId}`, `Error en diagnóstico: ${error.message}`);
   }
   
-  if (!diagnostico) {
-    log('error', `CASILLAS:${requestId}`, 'No se pudo leer la página (evaluarSeguro retornó null)');
-    return false;
+  if (diagnostico) {
+    log('info', `CASILLAS:${requestId}`, 'Diagnóstico:', diagnostico);
   }
   
-  log('info', `CASILLAS:${requestId}`, 'Diagnóstico:', diagnostico);
-  
-  if (!diagnostico.textoExiste) {
-    log('error', `CASILLAS:${requestId}`, 'El texto "Casillas Electrónicas" no existe en la página');
-    log('info', `CASILLAS:${requestId}`, `Extracto: ${diagnostico.extractoBody || 'vacío'}`);
-    return false;
+  // FIX v4.9.1: NO abortar si textoExiste es false
+  // Intentar hacer clic de todas formas - el DOM puede tener el elemento
+  if (diagnostico && !diagnostico.textoExiste) {
+    log('warn', `CASILLAS:${requestId}`, 'Texto "Casillas Electrónicas" no detectado, intentando de todas formas...');
   }
   
-  // PASO 2: HACER CLIC EN EL ENLACE CORRECTO
+  // PASO 2: HACER CLIC EN EL ENLACE CORRECTO (6 estrategias)
   const resultado = await evaluarSeguro(page, () => {
-    // ESTRATEGIA 1: ID exacto
+    // ESTRATEGIA 1: ID exacto (el más confiable)
     const enlaceDirecto = document.querySelector('#frmNuevo\\:j_idt38');
     if (enlaceDirecto) {
       enlaceDirecto.click();
       return { exito: true, metodo: 'id_exacto', id: 'frmNuevo:j_idt38' };
     }
     
-    // ESTRATEGIA 2: Enlaces commandlink con contexto
+    // ESTRATEGIA 2: Buscar span.txtredbtn con texto "Casillas" y subir al enlace padre
+    const spansTxtredbtn = document.querySelectorAll('span.txtredbtn');
+    for (const span of spansTxtredbtn) {
+      const textoSpan = (span.innerText || '').toLowerCase();
+      if (textoSpan.includes('casillas')) {
+        // Subir hasta encontrar el enlace <a>
+        let elemento = span.parentElement;
+        let niveles = 0;
+        while (elemento && niveles < 5) {
+          if (elemento.tagName === 'A') {
+            elemento.click();
+            return { exito: true, metodo: 'span_txtredbtn', id: elemento.id || 'sin_id' };
+          }
+          elemento = elemento.parentElement;
+          niveles++;
+        }
+      }
+    }
+    
+    // ESTRATEGIA 3: Enlaces commandlink con contexto
     const enlacesCommandlink = document.querySelectorAll('a.ui-commandlink');
     for (const enlace of enlacesCommandlink) {
-      const padre = enlace.parentElement;
-      if (!padre) continue;
-      const textoPadre = (padre.innerText || '').toLowerCase();
-      
-      if (textoPadre.includes('casillas') && 
-          textoPadre.includes('electr') && 
-          !textoPadre.includes('mesa de partes')) {
+      const textoEnlace = (enlace.innerText || '').toLowerCase();
+      if (textoEnlace.includes('casillas') && !textoEnlace.includes('mesa de partes')) {
         enlace.click();
-        return { exito: true, metodo: 'commandlink_contexto', id: enlace.id || 'sin_id' };
+        return { exito: true, metodo: 'commandlink_texto', id: enlace.id || 'sin_id' };
       }
     }
     
-    // ESTRATEGIA 3: Enlaces con onclick submit
+    // ESTRATEGIA 4: Enlaces con onclick submit
     const enlacesSubmit = document.querySelectorAll('a[onclick*="submit"]');
     for (const enlace of enlacesSubmit) {
-      const padre = enlace.parentElement;
-      if (!padre) continue;
-      const textoPadre = (padre.innerText || '').toLowerCase();
-      
-      if (textoPadre.includes('casillas')) {
+      const textoEnlace = (enlace.innerText || '').toLowerCase();
+      if (textoEnlace.includes('casillas')) {
         enlace.click();
-        return { exito: true, metodo: 'submit_contexto', id: enlace.id || 'sin_id' };
+        return { exito: true, metodo: 'submit_texto', id: enlace.id || 'sin_id' };
       }
     }
     
-    // ESTRATEGIA 4: Div btnservicios con hermano enlace
+    // ESTRATEGIA 5: Div btnservicios/bggradient que contenga "casillas"
     const divsBtnservicios = document.querySelectorAll('.btnservicios, .bggradient');
     for (const div of divsBtnservicios) {
       const textoDiv = (div.innerText || '').toLowerCase();
-      
-      if (textoDiv.includes('casillas') && textoDiv.includes('electr')) {
-        const hermanoAnterior = div.previousElementSibling;
-        if (hermanoAnterior && hermanoAnterior.tagName === 'A') {
-          hermanoAnterior.click();
-          return { exito: true, metodo: 'hermano_anterior', id: hermanoAnterior.id || 'sin_id' };
-        }
-        
-        const padre = div.parentElement;
-        if (padre) {
-          const enlacePadre = padre.querySelector('a[onclick]');
-          if (enlacePadre) {
-            enlacePadre.click();
-            return { exito: true, metodo: 'enlace_en_padre', id: enlacePadre.id || 'sin_id' };
+      if (textoDiv.includes('casillas')) {
+        // El div está DENTRO del enlace, buscar el enlace padre
+        let elemento = div.parentElement;
+        let niveles = 0;
+        while (elemento && niveles < 3) {
+          if (elemento.tagName === 'A') {
+            elemento.click();
+            return { exito: true, metodo: 'div_btnservicios', id: elemento.id || 'sin_id' };
           }
+          elemento = elemento.parentElement;
+          niveles++;
         }
       }
     }
     
-    // ESTRATEGIA 5: Primer enlace frmNuevo
+    // ESTRATEGIA 6: Primer enlace frmNuevo con onclick (último recurso)
     const primerEnlace = document.querySelector('a[id*="frmNuevo"][onclick]');
     if (primerEnlace) {
       primerEnlace.click();
@@ -272,7 +282,9 @@ async function navegarACasillas(page, requestId) {
       debug: {
         commandlink: document.querySelectorAll('a.ui-commandlink').length,
         submit: document.querySelectorAll('a[onclick*="submit"]').length,
-        btnservicios: document.querySelectorAll('.btnservicios').length
+        btnservicios: document.querySelectorAll('.btnservicios, .bggradient').length,
+        txtredbtn: document.querySelectorAll('span.txtredbtn').length,
+        frmNuevo: document.querySelectorAll('a[id*="frmNuevo"]').length
       }
     };
   });
@@ -1015,7 +1027,7 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.9.0',
+    version: '4.9.1',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
@@ -1301,22 +1313,26 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║              LEXA SCRAPER SERVICE v4.9.0 - MODULAR                            ║
+║              LEXA SCRAPER SERVICE v4.9.1 - FIX CASILLAS                       ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${String(PORT).padEnd(70)}║
 ║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
 ║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
 ║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  CAMBIOS v4.9.0:                                                              ║
+║  CAMBIOS v4.9.1:                                                              ║
 ║                                                                               ║
-║    ✓ FIX: analizarResultadoLogin ya no confunde login.xhtml                   ║
-║    ✓ Código dividido: core.js (estable) + index.js (modificable)              ║
-║    ✓ Mejor detección de login fallido vs exitoso                              ║
+║    ✓ FIX: navegarACasillas ya no aborta si textoExiste=false                  ║
+║    ✓ NUEVA estrategia: busca span.txtredbtn con "Casillas"                    ║
+║    ✓ Mejor detección del enlace padre desde el span                           ║
 ║                                                                               ║
-║  ESTRUCTURA:                                                                  ║
-║    core.js  → Funciones base (NO MODIFICAR)                                   ║
-║    index.js → Lógica de negocio (MODIFICABLE)                                 ║
+║  ESTRATEGIAS DE BÚSQUEDA (6):                                                 ║
+║    1. ID exacto: #frmNuevo:j_idt38                                            ║
+║    2. span.txtredbtn → enlace padre (NUEVO)                                   ║
+║    3. a.ui-commandlink con texto "casillas"                                   ║
+║    4. a[onclick*="submit"] con texto "casillas"                               ║
+║    5. div.btnservicios → enlace padre                                         ║
+║    6. Primer enlace frmNuevo (último recurso)                                 ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                                   ║
 ║    GET  /health    POST /scraper    GET  /metricas    GET /sesiones           ║
