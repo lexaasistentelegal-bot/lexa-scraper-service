@@ -1,11 +1,12 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.9.3 - FIX FALSO POSITIVO LOGIN
+ * LEXA SCRAPER SERVICE v4.9.4 - FIX TIMING POST-LOGIN
  * ============================================================
  * 
  * ARCHIVO MODIFICABLE - Contiene:
- *   - analizarResultadoLogin (FIX v4.9.3) ← CAMBIO PRINCIPAL
- *   - verificarEstadoPagina (NUEVA función auxiliar)
+ *   - analizarResultadoLogin (FIX v4.9.3)
+ *   - verificarEstadoPagina (v4.9.3)
+ *   - Timing post-login con reintentos (FIX v4.9.4) ← NUEVO
  *   - navegarACasillas (FIX v4.9.2)
  *   - Navegación SINOE post-login
  *   - Endpoints HTTP
@@ -14,6 +15,12 @@
  * Las funciones base están en core.js (NO TOCAR)
  * ============================================================
  * 
+ * CAMBIOS v4.9.4:
+ *   ✓ FIX: Espera waitForNavigation después de clic en login
+ *   ✓ FIX: Reintentos de verificación (5x, 3s entre cada uno)
+ *   ✓ Solo declara login_fallido después de agotar reintentos
+ *   ✓ Logs detallados de cada intento de verificación
+ *
  * CAMBIOS v4.9.3:
  *   ✓ FIX CRÍTICO: analizarResultadoLogin ya no usa page.content()
  *   ✓ NUEVA ESTRATEGIA: Verifica elementos DOM específicos del dashboard
@@ -1028,28 +1035,71 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       await page.keyboard.press('Enter');
     }
     
-    // PASO 13: Esperar y leer página
-    log('info', `SCRAPER:${requestId}`, 'Esperando resultado...');
+    // PASO 13: Esperar navegación después del login
+    log('info', `SCRAPER:${requestId}`, 'Esperando que SINOE procese el login...');
     
-    // Esperar a que la página se estabilice
-    await delay(TIMEOUT.esperaPostClick);
+    // ═══════════════════════════════════════════════════════════════════
+    // FIX v4.9.4: Esperar navegación correctamente
+    // ═══════════════════════════════════════════════════════════════════
+    // 
+    // PROBLEMA v4.9.3: Solo esperábamos con delay(), pero SINOE puede
+    // tardar más en procesar. Verificábamos cuando aún estaban los
+    // campos de login → "login fallido" (FALSO NEGATIVO).
+    //
+    // SOLUCIÓN: Esperar a que la navegación termine O que cambien los
+    // elementos de la página, con múltiples reintentos.
+    // ═══════════════════════════════════════════════════════════════════
+    
+    // Estrategia 1: Intentar esperar navegación (puede fallar si no hay navegación)
+    try {
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }),
+        delay(20000) // Timeout de seguridad
+      ]);
+      log('info', `SCRAPER:${requestId}`, 'Navegación completada');
+    } catch (navError) {
+      log('info', `SCRAPER:${requestId}`, 'Timeout de navegación - continuando con verificación');
+    }
+    
+    // Esperar un poco más para que JS termine de renderizar
+    await delay(3000);
     
     // Cerrar popups que puedan aparecer
     await cerrarPopups(page, `SCRAPER:${requestId}`);
-    await delay(500);
+    await delay(1000);
     
     // ═══════════════════════════════════════════════════════════════════
-    // FIX v4.9.3: Usar la nueva función analizarResultadoLogin
+    // Verificar resultado con REINTENTOS
     // ═══════════════════════════════════════════════════════════════════
     
-    let resultado = await analizarResultadoLogin(page, urlAntes, requestId);
+    let resultado = null;
+    const MAX_REINTENTOS_VERIFICACION = 5;
+    const ESPERA_ENTRE_REINTENTOS = 3000; // 3 segundos
     
-    // Si es indeterminado, dar un poco más de tiempo y reintentar
-    if (resultado.tipo === 'indeterminado') {
-      log('info', `SCRAPER:${requestId}`, 'Resultado indeterminado, esperando 3s adicionales...');
-      await delay(3000);
-      await cerrarPopups(page, `SCRAPER:${requestId}`);
+    for (let intento = 1; intento <= MAX_REINTENTOS_VERIFICACION; intento++) {
       resultado = await analizarResultadoLogin(page, urlAntes, requestId);
+      
+      log('info', `SCRAPER:${requestId}`, `Verificación ${intento}/${MAX_REINTENTOS_VERIFICACION}:`, {
+        tipo: resultado.tipo,
+        tienePassword: resultado.detalles?.login?.tieneCampoPassword,
+        tieneDashboard: resultado.detalles?.dashboard?.tieneFormDashboard
+      });
+      
+      // Si es éxito o error definitivo, salir del loop
+      if (resultado.tipo === 'login_exitoso' || 
+          resultado.tipo === 'captcha_incorrecto' ||
+          resultado.tipo === 'credenciales_invalidas' ||
+          resultado.tipo === 'sesion_activa') {
+        break;
+      }
+      
+      // Si es login_fallido o indeterminado, podría ser que la página aún no cargó
+      // Dar más tiempo solo si aún hay intentos
+      if (intento < MAX_REINTENTOS_VERIFICACION) {
+        log('info', `SCRAPER:${requestId}`, `Esperando ${ESPERA_ENTRE_REINTENTOS/1000}s antes de reintentar...`);
+        await delay(ESPERA_ENTRE_REINTENTOS);
+        await cerrarPopups(page, `SCRAPER:${requestId}`);
+      }
     }
     
     log('info', `SCRAPER:${requestId}`, 'Resultado del análisis:', { 
@@ -1319,7 +1369,7 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.9.3',
+    version: '4.9.4',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
@@ -1459,7 +1509,7 @@ app.post('/test-whatsapp', async (req, res) => {
   const validacion = validarNumeroWhatsApp(numero);
   if (!validacion.valido) return res.status(400).json({ success: false, error: validacion.error });
   
-  const enviado = await enviarWhatsAppTexto(validacion.numero, mensaje || '🧪 Test LEXA Scraper v4.9.3');
+  const enviado = await enviarWhatsAppTexto(validacion.numero, mensaje || '🧪 Test LEXA Scraper v4.9.4');
   res.json({ success: enviado });
 });
 
@@ -1643,21 +1693,24 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.9.3 - FIX FALSO POSITIVO LOGIN              ║
+║           LEXA SCRAPER SERVICE v4.9.4 - FIX TIMING POST-LOGIN                 ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${String(PORT).padEnd(70)}║
 ║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
 ║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
 ║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  FIX v4.9.3 - CAMBIO CRÍTICO:                                                 ║
+║  FIX v4.9.4 - TIMING POST-LOGIN:                                              ║
 ║                                                                               ║
-║    ✓ analizarResultadoLogin() REESCRITO completamente                         ║
-║    ✓ Ya NO usa page.content() (causaba falsos positivos)                      ║
-║    ✓ Ahora verifica elementos DOM específicos del dashboard                   ║
+║    ✓ Espera waitForNavigation después del clic en login                       ║
+║    ✓ Reintentos de verificación (5x con 3s entre cada uno)                    ║
+║    ✓ Solo declara "login_fallido" después de agotar reintentos                ║
+║                                                                               ║
+║  FIX v4.9.3 - VERIFICACIÓN DE LOGIN:                                          ║
+║                                                                               ║
+║    ✓ analizarResultadoLogin() usa DOM, no page.content()                      ║
 ║    ✓ Verifica PRESENCIA de: form#frmNuevo, barra Bienvenido, botones          ║
 ║    ✓ Verifica AUSENCIA de: input[type="password"], campo CAPTCHA              ║
-║    ✓ Consistente con navegarACasillas() (ambos usan evaluarSeguro)            ║
 ║                                                                               ║
 ║  ESTRATEGIAS DE BÚSQUEDA CASILLAS (6):                                        ║
 ║    1. ID exacto: #frmNuevo:j_idt38                                            ║
@@ -1671,7 +1724,7 @@ app.listen(PORT, () => {
 ║    GET  /health              POST /scraper           GET  /metricas           ║
 ║    GET  /sesiones            POST /webhook/whatsapp  POST /test-whatsapp      ║
 ║    POST /test-conexion       POST /test-credenciales POST /test-captcha       ║
-║    POST /test-verificar-estado (NUEVO - para diagnóstico)                     ║
+║    POST /test-verificar-estado                                                ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
   `);
   
