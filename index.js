@@ -1,13 +1,15 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.1.1 - Sistema Screenshot CAPTCHA
+ * LEXA SCRAPER SERVICE v4.2.0 - Sistema Screenshot CAPTCHA
  * ============================================================
  * Versión: AAA (Producción)
  * Fecha: Febrero 2026
  * 
- * CORRECCIÓN v4.1.1:
- * - Formato de imagen corregido para Evolution API
- * - API Key actualizada
+ * CORRECCIONES v4.2.0:
+ * - Manejo del popup "Aceptar" de SINOE
+ * - Captura precisa de la imagen del CAPTCHA
+ * - Mejor detección de selectores
+ * - Esperas más robustas
  * ============================================================
  */
 
@@ -32,13 +34,23 @@ const SINOE_URLS = {
   bandeja: 'sso-menu-app.xhtml'
 };
 
-// Selectores CSS
+// Selectores CSS actualizados para SINOE V.2.2.2
 const SELECTORES = {
+  // Campos de login
   usuario: 'input[placeholder="Usuario"]',
   password: 'input[placeholder="Contraseña"]',
-  captcha: 'input[placeholder="Ingrese Captcha"], #frmLogin\\:captcha',
-  captchaImg: 'img[id*="captcha"], img[src*="captcha"]',
-  btnIngresar: '#frmLogin\\:btnIngresar, button[type="submit"]',
+  
+  // CAPTCHA - múltiples selectores para mayor robustez
+  captchaInput: 'input[placeholder="INGRESE CAPTCHA"], input[placeholder="Ingrese Captcha"], input[id*="captcha"]',
+  captchaImg: 'img[id*="captcha"], img[src*="captcha"], img[src*="Captcha"]',
+  
+  // Botones
+  btnIngresar: 'button[type="submit"], input[type="submit"], .ui-button, button:contains("Ingresar")',
+  
+  // Popup de aceptar términos
+  popupAceptar: 'button:contains("Aceptar"), .ui-button:contains("Aceptar"), button.ui-button, .ui-dialog-buttonset button',
+  
+  // Tabla de notificaciones
   tablaNotificaciones: 'table tbody tr, .ui-datatable-data tr'
 };
 
@@ -47,8 +59,8 @@ const TIMEOUT = {
   navegacion: 60000,
   captcha: 300000,
   api: 30000,
-  modal: 15000,
-  descarga: 120000
+  popup: 5000,
+  elemento: 10000
 };
 
 // Configuración externa
@@ -276,8 +288,6 @@ async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) 
     try {
       const url = `${CONFIG.evolution.url}/message/sendMedia/${CONFIG.evolution.instance}`;
       
-      // Evolution API v2.x requiere el base64 SIN el prefijo data:image
-      // y necesita el campo fileName
       const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -295,7 +305,7 @@ async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) 
       });
 
       if (response.ok) {
-        log('success', 'WHATSAPP', 'Imagen enviada', { numero: enmascarar(numero) });
+        log('success', 'WHATSAPP', 'Imagen enviada', { numero: enmascarar(numero), size: base64Image.length });
         return true;
       }
       
@@ -316,60 +326,229 @@ async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) 
 // FUNCIONES DE SCRAPING
 // ============================================================
 
-async function llenarCampo(page, selector, valor) {
-  const campo = await page.$(selector);
-  if (!campo) throw new Error(`Campo no encontrado: ${selector}`);
+/**
+ * Cierra popups de SINOE (términos, avisos, etc.)
+ */
+async function cerrarPopups(page) {
+  log('info', 'POPUP', 'Buscando popups para cerrar...');
   
+  try {
+    // Esperar un momento para que aparezcan los popups
+    await delay(2000);
+    
+    // Buscar botones de "Aceptar" en diferentes formatos
+    const selectoresPopup = [
+      'button.ui-button',
+      '.ui-dialog-buttonset button',
+      'button:has-text("Aceptar")',
+      '.ui-button-text:has-text("Aceptar")',
+      '[aria-label="Aceptar"]',
+      'button[type="button"]'
+    ];
+    
+    for (const selector of selectoresPopup) {
+      try {
+        const botones = await page.$$(selector);
+        
+        for (const boton of botones) {
+          const texto = await boton.evaluate(el => el.textContent?.trim().toLowerCase() || '');
+          const visible = await boton.isIntersectingViewport();
+          
+          if (visible && (texto.includes('aceptar') || texto.includes('acepto') || texto.includes('ok') || texto.includes('cerrar'))) {
+            log('info', 'POPUP', `Cerrando popup con botón: "${texto}"`);
+            await boton.click();
+            await delay(1000);
+          }
+        }
+      } catch (e) {
+        // Ignorar errores de selector
+      }
+    }
+    
+    // También intentar presionar Escape por si hay modales
+    await page.keyboard.press('Escape').catch(() => {});
+    await delay(500);
+    
+    log('success', 'POPUP', 'Búsqueda de popups completada');
+    
+  } catch (error) {
+    log('warn', 'POPUP', `Error buscando popups: ${error.message}`);
+  }
+}
+
+/**
+ * Limpia y llena un campo de texto
+ */
+async function llenarCampo(page, selector, valor) {
+  // Intentar múltiples selectores
+  const selectores = selector.split(', ');
+  let campo = null;
+  
+  for (const sel of selectores) {
+    campo = await page.$(sel.trim());
+    if (campo) break;
+  }
+  
+  if (!campo) {
+    throw new Error(`Campo no encontrado con selectores: ${selector}`);
+  }
+  
+  // Hacer scroll al elemento para asegurar que está visible
+  await campo.scrollIntoView();
+  await delay(200);
+  
+  // Limpiar y escribir
   await campo.click({ clickCount: 3 });
   await delay(100);
   await page.keyboard.press('Backspace');
   await delay(100);
   await campo.type(valor, { delay: 50 });
+  
+  return campo;
 }
 
+/**
+ * Captura screenshot SOLO de la imagen del CAPTCHA
+ */
 async function capturarCaptcha(page) {
-  await page.waitForSelector(SELECTORES.captchaImg, { timeout: 10000 })
-    .catch(() => {});
+  log('info', 'CAPTCHA', 'Buscando imagen del CAPTCHA...');
   
-  await delay(1000);
+  // Esperar a que la página esté completamente cargada
+  await delay(2000);
   
-  const captchaImg = await page.$(SELECTORES.captchaImg);
+  // Selectores específicos para la imagen del CAPTCHA de SINOE
+  const selectoresCaptcha = [
+    'img[src*="captcha"]',
+    'img[src*="Captcha"]',
+    'img[id*="captcha"]',
+    'img[id*="Captcha"]',
+    '.captcha-image',
+    'img[alt*="captcha"]'
+  ];
+  
+  let captchaImg = null;
+  
+  for (const selector of selectoresCaptcha) {
+    try {
+      captchaImg = await page.$(selector);
+      if (captchaImg) {
+        const box = await captchaImg.boundingBox();
+        if (box && box.width > 50 && box.height > 20) {
+          log('info', 'CAPTCHA', `Imagen encontrada con selector: ${selector}`, { width: box.width, height: box.height });
+          break;
+        }
+      }
+    } catch (e) {
+      // Continuar con el siguiente selector
+    }
+  }
   
   if (captchaImg) {
-    const box = await captchaImg.boundingBox();
+    // Verificar que la imagen está cargada
+    const isLoaded = await captchaImg.evaluate(img => img.complete && img.naturalHeight > 0);
     
-    if (box && box.width > 50 && box.height > 20) {
+    if (isLoaded) {
       const screenshot = await captchaImg.screenshot({ encoding: 'base64' });
       
       if (screenshot && screenshot.length > 500) {
-        log('success', 'CAPTCHA', 'Screenshot capturado', { size: screenshot.length });
+        log('success', 'CAPTCHA', 'Screenshot de imagen capturado', { bytes: screenshot.length });
+        return screenshot;
+      }
+    } else {
+      log('warn', 'CAPTCHA', 'Imagen encontrada pero no cargada, esperando...');
+      await delay(2000);
+      
+      const screenshot = await captchaImg.screenshot({ encoding: 'base64' });
+      if (screenshot && screenshot.length > 500) {
         return screenshot;
       }
     }
   }
   
-  // Fallback: screenshot del área del formulario
-  log('warn', 'CAPTCHA', 'Usando fallback - captura de área');
+  // Fallback: buscar por evaluación del DOM
+  log('warn', 'CAPTCHA', 'Buscando CAPTCHA por evaluación del DOM...');
   
-  const form = await page.$('form, .login-form, .ui-panel');
-  if (form) {
-    const formBox = await form.boundingBox();
-    if (formBox) {
-      return await page.screenshot({ 
-        encoding: 'base64',
-        clip: {
-          x: formBox.x,
-          y: formBox.y + formBox.height * 0.4,
-          width: formBox.width,
-          height: formBox.height * 0.4
+  const captchaData = await page.evaluate(() => {
+    // Buscar todas las imágenes
+    const imagenes = document.querySelectorAll('img');
+    
+    for (const img of imagenes) {
+      const src = img.src?.toLowerCase() || '';
+      const id = img.id?.toLowerCase() || '';
+      const alt = img.alt?.toLowerCase() || '';
+      
+      if (src.includes('captcha') || id.includes('captcha') || alt.includes('captcha')) {
+        const rect = img.getBoundingClientRect();
+        if (rect.width > 50 && rect.height > 20) {
+          return {
+            found: true,
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height
+          };
         }
-      });
+      }
+    }
+    
+    return { found: false };
+  });
+  
+  if (captchaData.found) {
+    log('info', 'CAPTCHA', 'Capturando área específica', captchaData);
+    
+    const screenshot = await page.screenshot({
+      encoding: 'base64',
+      clip: {
+        x: Math.max(0, captchaData.x - 5),
+        y: Math.max(0, captchaData.y - 5),
+        width: captchaData.width + 10,
+        height: captchaData.height + 10
+      }
+    });
+    
+    if (screenshot && screenshot.length > 500) {
+      return screenshot;
     }
   }
   
+  // Último fallback: capturar el área del formulario de login
+  log('warn', 'CAPTCHA', 'Usando fallback - área del formulario');
+  
+  const formArea = await page.evaluate(() => {
+    // Buscar el contenedor del formulario
+    const form = document.querySelector('form') || document.querySelector('.login-container') || document.querySelector('.ui-panel');
+    
+    if (form) {
+      const rect = form.getBoundingClientRect();
+      return {
+        x: rect.x,
+        y: rect.y + rect.height * 0.4, // Parte inferior donde suele estar el CAPTCHA
+        width: rect.width,
+        height: rect.height * 0.3
+      };
+    }
+    
+    return null;
+  });
+  
+  if (formArea) {
+    const screenshot = await page.screenshot({
+      encoding: 'base64',
+      clip: formArea
+    });
+    
+    return screenshot;
+  }
+  
+  // Si todo falla, screenshot completo
+  log('error', 'CAPTCHA', 'No se encontró el CAPTCHA, capturando pantalla completa');
   return await page.screenshot({ encoding: 'base64' });
 }
 
+/**
+ * Busca el link correcto a Casillas/SINOE
+ */
 async function buscarLinkCasillas(page) {
   const links = await page.$$('a');
   
@@ -388,6 +567,9 @@ async function buscarLinkCasillas(page) {
   return null;
 }
 
+/**
+ * Extrae las notificaciones de la tabla de SINOE
+ */
 async function extraerNotificaciones(page) {
   await page.waitForSelector('table, .ui-datatable', { timeout: TIMEOUT.navegacion })
     .catch(() => {});
@@ -433,7 +615,9 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
   try {
     metricas.scrapersIniciados++;
     
+    // ========================================
     // PASO 1: Conectar a Browserless
+    // ========================================
     log('info', `SCRAPER:${requestId}`, 'Conectando a Browserless...');
     
     const wsEndpoint = CONFIG.browserless.token 
@@ -442,50 +626,81 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     
     browser = await puppeteer.connect({
       browserWSEndpoint: wsEndpoint,
-      defaultViewport: { width: 1280, height: 800 }
+      defaultViewport: { width: 1366, height: 768 }
     });
     
     page = await browser.newPage();
     page.setDefaultNavigationTimeout(TIMEOUT.navegacion);
     
+    // ========================================
     // PASO 2: Navegar a SINOE
+    // ========================================
     log('info', `SCRAPER:${requestId}`, 'Navegando a SINOE...');
     
     await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2' });
     
+    // Esperar a que la página cargue completamente
+    await delay(3000);
+    
+    // ========================================
+    // PASO 3: Cerrar popups (Aceptar términos)
+    // ========================================
+    log('info', `SCRAPER:${requestId}`, 'Verificando popups...');
+    await cerrarPopups(page);
+    
     // Manejar página de parámetros no válidos
     const contenido = await page.content();
-    if (contenido.includes('PARAMETROS DE SEGURIDAD NO VALIDOS')) {
+    if (contenido.includes('PARAMETROS DE SEGURIDAD NO VALIDOS') || contenido.includes('PARAMETROS NO VALIDOS')) {
+      log('info', `SCRAPER:${requestId}`, 'Página de parámetros detectada, navegando...');
       const buttons = await page.$$('button, a');
       for (const btn of buttons) {
         const texto = await btn.evaluate(el => el.textContent?.toUpperCase() || '');
-        if (texto.includes('INICIO')) {
+        if (texto.includes('INICIO') || texto.includes('ACEPTAR')) {
           await btn.click();
-          await page.waitForNavigation({ waitUntil: 'networkidle2' });
+          await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
+          await delay(2000);
+          await cerrarPopups(page); // Verificar popups de nuevo
           break;
         }
       }
     }
     
-    // PASO 3: Esperar campos
-    await page.waitForSelector(SELECTORES.usuario, { timeout: TIMEOUT.navegacion });
+    // ========================================
+    // PASO 4: Esperar campos de login
+    // ========================================
+    log('info', `SCRAPER:${requestId}`, 'Esperando campos de login...');
     
-    // PASO 4: Llenar credenciales
+    await page.waitForSelector(SELECTORES.usuario, { timeout: TIMEOUT.elemento });
+    
+    // ========================================
+    // PASO 5: Llenar credenciales
+    // ========================================
     log('info', `SCRAPER:${requestId}`, 'Llenando credenciales...');
-    await llenarCampo(page, SELECTORES.usuario, sinoeUsuario);
-    await delay(300);
-    await llenarCampo(page, SELECTORES.password, sinoePassword);
     
-    // PASO 5: Capturar CAPTCHA
+    await llenarCampo(page, SELECTORES.usuario, sinoeUsuario);
+    await delay(500);
+    await llenarCampo(page, SELECTORES.password, sinoePassword);
+    await delay(500);
+    
+    // ========================================
+    // PASO 6: Capturar CAPTCHA
+    // ========================================
     log('info', `SCRAPER:${requestId}`, 'Capturando CAPTCHA...');
-    await delay(1000);
+    
+    // Esperar a que el CAPTCHA cargue
+    await delay(2000);
+    
     const captchaBase64 = await capturarCaptcha(page);
     
     if (!captchaBase64 || captchaBase64.length < 500) {
       throw new Error('No se pudo capturar el CAPTCHA');
     }
     
-    // PASO 6: Enviar imagen
+    log('success', `SCRAPER:${requestId}`, 'CAPTCHA capturado', { bytes: captchaBase64.length });
+    
+    // ========================================
+    // PASO 7: Enviar imagen por WhatsApp
+    // ========================================
     log('info', `SCRAPER:${requestId}`, 'Enviando imagen por WhatsApp...');
     
     const caption = `📩 ${nombreAbogado}, escriba el código que ve en la imagen y envíelo como respuesta.\n\n⏱️ Tiene 5 minutos.\n🔒 Credenciales ya llenadas.`;
@@ -494,7 +709,9 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       throw new Error('No se pudo enviar la imagen por WhatsApp');
     }
     
-    // PASO 7: Esperar respuesta
+    // ========================================
+    // PASO 8: Esperar respuesta del abogado
+    // ========================================
     log('info', `SCRAPER:${requestId}`, 'Esperando respuesta del abogado...');
     
     const captchaTexto = await new Promise((resolve, reject) => {
@@ -518,57 +735,95 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     metricas.captchasRecibidos++;
     log('success', `SCRAPER:${requestId}`, `CAPTCHA recibido: ${captchaTexto}`);
     
-    // PASO 8: Escribir CAPTCHA y login
-    const campoCaptcha = await page.$(SELECTORES.captcha);
-    if (!campoCaptcha) throw new Error('Campo CAPTCHA no encontrado');
+    // ========================================
+    // PASO 9: Escribir CAPTCHA y hacer login
+    // ========================================
+    log('info', `SCRAPER:${requestId}`, 'Escribiendo CAPTCHA...');
+    
+    // Buscar campo del CAPTCHA
+    const selectoresCaptchaInput = SELECTORES.captchaInput.split(', ');
+    let campoCaptcha = null;
+    
+    for (const selector of selectoresCaptchaInput) {
+      campoCaptcha = await page.$(selector.trim());
+      if (campoCaptcha) break;
+    }
+    
+    if (!campoCaptcha) {
+      // Buscar por placeholder parcial
+      campoCaptcha = await page.$('input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[placeholder*="captcha"]');
+    }
+    
+    if (!campoCaptcha) {
+      throw new Error('Campo de CAPTCHA no encontrado');
+    }
     
     await campoCaptcha.click({ clickCount: 3 });
     await delay(100);
     await page.keyboard.press('Backspace');
     await delay(100);
-    await campoCaptcha.type(captchaTexto.toUpperCase(), { delay: 30 });
+    await campoCaptcha.type(captchaTexto.toUpperCase(), { delay: 50 });
     
     const urlAntes = page.url();
     
-    const btn = await page.$(SELECTORES.btnIngresar);
-    if (btn) await btn.click();
-    else await page.keyboard.press('Enter');
+    // Buscar y hacer clic en el botón de ingresar
+    const btnIngresar = await page.$('button[type="submit"], input[type="submit"], .ui-button');
+    if (btnIngresar) {
+      await btnIngresar.click();
+    } else {
+      await page.keyboard.press('Enter');
+    }
     
+    // Esperar navegación
     await page.waitForFunction(
       url => window.location.href !== url,
       { timeout: TIMEOUT.navegacion },
       urlAntes
-    );
+    ).catch(() => {});
     
     await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
+    await delay(2000);
     
-    // PASO 9: Verificar login
+    // ========================================
+    // PASO 10: Verificar resultado del login
+    // ========================================
+    log('info', `SCRAPER:${requestId}`, 'Verificando login...');
+    
     const urlActual = page.url();
     const contenidoActual = await page.content();
     
+    // Verificar errores
     if (contenidoActual.toLowerCase().includes('captcha') && 
-        contenidoActual.toLowerCase().includes('incorrecto')) {
+        (contenidoActual.toLowerCase().includes('incorrecto') || contenidoActual.toLowerCase().includes('inválido'))) {
       await enviarWhatsAppTexto(whatsappNumero, `❌ CAPTCHA incorrecto. Intente de nuevo.`);
       throw new Error('CAPTCHA incorrecto');
     }
     
-    if (urlActual.includes(SINOE_URLS.sessionActiva)) {
+    if (urlActual.includes(SINOE_URLS.sessionActiva) || contenidoActual.includes('sesión activa')) {
       await enviarWhatsAppTexto(whatsappNumero, `⚠️ Hay sesión activa. Ciérrela e intente de nuevo.`);
       throw new Error('Sesión activa');
     }
     
-    // PASO 10: Navegar a Casillas
+    log('success', `SCRAPER:${requestId}`, 'Login exitoso');
+    
+    // ========================================
+    // PASO 11: Navegar a Casillas
+    // ========================================
     const linkCasillas = await buscarLinkCasillas(page);
     if (linkCasillas) {
       await linkCasillas.click();
       await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
     }
     
-    // PASO 11: Extraer notificaciones
+    // ========================================
+    // PASO 12: Extraer notificaciones
+    // ========================================
     log('info', `SCRAPER:${requestId}`, 'Extrayendo notificaciones...');
     const notificaciones = await extraerNotificaciones(page);
     
+    // ========================================
     // ÉXITO
+    // ========================================
     const duracionMs = Date.now() - inicioMs;
     metricas.scrapersExitosos++;
     
@@ -578,7 +833,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     );
     
     await enviarWhatsAppTexto(whatsappNumero,
-      `✅ ${nombreAbogado}, acceso exitoso.\n\n📋 ${notificaciones.length} notificación(es) encontrada(s).\n\nProcesando...`
+      `✅ ${nombreAbogado}, acceso exitoso a SINOE.\n\n📋 ${notificaciones.length} notificación(es) encontrada(s).\n\nProcesando documentos...`
     );
     
     log('success', `SCRAPER:${requestId}`, 'Completado', { duracionMs, notificaciones: notificaciones.length });
@@ -622,7 +877,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'lexa-scraper-service',
-    version: '4.1.1',
+    version: '4.2.0',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
@@ -732,7 +987,7 @@ app.post('/test-whatsapp', async (req, res) => {
   const validacion = validarNumeroWhatsApp(req.body.numero);
   if (!validacion.valido) return res.status(400).json({ success: false, error: validacion.error });
   
-  const resultado = await enviarWhatsAppTexto(validacion.numero, req.body.mensaje || '🧪 Test LEXA v4.1.1');
+  const resultado = await enviarWhatsAppTexto(validacion.numero, req.body.mensaje || '🧪 Test LEXA v4.2.0');
   res.json({ success: resultado });
 });
 
@@ -784,11 +1039,15 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.1.1 (AAA)                      ║
+║           LEXA SCRAPER SERVICE v4.2.0 (AAA)                      ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${PORT}                                                     ║
 ║  Auth: ${process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️'}                                      ║
-║  Evolution: ${CONFIG.evolution.url}                ║
+╠══════════════════════════════════════════════════════════════════╣
+║  MEJORAS v4.2.0:                                                 ║
+║    - Manejo de popup "Aceptar"                                   ║
+║    - Captura precisa del CAPTCHA                                 ║
+║    - Selectores actualizados para SINOE V.2.2.2                  ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                      ║
 ║    GET  /health           POST /webhook/whatsapp                 ║
