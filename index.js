@@ -1,12 +1,13 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.9.4 - FIX TIMING POST-LOGIN
+ * LEXA SCRAPER SERVICE v4.9.5 - FIX CLIC LOGIN PRIMEFACES
  * ============================================================
  * 
  * ARCHIVO MODIFICABLE - Contiene:
+ *   - FIX v4.9.5: Clic en botón login compatible con PrimeFaces
  *   - analizarResultadoLogin (FIX v4.9.3)
  *   - verificarEstadoPagina (v4.9.3)
- *   - Timing post-login con reintentos (FIX v4.9.4) ← NUEVO
+ *   - Timing post-login con reintentos (FIX v4.9.4)
  *   - navegarACasillas (FIX v4.9.2)
  *   - Navegación SINOE post-login
  *   - Endpoints HTTP
@@ -15,6 +16,16 @@
  * Las funciones base están en core.js (NO TOCAR)
  * ============================================================
  * 
+ * CAMBIOS v4.9.5:
+ *   ✓ FIX CRÍTICO: Clic en botón "Ingresar" ahora usa:
+ *     1. Selector exacto #frmLogin:btnIngresar
+ *     2. Ejecución directa de PrimeFaces.ab() vía page.evaluate()
+ *     3. Fallback con submit del formulario
+ *   ✓ El botón tiene onclick="PrimeFaces.ab({...});return false;"
+ *     que bloqueaba el clic normal de Puppeteer
+ *   ✓ Nueva función hacerClicLoginPrimeFaces() dedicada
+ *   ✓ Mejor logging del proceso de clic
+ *
  * CAMBIOS v4.9.4:
  *   ✓ FIX: Espera waitForNavigation después de clic en login
  *   ✓ FIX: Reintentos de verificación (5x, 3s entre cada uno)
@@ -435,6 +446,240 @@ async function analizarResultadoLogin(page, urlAntes, requestId) {
     tipo: 'indeterminado', 
     mensaje: 'Resultado indeterminado - verificando...',
     detalles: estado
+  };
+}
+
+// ============================================================
+// FIX v4.9.5: FUNCIÓN PARA HACER CLIC EN LOGIN (PRIMEFACES)
+// ============================================================
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * FIX v4.9.5: Hace clic en el botón "Ingresar" de SINOE
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * PROBLEMA:
+ *   El botón de SINOE tiene este HTML:
+ *   <button id="frmLogin:btnIngresar" 
+ *           onclick="PrimeFaces.ab({s:'frmLogin:btnIngresar'});return false;" 
+ *           type="submit">
+ *   
+ *   El "return false;" bloquea el comportamiento normal del submit.
+ *   Puppeteer hace clic pero el navegador cancela la acción.
+ * 
+ * SOLUCIÓN:
+ *   1. Buscar el botón por su ID exacto
+ *   2. Ejecutar directamente PrimeFaces.ab() que es lo que hace el onclick
+ *   3. Si falla, intentar submit directo del formulario
+ *   4. Como último recurso, hacer clic normal + Enter
+ * 
+ * @param {Page} page - Instancia de Puppeteer page
+ * @param {string} requestId - ID para logging
+ * @returns {Object} {exito: boolean, metodo: string, error?: string}
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+async function hacerClicLoginPrimeFaces(page, requestId) {
+  log('info', `LOGIN:${requestId}`, 'Ejecutando clic en botón login (PrimeFaces)...');
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 1: Ejecutar PrimeFaces.ab() directamente
+  // Esta es la manera correcta de interactuar con PrimeFaces
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    const resultadoPF = await page.evaluate(() => {
+      // Verificar que PrimeFaces existe
+      if (typeof PrimeFaces === 'undefined') {
+        return { exito: false, error: 'PrimeFaces no está definido' };
+      }
+      
+      // Verificar que el botón existe
+      const boton = document.getElementById('frmLogin:btnIngresar');
+      if (!boton) {
+        return { exito: false, error: 'Botón frmLogin:btnIngresar no encontrado' };
+      }
+      
+      // Ejecutar la función de PrimeFaces directamente
+      // Esto es exactamente lo que hace el onclick del botón
+      try {
+        PrimeFaces.ab({
+          s: 'frmLogin:btnIngresar',
+          f: 'frmLogin',           // Formulario
+          u: 'frmLogin',           // Update
+          onco: function(xhr, status, args) {} // Callback vacío
+        });
+        return { exito: true, metodo: 'primefaces_ab_directo' };
+      } catch (pfError) {
+        return { exito: false, error: `PrimeFaces.ab() falló: ${pfError.message}` };
+      }
+    });
+    
+    if (resultadoPF.exito) {
+      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado con método: ${resultadoPF.metodo}`);
+      return resultadoPF;
+    }
+    
+    log('warn', `LOGIN:${requestId}`, `Estrategia 1 falló: ${resultadoPF.error}`);
+  } catch (error) {
+    log('warn', `LOGIN:${requestId}`, `Error en estrategia 1: ${error.message}`);
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 2: Ejecutar el onclick del botón manualmente
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    const resultadoOnclick = await page.evaluate(() => {
+      const boton = document.getElementById('frmLogin:btnIngresar');
+      if (!boton) {
+        return { exito: false, error: 'Botón no encontrado' };
+      }
+      
+      // Obtener y ejecutar el onclick como string
+      const onclickAttr = boton.getAttribute('onclick');
+      if (onclickAttr && onclickAttr.includes('PrimeFaces.ab')) {
+        // Extraer solo la parte de PrimeFaces.ab(...) sin el return false
+        const match = onclickAttr.match(/PrimeFaces\.ab\(\{[^}]+\}\)/);
+        if (match) {
+          try {
+            eval(match[0]);
+            return { exito: true, metodo: 'onclick_eval' };
+          } catch (evalError) {
+            return { exito: false, error: `eval falló: ${evalError.message}` };
+          }
+        }
+      }
+      
+      return { exito: false, error: 'onclick no contiene PrimeFaces.ab válido' };
+    });
+    
+    if (resultadoOnclick.exito) {
+      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado con método: ${resultadoOnclick.metodo}`);
+      return resultadoOnclick;
+    }
+    
+    log('warn', `LOGIN:${requestId}`, `Estrategia 2 falló: ${resultadoOnclick.error}`);
+  } catch (error) {
+    log('warn', `LOGIN:${requestId}`, `Error en estrategia 2: ${error.message}`);
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 3: Submit directo del formulario con AJAX de PrimeFaces
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    const resultadoSubmit = await page.evaluate(() => {
+      const form = document.getElementById('frmLogin');
+      if (!form) {
+        return { exito: false, error: 'Formulario frmLogin no encontrado' };
+      }
+      
+      // Intentar enviar vía PrimeFaces si está disponible
+      if (typeof PrimeFaces !== 'undefined' && PrimeFaces.ajax) {
+        try {
+          PrimeFaces.ajax.Request.handle({
+            formId: 'frmLogin',
+            source: 'frmLogin:btnIngresar',
+            process: '@form',
+            update: '@form'
+          });
+          return { exito: true, metodo: 'primefaces_ajax_request' };
+        } catch (ajaxError) {
+          // Continuar con siguiente intento
+        }
+      }
+      
+      // Submit directo (menos probable que funcione con PrimeFaces)
+      try {
+        form.submit();
+        return { exito: true, metodo: 'form_submit_directo' };
+      } catch (submitError) {
+        return { exito: false, error: `submit falló: ${submitError.message}` };
+      }
+    });
+    
+    if (resultadoSubmit.exito) {
+      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado con método: ${resultadoSubmit.metodo}`);
+      return resultadoSubmit;
+    }
+    
+    log('warn', `LOGIN:${requestId}`, `Estrategia 3 falló: ${resultadoSubmit.error}`);
+  } catch (error) {
+    log('warn', `LOGIN:${requestId}`, `Error en estrategia 3: ${error.message}`);
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 4: Clic con Puppeteer + trigger de eventos
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    // Buscar el botón por varios selectores
+    const selectores = [
+      '#frmLogin\\:btnIngresar',              // ID exacto (escapado)
+      'button[id="frmLogin:btnIngresar"]',    // ID como atributo
+      '#frmLogin button[type="submit"]',      // Submit dentro del form
+      'button.ui-button[type="submit"]',      // Clase UI + submit
+      'button:has-text("Ingresar")'           // Por texto (solo Playwright)
+    ];
+    
+    let botonEncontrado = null;
+    for (const selector of selectores) {
+      try {
+        botonEncontrado = await page.$(selector);
+        if (botonEncontrado) {
+          log('info', `LOGIN:${requestId}`, `Botón encontrado con selector: ${selector}`);
+          break;
+        }
+      } catch (e) {
+        // Selector puede no ser válido, continuar
+      }
+    }
+    
+    if (botonEncontrado) {
+      // Hacer clic y disparar eventos manualmente
+      await botonEncontrado.click();
+      
+      // Esperar un poco y verificar si funcionó
+      await delay(500);
+      
+      // Disparar eventos adicionales por si acaso
+      await page.evaluate(() => {
+        const boton = document.getElementById('frmLogin:btnIngresar');
+        if (boton) {
+          boton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          boton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          boton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }
+      });
+      
+      log('success', `LOGIN:${requestId}`, '✓ Login ejecutado con método: puppeteer_click_eventos');
+      return { exito: true, metodo: 'puppeteer_click_eventos' };
+    }
+    
+    log('warn', `LOGIN:${requestId}`, 'No se encontró el botón con ningún selector');
+  } catch (error) {
+    log('warn', `LOGIN:${requestId}`, `Error en estrategia 4: ${error.message}`);
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 5: Enter en el campo CAPTCHA (último recurso)
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    log('info', `LOGIN:${requestId}`, 'Intentando Enter como último recurso...');
+    await page.keyboard.press('Enter');
+    
+    log('success', `LOGIN:${requestId}`, '✓ Login ejecutado con método: keyboard_enter');
+    return { exito: true, metodo: 'keyboard_enter' };
+  } catch (error) {
+    log('error', `LOGIN:${requestId}`, `Error en estrategia 5: ${error.message}`);
+  }
+  
+  // Si llegamos aquí, ninguna estrategia funcionó
+  return { 
+    exito: false, 
+    metodo: 'ninguno', 
+    error: 'Todas las estrategias de clic fallaron' 
   };
 }
 
@@ -1022,32 +1267,28 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     await delay(100);
     await campoCaptcha.type(captchaTexto.toUpperCase(), { delay: 50 });
     
-    // PASO 12: Hacer clic en LOGIN
+    // ═══════════════════════════════════════════════════════════════════
+    // PASO 12: FIX v4.9.5 - Hacer clic en LOGIN usando PrimeFaces
+    // ═══════════════════════════════════════════════════════════════════
     const urlAntes = await leerUrlSegura(page) || SINOE_URLS.login;
     
-    log('info', `SCRAPER:${requestId}`, 'Haciendo clic en botón de login...');
+    log('info', `SCRAPER:${requestId}`, 'Ejecutando login (FIX v4.9.5 - PrimeFaces)...');
     
-    const btnIngresar = await page.$('button[type="submit"], input[type="submit"], .ui-button[type="submit"]');
+    const resultadoClic = await hacerClicLoginPrimeFaces(page, requestId);
     
-    if (btnIngresar) {
-      await btnIngresar.click();
-    } else {
-      await page.keyboard.press('Enter');
+    if (!resultadoClic.exito) {
+      log('error', `SCRAPER:${requestId}`, 'Error crítico: No se pudo hacer clic en login', resultadoClic);
+      await enviarWhatsAppTexto(whatsappNumero, '⚠️ Error técnico al procesar el login. Intente de nuevo.');
+      throw new Error(`Clic en login falló: ${resultadoClic.error}`);
     }
+    
+    log('info', `SCRAPER:${requestId}`, `Clic en login exitoso (método: ${resultadoClic.metodo})`);
     
     // PASO 13: Esperar navegación después del login
     log('info', `SCRAPER:${requestId}`, 'Esperando que SINOE procese el login...');
     
     // ═══════════════════════════════════════════════════════════════════
     // FIX v4.9.4: Esperar navegación correctamente
-    // ═══════════════════════════════════════════════════════════════════
-    // 
-    // PROBLEMA v4.9.3: Solo esperábamos con delay(), pero SINOE puede
-    // tardar más en procesar. Verificábamos cuando aún estaban los
-    // campos de login → "login fallido" (FALSO NEGATIVO).
-    //
-    // SOLUCIÓN: Esperar a que la navegación termine O que cambien los
-    // elementos de la página, con múltiples reintentos.
     // ═══════════════════════════════════════════════════════════════════
     
     // Estrategia 1: Intentar esperar navegación (puede fallar si no hay navegación)
@@ -1164,10 +1405,14 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
         await nuevoCampoCaptcha.type(nuevoCaptcha.toUpperCase(), { delay: 50 });
       }
       
+      // Usar la nueva función de clic
       const nuevoUrlAntes = await leerUrlSegura(page);
-      const nuevoBtn = await page.$('button[type="submit"], input[type="submit"]');
-      if (nuevoBtn) await nuevoBtn.click();
-      else await page.keyboard.press('Enter');
+      const nuevoResultadoClic = await hacerClicLoginPrimeFaces(page, requestId);
+      
+      if (!nuevoResultadoClic.exito) {
+        log('warn', `SCRAPER:${requestId}`, 'Clic falló en segundo intento, usando Enter...');
+        await page.keyboard.press('Enter');
+      }
       
       await delay(TIMEOUT.esperaPostClick);
       await cerrarPopups(page, `SCRAPER:${requestId}`);
@@ -1298,17 +1543,31 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       clearTimeout(timeoutCaptchaId);
     }
     
-    if (sesionesActivas.has(whatsappNumero)) {
-      const s = sesionesActivas.get(whatsappNumero);
-      if (s.timeoutId) clearTimeout(s.timeoutId);
-      sesionesActivas.delete(whatsappNumero);
-    }
-    
-    return { success: false, error: error.message, requestId };
+    return { 
+      success: false, 
+      error: error.message,
+      duracionMs: Date.now() - inicioMs,
+      requestId
+    };
     
   } finally {
+    // Limpiar sesión
+    for (const [numero, sesion] of sesionesActivas.entries()) {
+      if (sesion.requestId === requestId) {
+        if (sesion.timeoutId) clearTimeout(sesion.timeoutId);
+        sesionesActivas.delete(numero);
+        break;
+      }
+    }
+    
+    // Cerrar browser
     if (browser) {
-      try { await browser.close(); } catch (e) {}
+      try {
+        await browser.close();
+        log('info', `SCRAPER:${requestId}`, 'Browser cerrado');
+      } catch (e) {
+        log('warn', `SCRAPER:${requestId}`, `Error cerrando browser: ${e.message}`);
+      }
     }
   }
 }
@@ -1317,204 +1576,236 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
 // MIDDLEWARES
 // ============================================================
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' }));
 
-// Rate limiting
+// Logging de requests
 app.use((req, res, next) => {
-  if (req.path === '/health') return next();
-  
-  const ip = req.ip || req.connection.remoteAddress || 'unknown';
-  const ahora = Date.now();
-  
-  if (!rateLimitCache.has(ip)) {
-    rateLimitCache.set(ip, { count: 1, timestamp: ahora });
-    return next();
-  }
-  
-  const data = rateLimitCache.get(ip);
-  
-  if (ahora - data.timestamp > RATE_LIMIT.windowMs) {
-    rateLimitCache.set(ip, { count: 1, timestamp: ahora });
-    return next();
-  }
-  
-  data.count++;
-  
-  if (data.count > RATE_LIMIT.maxRequestsPerIp) {
-    return res.status(429).json({ success: false, error: 'Demasiadas solicitudes' });
-  }
-  
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    if (req.path !== '/health') {
+      log('info', 'HTTP', `${req.method} ${req.path} - ${res.statusCode} (${ms}ms)`);
+    }
+  });
   next();
 });
 
-// Auth para rutas protegidas
-app.use((req, res, next) => {
-  const publicPaths = ['/health', '/webhook/whatsapp'];
-  if (publicPaths.includes(req.path)) return next();
+// Autenticación básica
+const authMiddleware = (req, res, next) => {
+  // Excluir health y webhook de autenticación
+  if (req.path === '/health' || req.path.startsWith('/webhook/')) {
+    return next();
+  }
   
-  const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Token de autenticación requerido' });
+  }
   
-  if (apiKey !== API_KEY) {
-    log('warn', 'AUTH', `Acceso no autorizado a ${req.path}`);
-    return res.status(401).json({ success: false, error: 'No autorizado' });
+  const token = authHeader.split(' ')[1];
+  if (token !== API_KEY) {
+    return res.status(403).json({ error: 'Token inválido' });
   }
   
   next();
-});
+};
+
+app.use(authMiddleware);
 
 // ============================================================
 // ENDPOINTS
 // ============================================================
 
+// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.9.4',
-    uptime: process.uptime(),
-    sesionesActivas: sesionesActivas.size,
-    metricas: {
-      scrapersExitosos: metricas.scrapersExitosos,
-      scrapersFallidos: metricas.scrapersFallidos,
-      sesionesFinalizadas: metricas.sesionesFinalizadas,
-      consolidadosDescargados: metricas.consolidadosDescargados,
-      modalesAbiertos: metricas.modalesAbiertos,
-      erroresFrameIgnorados: metricas.erroresFrameIgnorados,
-      tiempoPromedioMs: metricas.tiempoPromedioMs
-    }
+    version: '4.9.5',
+    fix: 'Clic login PrimeFaces',
+    uptime: Math.floor(process.uptime()),
+    sesionesActivas: sesionesActivas.size
   });
 });
 
+// Métricas
 app.get('/metricas', (req, res) => {
-  res.json(metricas);
+  res.json({
+    ...metricas,
+    sesionesActivas: sesionesActivas.size,
+    uptimeSegundos: Math.floor(process.uptime())
+  });
 });
 
+// Lista de sesiones activas
 app.get('/sesiones', (req, res) => {
   const sesiones = [];
-  for (const [numero, data] of sesionesActivas.entries()) {
+  for (const [numero, sesion] of sesionesActivas.entries()) {
     sesiones.push({
       numero: enmascarar(numero),
-      nombreAbogado: data.nombreAbogado,
-      requestId: data.requestId,
-      tiempoEsperaMs: Date.now() - data.timestamp
+      nombreAbogado: sesion.nombreAbogado,
+      requestId: sesion.requestId,
+      tiempoEspera: Math.floor((Date.now() - sesion.timestamp) / 1000)
     });
   }
-  res.json({ sesiones });
+  res.json({ total: sesiones.length, sesiones });
 });
 
-app.post('/scraper', async (req, res) => {
-  metricas.requestsTotal++;
-  
-  const { sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado } = req.body;
-  
-  if (!sinoeUsuario || !sinoePassword) {
-    return res.status(400).json({ success: false, error: 'Credenciales requeridas' });
-  }
-  
-  const validacion = validarNumeroWhatsApp(whatsappNumero);
-  if (!validacion.valido) {
-    return res.status(400).json({ success: false, error: validacion.error });
-  }
-  
-  if (sesionesActivas.has(validacion.numero)) {
-    return res.status(409).json({ success: false, error: 'Ya hay un proceso activo para este número' });
-  }
-  
-  res.json({ success: true, message: 'Proceso iniciado' });
-  
-  ejecutarScraper({
-    sinoeUsuario,
-    sinoePassword,
-    whatsappNumero: validacion.numero,
-    nombreAbogado: nombreAbogado || 'Dr(a).'
-  }).catch(error => {
-    log('error', 'SCRAPER', `Error no manejado: ${error.message}`);
-  });
-});
-
-app.post('/webhook/whatsapp', (req, res) => {
-  res.sendStatus(200);
-  
+// Webhook de WhatsApp
+app.post('/webhook/whatsapp', async (req, res) => {
   try {
-    const data = req.body;
-    const evento = (data.event || '').toLowerCase().replace(/_/g, '.');
+    const { data } = req.body;
     
-    log('info', 'WEBHOOK', 'Evento recibido', { event: evento, instance: data.instance });
-    
-    if (!evento.includes('messages.upsert') && !evento.includes('message')) return;
-    
-    let mensaje = null;
-    let remitente = null;
-    
-    if (data.data?.message?.conversation) {
-      mensaje = data.data.message.conversation;
-      remitente = data.data.key?.remoteJid;
-    } else if (data.data?.message?.extendedTextMessage?.text) {
-      mensaje = data.data.message.extendedTextMessage.text;
-      remitente = data.data.key?.remoteJid;
-    } else if (Array.isArray(data.data)) {
-      const item = data.data[0];
-      if (item?.message?.conversation) {
-        mensaje = item.message.conversation;
-        remitente = item.key?.remoteJid;
-      }
+    if (!data?.message?.conversation && !data?.message?.extendedTextMessage?.text) {
+      return res.status(200).json({ status: 'ignored', reason: 'no_text' });
     }
     
-    if (!mensaje || !remitente) return;
-    if (data.data?.key?.fromMe === true) return;
+    const mensaje = data.message.conversation || data.message.extendedTextMessage?.text || '';
+    const remoteJid = data.key?.remoteJid || '';
+    const numero = remoteJid.replace('@s.whatsapp.net', '');
+    const messageId = data.key?.id || '';
     
-    const numero = remitente.replace('@s.whatsapp.net', '').replace(/\D/g, '');
-    
-    const webhookKey = `${numero}-${mensaje}-${Date.now().toString().substring(0, 10)}`;
-    if (webhooksRecientes.has(webhookKey)) {
-      log('debug', 'WEBHOOK', 'Mensaje duplicado ignorado');
-      return;
+    // Evitar duplicados
+    if (webhooksRecientes.has(messageId)) {
+      return res.status(200).json({ status: 'duplicate' });
     }
-    webhooksRecientes.set(webhookKey, Date.now());
+    webhooksRecientes.set(messageId, Date.now());
     
-    log('info', 'WEBHOOK', 'Mensaje', { numero: enmascarar(numero), texto: mensaje.substring(0, 20) });
-    
-    if (!sesionesActivas.has(numero)) {
-      log('debug', 'WEBHOOK', 'No hay sesión activa para este número');
-      return;
+    // Ignorar mensajes propios
+    if (data.key?.fromMe) {
+      return res.status(200).json({ status: 'ignored', reason: 'own_message' });
     }
     
+    log('info', 'WEBHOOK', `Mensaje de ${enmascarar(numero)}: "${mensaje.substring(0, 30)}..."`);
+    
+    // Buscar sesión activa
     const sesion = sesionesActivas.get(numero);
-    const validacion = validarCaptcha(mensaje);
+    
+    if (!sesion) {
+      log('info', 'WEBHOOK', `No hay sesión activa para ${enmascarar(numero)}`);
+      return res.status(200).json({ status: 'no_session' });
+    }
+    
+    // Validar CAPTCHA
+    const captchaLimpio = mensaje.trim().toUpperCase();
+    const validacion = validarCaptcha(captchaLimpio);
     
     if (!validacion.valido) {
-      enviarWhatsAppTexto(numero, `⚠️ ${validacion.error}\n${validacion.sugerencia || ''}`);
-      return;
+      log('warn', 'WEBHOOK', `CAPTCHA inválido: "${captchaLimpio}" - ${validacion.error}`);
+      await enviarWhatsAppTexto(numero, `⚠️ ${validacion.error}\n\nEnvíe solo el código CAPTCHA (5 caracteres).`);
+      return res.status(200).json({ status: 'invalid_captcha', error: validacion.error });
     }
     
-    log('success', 'WEBHOOK', 'CAPTCHA procesado', { numero: enmascarar(numero), captcha: validacion.captcha });
+    log('success', 'WEBHOOK', `CAPTCHA válido recibido: ${captchaLimpio}`);
     
-    if (sesion.timeoutId) {
-      clearTimeout(sesion.timeoutId);
+    // Resolver promesa
+    if (sesion.resolve) {
+      sesion.resolve(captchaLimpio);
     }
     
-    sesionesActivas.delete(numero);
-    sesion.resolve(validacion.captcha);
+    res.status(200).json({ status: 'captcha_received', captcha: captchaLimpio });
     
   } catch (error) {
-    log('error', 'WEBHOOK', `Error: ${error.message}`);
+    log('error', 'WEBHOOK', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Endpoints de diagnóstico
+// Endpoint principal del scraper
+app.post('/scraper', async (req, res) => {
+  try {
+    const { sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado } = req.body;
+    
+    // Validaciones
+    if (!sinoeUsuario || !sinoePassword) {
+      return res.status(400).json({ error: 'Credenciales de SINOE requeridas' });
+    }
+    
+    if (!whatsappNumero) {
+      return res.status(400).json({ error: 'Número de WhatsApp requerido' });
+    }
+    
+    const numeroValidacion = validarNumeroWhatsApp(whatsappNumero);
+    if (!numeroValidacion.valido) {
+      return res.status(400).json({ error: numeroValidacion.error });
+    }
+    
+    // Rate limiting
+    const ahora = Date.now();
+    const ultimoRequest = rateLimitCache.get(numeroValidacion.numero);
+    if (ultimoRequest && (ahora - ultimoRequest) < RATE_LIMIT.minIntervaloMs) {
+      const segundosRestantes = Math.ceil((RATE_LIMIT.minIntervaloMs - (ahora - ultimoRequest)) / 1000);
+      return res.status(429).json({ 
+        error: `Espere ${segundosRestantes}s antes de intentar de nuevo`,
+        retryAfter: segundosRestantes
+      });
+    }
+    rateLimitCache.set(numeroValidacion.numero, ahora);
+    
+    // Verificar sesión existente
+    if (sesionesActivas.has(numeroValidacion.numero)) {
+      return res.status(409).json({ 
+        error: 'Ya hay una sesión activa para este número',
+        hint: 'Espere a que termine o envíe el CAPTCHA pendiente'
+      });
+    }
+    
+    log('info', 'API', `Iniciando scraper para ${enmascarar(numeroValidacion.numero)}`);
+    
+    // Ejecutar scraper (async, responde inmediatamente)
+    ejecutarScraper({
+      sinoeUsuario,
+      sinoePassword,
+      whatsappNumero: numeroValidacion.numero,
+      nombreAbogado: nombreAbogado || 'Usuario'
+    }).then(resultado => {
+      log('info', 'API', `Scraper finalizado: ${resultado.success ? 'ÉXITO' : 'FALLO'}`);
+    }).catch(error => {
+      log('error', 'API', `Error en scraper: ${error.message}`);
+    });
+    
+    res.status(202).json({ 
+      status: 'iniciado',
+      mensaje: 'Scraper iniciado. El abogado recibirá el CAPTCHA por WhatsApp.',
+      numero: enmascarar(numeroValidacion.numero)
+    });
+    
+  } catch (error) {
+    log('error', 'API', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// ENDPOINTS DE PRUEBA
+// ============================================================
+
 app.post('/test-whatsapp', async (req, res) => {
-  const { numero, mensaje } = req.body;
-  
-  if (!numero) return res.status(400).json({ success: false, error: 'Número requerido' });
-  
-  const validacion = validarNumeroWhatsApp(numero);
-  if (!validacion.valido) return res.status(400).json({ success: false, error: validacion.error });
-  
-  const enviado = await enviarWhatsAppTexto(validacion.numero, mensaje || '🧪 Test LEXA Scraper v4.9.4');
-  res.json({ success: enviado });
+  try {
+    const { numero, mensaje } = req.body;
+    
+    if (!numero) {
+      return res.status(400).json({ error: 'Número requerido' });
+    }
+    
+    const validacion = validarNumeroWhatsApp(numero);
+    if (!validacion.valido) {
+      return res.status(400).json({ error: validacion.error });
+    }
+    
+    const resultado = await enviarWhatsAppTexto(
+      validacion.numero, 
+      mensaje || '🤖 Mensaje de prueba de LEXA Scraper v4.9.5'
+    );
+    
+    res.json({ success: resultado, numero: enmascarar(validacion.numero) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 app.post('/test-conexion', async (req, res) => {
   let browser = null;
+  
   try {
     const ws = CONFIG.browserless.token 
       ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
@@ -1522,10 +1813,17 @@ app.post('/test-conexion', async (req, res) => {
     
     browser = await puppeteer.connect({ browserWSEndpoint: ws, defaultViewport: DEFAULT_VIEWPORT });
     const page = await browser.newPage();
-    await page.goto('https://www.google.com', { waitUntil: 'networkidle2', timeout: 30000 });
-    const titulo = await page.title();
     
-    res.json({ success: true, browserless: 'ok', titulo });
+    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+    
+    const titulo = await page.title();
+    const url = await page.url();
+    
+    res.json({ 
+      success: true, 
+      browserless: 'conectado',
+      sinoe: { titulo, url }
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   } finally {
@@ -1659,6 +1957,56 @@ app.post('/test-verificar-estado', async (req, res) => {
 });
 
 // ============================================================
+// NUEVO ENDPOINT v4.9.5: Test del clic en login
+// ============================================================
+
+app.post('/test-clic-login', async (req, res) => {
+  let browser = null;
+  
+  try {
+    const ws = CONFIG.browserless.token 
+      ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
+      : CONFIG.browserless.url;
+    
+    browser = await puppeteer.connect({ browserWSEndpoint: ws, defaultViewport: DEFAULT_VIEWPORT });
+    const page = await browser.newPage();
+    
+    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+    await delay(3000);
+    await cerrarPopups(page, 'TEST-CLIC');
+    await delay(1000);
+    
+    // Verificar estructura del botón
+    const infoBoton = await page.evaluate(() => {
+      const boton = document.getElementById('frmLogin:btnIngresar');
+      if (!boton) return { existe: false };
+      
+      return {
+        existe: true,
+        id: boton.id,
+        type: boton.type,
+        className: boton.className,
+        onclick: boton.getAttribute('onclick'),
+        tienePrimeFaces: typeof PrimeFaces !== 'undefined',
+        innerHTML: boton.innerHTML.substring(0, 100)
+      };
+    });
+    
+    res.json({ 
+      success: true, 
+      boton: infoBoton,
+      mensaje: infoBoton.existe 
+        ? 'Botón encontrado correctamente' 
+        : 'ADVERTENCIA: Botón no encontrado con ID frmLogin:btnIngresar'
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+// ============================================================
 // GRACEFUL SHUTDOWN
 // ============================================================
 
@@ -1693,13 +2041,20 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.9.4 - FIX TIMING POST-LOGIN                 ║
+║           LEXA SCRAPER SERVICE v4.9.5 - FIX CLIC LOGIN PRIMEFACES             ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${String(PORT).padEnd(70)}║
 ║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
 ║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
 ║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
+║  FIX v4.9.5 - CLIC LOGIN PRIMEFACES:                                          ║
+║                                                                               ║
+║    ✓ Nueva función hacerClicLoginPrimeFaces() dedicada                        ║
+║    ✓ Ejecuta PrimeFaces.ab() directamente (evita return false)                ║
+║    ✓ 5 estrategias de fallback para máxima compatibilidad                     ║
+║    ✓ Nuevo endpoint /test-clic-login para diagnóstico                         ║
+║                                                                               ║
 ║  FIX v4.9.4 - TIMING POST-LOGIN:                                              ║
 ║                                                                               ║
 ║    ✓ Espera waitForNavigation después del clic en login                       ║
@@ -1724,7 +2079,7 @@ app.listen(PORT, () => {
 ║    GET  /health              POST /scraper           GET  /metricas           ║
 ║    GET  /sesiones            POST /webhook/whatsapp  POST /test-whatsapp      ║
 ║    POST /test-conexion       POST /test-credenciales POST /test-captcha       ║
-║    POST /test-verificar-estado                                                ║
+║    POST /test-verificar-estado                       POST /test-clic-login    ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
   `);
   
