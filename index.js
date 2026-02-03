@@ -1,10 +1,11 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.9.2 - FIX FRAME TIMING
+ * LEXA SCRAPER SERVICE v4.9.3 - FIX FALSO POSITIVO LOGIN
  * ============================================================
  * 
  * ARCHIVO MODIFICABLE - Contiene:
- *   - analizarResultadoLogin (FIX v4.9.0)
+ *   - analizarResultadoLogin (FIX v4.9.3) ← CAMBIO PRINCIPAL
+ *   - verificarEstadoPagina (NUEVA función auxiliar)
  *   - navegarACasillas (FIX v4.9.2)
  *   - Navegación SINOE post-login
  *   - Endpoints HTTP
@@ -13,6 +14,14 @@
  * Las funciones base están en core.js (NO TOCAR)
  * ============================================================
  * 
+ * CAMBIOS v4.9.3:
+ *   ✓ FIX CRÍTICO: analizarResultadoLogin ya no usa page.content()
+ *   ✓ NUEVA ESTRATEGIA: Verifica elementos DOM específicos del dashboard
+ *   ✓ Verifica PRESENCIA de: form#frmNuevo, barra "Bienvenido(a):", botones
+ *   ✓ Verifica AUSENCIA de: input[type="password"], campo CAPTCHA
+ *   ✓ Consistente con navegarACasillas() (usa evaluarSeguro)
+ *   ✓ Logging detallado para diagnóstico
+ *
  * CAMBIOS v4.9.2:
  *   ✓ FIX: Espera 3s para que página se estabilice post-login
  *   ✓ FIX: Reintentos (3x) si evaluarSeguro retorna null
@@ -78,91 +87,348 @@ const {
 const app = express();
 
 // ============================================================
-// ANÁLISIS DE RESULTADO LOGIN - FIX v4.9.0
+// FUNCIÓN AUXILIAR: VERIFICAR ESTADO DE LA PÁGINA
 // ============================================================
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * FIX v4.9.0: Detección mejorada de login exitoso
+ * NUEVA v4.9.3: Verifica el estado de la página usando elementos DOM
  * ═══════════════════════════════════════════════════════════════════════════
  * 
- * BUG ANTERIOR:
- *   El código asumía que login.xhtml = login exitoso, pero SINOE
- *   usa login.xhtml TAMBIÉN para la página de login inicial.
+ * Esta función examina el DOM para determinar si estamos en:
+ *   - Página de login (pre-autenticación)
+ *   - Dashboard (post-autenticación exitosa)
+ *   - Página de sesión activa
+ *   - Página de error
  * 
- * SOLUCIÓN:
- *   Verificar que existan las OPCIONES DE SERVICIO (Casillas, Mesa de Partes)
- *   para confirmar que realmente se logueó exitosamente.
+ * NO usa page.content() porque incluye HTML de menús/nav que causa
+ * falsos positivos.
+ * 
+ * @param {Page} page - Instancia de Puppeteer page
+ * @returns {Object} Estado detallado de la página
  * ═══════════════════════════════════════════════════════════════════════════
  */
-function analizarResultadoLogin(url, contenido, urlAntes) {
-  const urlLower = url.toLowerCase();
-  const contenidoLower = contenido.toLowerCase();
-  
-  // 1. Error de CAPTCHA (prioridad alta)
-  if (contenidoLower.includes('captcha') && 
-      (contenidoLower.includes('incorrecto') || 
-       contenidoLower.includes('inválido') ||
-       contenidoLower.includes('invalido') ||
-       contenidoLower.includes('erróneo') ||
-       contenidoLower.includes('erroneo'))) {
-    return { tipo: 'captcha_incorrecto', mensaje: 'CAPTCHA incorrecto' };
-  }
-  
-  // 2. Sesión activa
-  if (urlLower.includes('session-activa') || 
-      urlLower.includes('sso-session-activa') ||
-      contenidoLower.includes('sesión activa') ||
-      contenidoLower.includes('sesion activa') ||
-      contenidoLower.includes('finalizar sesion') ||
-      contenidoLower.includes('finalizar sesión')) {
-    return { tipo: 'sesion_activa', mensaje: 'Sesión activa detectada' };
-  }
-  
-  // 3. FIX v4.9.0: Login exitoso - VERIFICAR CONTENIDO, NO SOLO URL
-  // La página de dashboard DEBE tener los botones de servicio
-  const tieneOpcionesServicio = 
-    contenidoLower.includes('casillas electrónicas') ||
-    contenidoLower.includes('casillas electronicas') ||
-    contenidoLower.includes('mesa de partes electr');
-  
-  if (tieneOpcionesServicio) {
-    return { tipo: 'login_exitoso', mensaje: 'Login exitoso - opciones de servicio detectadas' };
-  }
-  
-  // 4. Si está en menu-app.xhtml es éxito seguro
-  if (urlLower.includes('menu-app') || urlLower.includes('sso-menu')) {
-    return { tipo: 'login_exitoso', mensaje: 'Login exitoso (menú principal)' };
-  }
-  
-  // 5. URL cambió y NO es página de login/validación
-  if (url !== urlAntes && 
-      !urlLower.includes('sso-validar') && 
-      !urlLower.includes('login.xhtml')) {
-    return { tipo: 'login_exitoso', mensaje: 'Login exitoso (URL cambió a página diferente)' };
-  }
-  
-  // 6. FIX v4.9.0: Si seguimos en login.xhtml SIN opciones de servicio = fallo
-  if (urlLower.includes('login.xhtml') && !tieneOpcionesServicio) {
-    // Verificar si hay mensaje de error específico
-    if (contenidoLower.includes('usuario o contraseña') ||
-        contenidoLower.includes('credenciales') ||
-        contenidoLower.includes('datos incorrectos')) {
-      return { tipo: 'credenciales_invalidas', mensaje: 'Usuario o contraseña incorrectos' };
+async function verificarEstadoPagina(page) {
+  return await evaluarSeguro(page, () => {
+    // ═══════════════════════════════════════════════════════════════════
+    // INDICADORES DE PÁGINA DE LOGIN (pre-autenticación)
+    // ═══════════════════════════════════════════════════════════════════
+    
+    // Campo de contraseña visible = estamos en formulario de login
+    const campoPassword = document.querySelector('input[type="password"]');
+    const tieneCampoPassword = campoPassword !== null && 
+                               campoPassword.offsetParent !== null; // visible
+    
+    // Campo de CAPTCHA visible = estamos en formulario de login
+    const campoCaptcha = document.querySelector(
+      'input[placeholder*="CAPTCHA"], input[placeholder*="captcha"], input[id*="captcha"]'
+    );
+    const tieneCampoCaptcha = campoCaptcha !== null;
+    
+    // Imagen de CAPTCHA visible
+    const imagenCaptcha = document.querySelector('img[src*="captcha"]');
+    const tieneImagenCaptcha = imagenCaptcha !== null && imagenCaptcha.complete;
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // INDICADORES DE DASHBOARD (post-autenticación exitosa)
+    // ═══════════════════════════════════════════════════════════════════
+    
+    // Formulario del dashboard (form#frmNuevo)
+    const formDashboard = document.querySelector('form#frmNuevo, form[name="frmNuevo"]');
+    const tieneFormDashboard = formDashboard !== null;
+    
+    // Barra de bienvenida con nombre de usuario
+    // Ejemplo: "Bienvenido(a): ERWIN RAFAEL CAPUÑAY CARLOS"
+    const bodyText = document.body.innerText || '';
+    const tieneBienvenida = bodyText.includes('Bienvenido(a):') || 
+                            bodyText.includes('Bienvenido:');
+    
+    // Extraer nombre del usuario si está presente
+    let nombreUsuario = null;
+    const matchBienvenida = bodyText.match(/Bienvenido\(?a?\)?:\s*([^\n\r]+)/i);
+    if (matchBienvenida) {
+      nombreUsuario = matchBienvenida[1].trim().substring(0, 50);
     }
     
-    // Si seguimos en login sin opciones, probablemente CAPTCHA incorrecto
-    // pero SINOE no muestra mensaje claro
-    return { tipo: 'login_fallido', mensaje: 'Login fallido - verifique CAPTCHA y credenciales' };
+    // Enlaces de servicio (Casillas, Mesa de Partes, etc.)
+    // Estos solo existen en el dashboard post-login
+    const enlacesFrmNuevo = document.querySelectorAll('a[id*="frmNuevo"]');
+    const tieneEnlacesServicio = enlacesFrmNuevo.length > 0;
+    
+    // Botones de servicio con clase específica
+    const spansTxtredbtn = document.querySelectorAll('span.txtredbtn');
+    const divsBtnservicios = document.querySelectorAll('.btnservicios, .bggradient');
+    const tieneBotonesServicio = spansTxtredbtn.length > 0 || divsBtnservicios.length > 0;
+    
+    // Texto "SERVICIOS ELECTRÓNICOS" (nota: con acento) - solo en dashboard
+    const tieneTextoServiciosElectronicos = bodyText.includes('SERVICIOS ELECTRÓNICOS') ||
+                                             bodyText.includes('SERVICIOS ELECTRONICOS');
+    
+    // Enlaces de usuario autenticado (MIS DATOS, CAMBIO DE CLAVE, CERRAR SESIÓN)
+    const tieneCerrarSesion = bodyText.includes('CERRAR SESIÓN') || 
+                              bodyText.includes('CERRAR SESION');
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // INDICADORES DE SESIÓN ACTIVA
+    // ═══════════════════════════════════════════════════════════════════
+    
+    const tieneSesionActiva = bodyText.toLowerCase().includes('sesión activa') ||
+                              bodyText.toLowerCase().includes('sesion activa') ||
+                              bodyText.toLowerCase().includes('finalizar sesion') ||
+                              bodyText.toLowerCase().includes('finalizar sesión');
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // INDICADORES DE ERROR
+    // ═══════════════════════════════════════════════════════════════════
+    
+    const bodyLower = bodyText.toLowerCase();
+    const tieneMensajeCaptchaIncorrecto = 
+      (bodyLower.includes('captcha') && 
+       (bodyLower.includes('incorrecto') || 
+        bodyLower.includes('inválido') ||
+        bodyLower.includes('invalido') ||
+        bodyLower.includes('erróneo') ||
+        bodyLower.includes('erroneo')));
+    
+    const tieneMensajeCredencialesInvalidas = 
+      bodyLower.includes('usuario o contraseña') ||
+      bodyLower.includes('credenciales') ||
+      bodyLower.includes('datos incorrectos');
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // RESULTADO CONSOLIDADO
+    // ═══════════════════════════════════════════════════════════════════
+    
+    return {
+      // URL actual
+      url: window.location.href,
+      
+      // Indicadores de login (pre-auth)
+      login: {
+        tieneCampoPassword,
+        tieneCampoCaptcha,
+        tieneImagenCaptcha
+      },
+      
+      // Indicadores de dashboard (post-auth)
+      dashboard: {
+        tieneFormDashboard,
+        tieneBienvenida,
+        nombreUsuario,
+        tieneEnlacesServicio,
+        tieneBotonesServicio,
+        tieneTextoServiciosElectronicos,
+        tieneCerrarSesion,
+        // Contadores para debug
+        enlacesFrmNuevoCount: enlacesFrmNuevo.length,
+        spansTxtredbtnCount: spansTxtredbtn.length,
+        divsBtnserviciosCount: divsBtnservicios.length
+      },
+      
+      // Indicadores de sesión activa
+      sesionActiva: {
+        detectada: tieneSesionActiva
+      },
+      
+      // Indicadores de error
+      errores: {
+        captchaIncorrecto: tieneMensajeCaptchaIncorrecto,
+        credencialesInvalidas: tieneMensajeCredencialesInvalidas
+      },
+      
+      // Extracto del body para debug (primeros 300 chars)
+      extractoBody: bodyText.substring(0, 300).replace(/\s+/g, ' ').trim()
+    };
+  });
+}
+
+// ============================================================
+// ANÁLISIS DE RESULTADO LOGIN - FIX v4.9.3 (REESCRITO)
+// ============================================================
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * FIX v4.9.3: Detección robusta de login exitoso usando DOM
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * PROBLEMA ANTERIOR (v4.9.0-v4.9.2):
+ *   - Usaba page.content() que retorna TODO el HTML incluyendo menús/nav
+ *   - Buscaba texto "casillas electrónicas" en el HTML completo
+ *   - El menú de navegación de la página de LOGIN contiene ese texto
+ *   - Esto causaba FALSOS POSITIVOS: creía que logueó cuando no lo hizo
+ * 
+ * SOLUCIÓN (v4.9.3):
+ *   - Usa verificarEstadoPagina() que examina elementos DOM específicos
+ *   - Verifica PRESENCIA de elementos del dashboard (form#frmNuevo, barra Bienvenido)
+ *   - Verifica AUSENCIA de elementos de login (campo password, CAPTCHA)
+ *   - Es CONSISTENTE con navegarACasillas() (ambos usan evaluarSeguro)
+ * 
+ * @param {Page} page - Instancia de Puppeteer page
+ * @param {string} urlAntes - URL antes del intento de login
+ * @param {string} requestId - ID de la solicitud para logging
+ * @returns {Object} Resultado del análisis {tipo, mensaje, detalles}
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+async function analizarResultadoLogin(page, urlAntes, requestId) {
+  // Obtener estado completo de la página
+  const estado = await verificarEstadoPagina(page);
+  
+  if (!estado) {
+    log('warn', `LOGIN:${requestId}`, 'No se pudo verificar estado de página (frame en transición)');
+    return { 
+      tipo: 'indeterminado', 
+      mensaje: 'No se pudo leer la página - reintentando',
+      detalles: null
+    };
   }
   
-  // 7. Si seguimos en sso-validar, el login no se procesó
-  if (urlLower.includes('sso-validar') && url === urlAntes) {
-    return { tipo: 'login_fallido', mensaje: 'Login no procesado - página no cambió' };
+  const url = estado.url || '';
+  const urlLower = url.toLowerCase();
+  
+  // Log detallado para diagnóstico
+  log('info', `LOGIN:${requestId}`, 'Estado de página:', {
+    url: url.substring(0, 60),
+    login: estado.login,
+    dashboard: {
+      tieneFormDashboard: estado.dashboard.tieneFormDashboard,
+      tieneBienvenida: estado.dashboard.tieneBienvenida,
+      tieneEnlacesServicio: estado.dashboard.tieneEnlacesServicio,
+      tieneBotonesServicio: estado.dashboard.tieneBotonesServicio
+    },
+    sesionActiva: estado.sesionActiva.detectada,
+    errores: estado.errores
+  });
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // CASO 1: Error de CAPTCHA (prioridad alta)
+  // ═══════════════════════════════════════════════════════════════════
+  if (estado.errores.captchaIncorrecto) {
+    log('warn', `LOGIN:${requestId}`, 'CAPTCHA incorrecto detectado');
+    return { 
+      tipo: 'captcha_incorrecto', 
+      mensaje: 'CAPTCHA incorrecto',
+      detalles: estado
+    };
   }
   
-  // 8. Indeterminado - requiere verificación manual
-  return { tipo: 'indeterminado', mensaje: 'Resultado indeterminado - verificando...' };
+  // ═══════════════════════════════════════════════════════════════════
+  // CASO 2: Credenciales inválidas
+  // ═══════════════════════════════════════════════════════════════════
+  if (estado.errores.credencialesInvalidas) {
+    log('warn', `LOGIN:${requestId}`, 'Credenciales inválidas detectadas');
+    return { 
+      tipo: 'credenciales_invalidas', 
+      mensaje: 'Usuario o contraseña incorrectos',
+      detalles: estado
+    };
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // CASO 3: Sesión activa detectada
+  // ═══════════════════════════════════════════════════════════════════
+  if (estado.sesionActiva.detectada || urlLower.includes('sso-session-activa')) {
+    log('info', `LOGIN:${requestId}`, 'Sesión activa detectada');
+    return { 
+      tipo: 'sesion_activa', 
+      mensaje: 'Sesión activa detectada - requiere finalización',
+      detalles: estado
+    };
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // CASO 4: Dashboard confirmado (LOGIN EXITOSO)
+  // Requiere AL MENOS 2 indicadores positivos del dashboard
+  // Y NINGÚN indicador de página de login
+  // ═══════════════════════════════════════════════════════════════════
+  
+  const indicadoresDashboard = [
+    estado.dashboard.tieneFormDashboard,
+    estado.dashboard.tieneBienvenida,
+    estado.dashboard.tieneEnlacesServicio,
+    estado.dashboard.tieneBotonesServicio,
+    estado.dashboard.tieneCerrarSesion
+  ];
+  const countDashboard = indicadoresDashboard.filter(Boolean).length;
+  
+  const indicadoresLogin = [
+    estado.login.tieneCampoPassword,
+    estado.login.tieneCampoCaptcha
+  ];
+  const countLogin = indicadoresLogin.filter(Boolean).length;
+  
+  // Login exitoso: múltiples indicadores de dashboard Y ninguno de login
+  if (countDashboard >= 2 && countLogin === 0) {
+    log('success', `LOGIN:${requestId}`, 'LOGIN EXITOSO confirmado', {
+      indicadoresDashboard: countDashboard,
+      indicadoresLogin: countLogin,
+      usuario: estado.dashboard.nombreUsuario
+    });
+    return { 
+      tipo: 'login_exitoso', 
+      mensaje: `Login exitoso - Usuario: ${estado.dashboard.nombreUsuario || 'detectado'}`,
+      detalles: estado
+    };
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // CASO 5: Estamos en sso-menu-app.xhtml (bandeja) - éxito seguro
+  // ═══════════════════════════════════════════════════════════════════
+  if (urlLower.includes('sso-menu-app')) {
+    log('success', `LOGIN:${requestId}`, 'Login exitoso - en bandeja de notificaciones');
+    return { 
+      tipo: 'login_exitoso', 
+      mensaje: 'Login exitoso (menú principal / bandeja)',
+      detalles: estado
+    };
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // CASO 6: Seguimos en página de login (LOGIN FALLIDO)
+  // Hay campos de login visibles = no hemos autenticado
+  // ═══════════════════════════════════════════════════════════════════
+  if (countLogin > 0 && countDashboard < 2) {
+    log('warn', `LOGIN:${requestId}`, 'LOGIN FALLIDO - campos de login aún visibles', {
+      tieneCampoPassword: estado.login.tieneCampoPassword,
+      tieneCampoCaptcha: estado.login.tieneCampoCaptcha,
+      indicadoresDashboard: countDashboard
+    });
+    return { 
+      tipo: 'login_fallido', 
+      mensaje: 'Login fallido - verifique CAPTCHA y credenciales',
+      detalles: estado
+    };
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // CASO 7: URL cambió a algo inesperado
+  // ═══════════════════════════════════════════════════════════════════
+  if (url !== urlAntes && !urlLower.includes('login') && !urlLower.includes('sso-validar')) {
+    log('info', `LOGIN:${requestId}`, 'URL cambió a página diferente', { url });
+    
+    // Si tiene indicadores de dashboard, es éxito
+    if (countDashboard >= 1) {
+      return { 
+        tipo: 'login_exitoso', 
+        mensaje: 'Login exitoso (URL cambió + indicadores de dashboard)',
+        detalles: estado
+      };
+    }
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // CASO 8: Indeterminado - requiere verificación adicional
+  // ═══════════════════════════════════════════════════════════════════
+  log('warn', `LOGIN:${requestId}`, 'Resultado indeterminado', {
+    indicadoresDashboard: countDashboard,
+    indicadoresLogin: countLogin,
+    url: url.substring(0, 60)
+  });
+  
+  return { 
+    tipo: 'indeterminado', 
+    mensaje: 'Resultado indeterminado - verificando...',
+    detalles: estado
+  };
 }
 
 // ============================================================
@@ -765,23 +1031,31 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     // PASO 13: Esperar y leer página
     log('info', `SCRAPER:${requestId}`, 'Esperando resultado...');
     
-    const resultadoPagina = await esperarYLeerPagina(page, requestId, urlAntes);
+    // Esperar a que la página se estabilice
+    await delay(TIMEOUT.esperaPostClick);
     
-    if (!resultadoPagina.exito) {
-      await enviarWhatsAppTexto(whatsappNumero, '❌ Error: No se pudo acceder a SINOE. Intente de nuevo.');
-      throw new Error('No se pudo leer la página después del login');
-    }
-    
-    // PASO 14: Analizar resultado
+    // Cerrar popups que puedan aparecer
     await cerrarPopups(page, `SCRAPER:${requestId}`);
     await delay(500);
     
-    const urlActual = await leerUrlSegura(page) || resultadoPagina.url;
-    const contenidoActual = await leerContenidoSeguro(page) || resultadoPagina.contenido;
+    // ═══════════════════════════════════════════════════════════════════
+    // FIX v4.9.3: Usar la nueva función analizarResultadoLogin
+    // ═══════════════════════════════════════════════════════════════════
     
-    const resultado = analizarResultadoLogin(urlActual, contenidoActual, urlAntes);
+    let resultado = await analizarResultadoLogin(page, urlAntes, requestId);
     
-    log('info', `SCRAPER:${requestId}`, 'Resultado:', resultado);
+    // Si es indeterminado, dar un poco más de tiempo y reintentar
+    if (resultado.tipo === 'indeterminado') {
+      log('info', `SCRAPER:${requestId}`, 'Resultado indeterminado, esperando 3s adicionales...');
+      await delay(3000);
+      await cerrarPopups(page, `SCRAPER:${requestId}`);
+      resultado = await analizarResultadoLogin(page, urlAntes, requestId);
+    }
+    
+    log('info', `SCRAPER:${requestId}`, 'Resultado del análisis:', { 
+      tipo: resultado.tipo, 
+      mensaje: resultado.mensaje 
+    });
     
     // MANEJO DE SESIÓN ACTIVA
     if (resultado.tipo === 'sesion_activa') {
@@ -845,18 +1119,14 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       if (nuevoBtn) await nuevoBtn.click();
       else await page.keyboard.press('Enter');
       
-      const nuevoResultado = await esperarYLeerPagina(page, requestId, nuevoUrlAntes);
+      await delay(TIMEOUT.esperaPostClick);
+      await cerrarPopups(page, `SCRAPER:${requestId}`);
       
-      if (!nuevoResultado.exito) {
-        await enviarWhatsAppTexto(whatsappNumero, '❌ Error en el segundo intento. Por favor intente de nuevo.');
-        throw new Error('Fallo en segundo intento después de finalizar sesión');
-      }
+      resultado = await analizarResultadoLogin(page, nuevoUrlAntes, requestId);
       
-      const nuevoAnalisis = analizarResultadoLogin(nuevoResultado.url, nuevoResultado.contenido, nuevoUrlAntes);
-      
-      if (nuevoAnalisis.tipo !== 'login_exitoso' && nuevoAnalisis.tipo !== 'indeterminado') {
-        await enviarWhatsAppTexto(whatsappNumero, `❌ ${nuevoAnalisis.mensaje}. Intente de nuevo.`);
-        throw new Error(`Error en segundo intento: ${nuevoAnalisis.mensaje}`);
+      if (resultado.tipo !== 'login_exitoso') {
+        await enviarWhatsAppTexto(whatsappNumero, `❌ ${resultado.mensaje}. Intente de nuevo.`);
+        throw new Error(`Error en segundo intento: ${resultado.mensaje}`);
       }
       
       log('success', `SCRAPER:${requestId}`, 'Login exitoso en segundo intento');
@@ -868,32 +1138,26 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       throw new Error('CAPTCHA incorrecto');
     }
     
-    // FIX v4.9.0: Manejar login fallido
-    if (resultado.tipo === 'login_fallido' || resultado.tipo === 'credenciales_invalidas') {
-      await enviarWhatsAppTexto(whatsappNumero, `❌ ${resultado.mensaje}. Verifique sus credenciales e intente de nuevo.`);
+    if (resultado.tipo === 'credenciales_invalidas') {
+      await enviarWhatsAppTexto(whatsappNumero, '❌ Usuario o contraseña incorrectos. Verifique sus credenciales.');
+      throw new Error('Credenciales inválidas');
+    }
+    
+    // FIX v4.9.3: Manejar login fallido explícitamente
+    if (resultado.tipo === 'login_fallido') {
+      await enviarWhatsAppTexto(whatsappNumero, `❌ ${resultado.mensaje}. Verifique el CAPTCHA e intente de nuevo.`);
       throw new Error(resultado.mensaje);
     }
     
-    if (resultado.tipo === 'error_desconocido') {
-      await enviarWhatsAppTexto(whatsappNumero, '❌ Error al iniciar sesión. Intente de nuevo.');
-      throw new Error('Error de login desconocido');
+    // Si sigue indeterminado después de reintentos, fallar
+    if (resultado.tipo === 'indeterminado') {
+      await enviarWhatsAppTexto(whatsappNumero, '⚠️ No se pudo confirmar el login. Intente de nuevo.');
+      throw new Error('Login indeterminado después de múltiples verificaciones');
     }
     
-    // Si es indeterminado, verificar si realmente tiene las opciones
-    if (resultado.tipo === 'indeterminado') {
-      log('warn', `SCRAPER:${requestId}`, 'Resultado indeterminado - verificando página...');
-      
-      // Intentar verificar de nuevo después de un momento
-      await delay(3000);
-      await cerrarPopups(page, `SCRAPER:${requestId}`);
-      
-      const contenidoVerificacion = await leerContenidoSeguro(page);
-      if (!contenidoVerificacion || 
-          (!contenidoVerificacion.toLowerCase().includes('casillas') && 
-           !contenidoVerificacion.toLowerCase().includes('mesa de partes'))) {
-        await enviarWhatsAppTexto(whatsappNumero, '⚠️ No se pudo confirmar el login. Verifique CAPTCHA e intente de nuevo.');
-        throw new Error('Login indeterminado - no se encontraron opciones de servicio');
-      }
+    // Si llegamos aquí, el login fue exitoso
+    if (resultado.tipo !== 'login_exitoso') {
+      throw new Error(`Tipo de resultado inesperado: ${resultado.tipo}`);
     }
     
     log('success', `SCRAPER:${requestId}`, 'Login exitoso en SINOE');
@@ -1055,7 +1319,7 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.9.2',
+    version: '4.9.3',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
@@ -1195,7 +1459,7 @@ app.post('/test-whatsapp', async (req, res) => {
   const validacion = validarNumeroWhatsApp(numero);
   if (!validacion.valido) return res.status(400).json({ success: false, error: validacion.error });
   
-  const enviado = await enviarWhatsAppTexto(validacion.numero, mensaje || '🧪 Test LEXA Scraper v4.9.0');
+  const enviado = await enviarWhatsAppTexto(validacion.numero, mensaje || '🧪 Test LEXA Scraper v4.9.3');
   res.json({ success: enviado });
 });
 
@@ -1307,6 +1571,44 @@ app.post('/test-captcha', async (req, res) => {
 });
 
 // ============================================================
+// NUEVO ENDPOINT: Test de verificación de estado de página
+// ============================================================
+
+app.post('/test-verificar-estado', async (req, res) => {
+  let browser = null;
+  
+  try {
+    const ws = CONFIG.browserless.token 
+      ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
+      : CONFIG.browserless.url;
+    
+    browser = await puppeteer.connect({ browserWSEndpoint: ws, defaultViewport: DEFAULT_VIEWPORT });
+    const page = await browser.newPage();
+    
+    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+    await delay(3000);
+    await cerrarPopups(page, 'TEST-ESTADO');
+    await delay(1000);
+    
+    const estado = await verificarEstadoPagina(page);
+    
+    res.json({ 
+      success: true, 
+      estado,
+      interpretacion: {
+        esPaginaLogin: estado.login.tieneCampoPassword || estado.login.tieneCampoCaptcha,
+        esDashboard: estado.dashboard.tieneFormDashboard && estado.dashboard.tieneBienvenida,
+        esSesionActiva: estado.sesionActiva.detectada
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+// ============================================================
 // GRACEFUL SHUTDOWN
 // ============================================================
 
@@ -1341,20 +1643,23 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║              LEXA SCRAPER SERVICE v4.9.2 - FIX FRAME TIMING                   ║
+║           LEXA SCRAPER SERVICE v4.9.3 - FIX FALSO POSITIVO LOGIN              ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${String(PORT).padEnd(70)}║
 ║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
 ║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
 ║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  CAMBIOS v4.9.2:                                                              ║
+║  FIX v4.9.3 - CAMBIO CRÍTICO:                                                 ║
 ║                                                                               ║
-║    ✓ FIX: Espera 3s para que página se estabilice post-login                  ║
-║    ✓ FIX: Reintentos (3x) si evaluarSeguro retorna null                       ║
-║    ✓ Más robusto ante frames en transición                                    ║
+║    ✓ analizarResultadoLogin() REESCRITO completamente                         ║
+║    ✓ Ya NO usa page.content() (causaba falsos positivos)                      ║
+║    ✓ Ahora verifica elementos DOM específicos del dashboard                   ║
+║    ✓ Verifica PRESENCIA de: form#frmNuevo, barra Bienvenido, botones          ║
+║    ✓ Verifica AUSENCIA de: input[type="password"], campo CAPTCHA              ║
+║    ✓ Consistente con navegarACasillas() (ambos usan evaluarSeguro)            ║
 ║                                                                               ║
-║  ESTRATEGIAS DE BÚSQUEDA (6):                                                 ║
+║  ESTRATEGIAS DE BÚSQUEDA CASILLAS (6):                                        ║
 ║    1. ID exacto: #frmNuevo:j_idt38                                            ║
 ║    2. span.txtredbtn → enlace padre                                           ║
 ║    3. a.ui-commandlink con texto "casillas"                                   ║
@@ -1363,8 +1668,10 @@ app.listen(PORT, () => {
 ║    6. Primer enlace frmNuevo (último recurso)                                 ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                                   ║
-║    GET  /health    POST /scraper    GET  /metricas    GET /sesiones           ║
-║    POST /webhook/whatsapp    POST /test-whatsapp    POST /test-conexion       ║
+║    GET  /health              POST /scraper           GET  /metricas           ║
+║    GET  /sesiones            POST /webhook/whatsapp  POST /test-whatsapp      ║
+║    POST /test-conexion       POST /test-credenciales POST /test-captcha       ║
+║    POST /test-verificar-estado (NUEVO - para diagnóstico)                     ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
   `);
   
