@@ -975,122 +975,168 @@ async function capturarFormularioLogin(page) {
 async function navegarACasillas(page, requestId) {
   log('info', `CASILLAS:${requestId}`, 'Buscando botón "Casillas Electrónicas"...');
   
+  // PRIMERO: Diagnóstico - ver qué hay en la página
+  const diagnostico = await evaluarSeguro(page, () => {
+    const resultado = {
+      url: window.location.href,
+      titulo: document.title,
+      bodyLength: document.body.innerText.length,
+      // Buscar elementos clave
+      btnservicios: document.querySelectorAll('.btnservicios, .bggradient, [class*="btnservicio"]').length,
+      enlaces: document.querySelectorAll('a').length,
+      enlacesOnclick: document.querySelectorAll('a[onclick]').length,
+      imagenes: document.querySelectorAll('img').length,
+      // Texto que contiene "casillas"
+      textoCasillas: document.body.innerText.toLowerCase().includes('casillas'),
+      textoElectronicas: document.body.innerText.toLowerCase().includes('electr'),
+      // Primeros 500 chars del body
+      extractoTexto: document.body.innerText.substring(0, 500).replace(/\s+/g, ' '),
+      // Todas las clases de divs principales
+      clasesDiv: [...new Set([...document.querySelectorAll('div[class]')].map(d => d.className).filter(c => c.length < 50))].slice(0, 20)
+    };
+    return resultado;
+  });
+  
+  log('info', `CASILLAS:${requestId}`, 'Diagnóstico de página:', diagnostico);
+  
+  // Si no hay texto "casillas", probablemente no estamos en la página correcta
+  if (!diagnostico?.textoCasillas) {
+    log('warn', `CASILLAS:${requestId}`, 'La página NO contiene texto "casillas" - puede que no sea la página de bienvenida');
+    
+    // Capturar screenshot para debug
+    try {
+      const screenshot = await page.screenshot({ encoding: 'base64', fullPage: false });
+      log('info', `CASILLAS:${requestId}`, `Screenshot capturado (${screenshot.length} bytes) - revisa logs para debug`);
+    } catch (e) {
+      log('warn', `CASILLAS:${requestId}`, 'No se pudo capturar screenshot');
+    }
+  }
+  
   const clickeado = await evaluarSeguro(page, () => {
     // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 1: Selector exacto del HTML de SINOE
-    // El botón está en: div.bggradient.btnservicios > a.ui-commandlink
+    // ESTRATEGIA 1: Buscar por clase exacta del HTML de SINOE
     // ═══════════════════════════════════════════════════════════════════
     
-    // Buscar el contenedor específico del botón de Casillas
-    const contenedores = document.querySelectorAll('.btnservicios, .bggradient, [class*="btnservicio"]');
+    // El botón está en div.bggradient.btnservicios (visto en tu screenshot)
+    const contenedores = document.querySelectorAll('.btnservicios, .bggradient.btnservicios, div[class*="btnservicio"]');
+    
+    console.log('Contenedores btnservicios encontrados:', contenedores.length);
     
     for (const contenedor of contenedores) {
-      const texto = (contenedor.innerText || contenedor.textContent || '').toLowerCase();
+      const texto = (contenedor.innerText || '').toLowerCase();
+      console.log('Contenedor texto:', texto.substring(0, 50));
       
       // Debe contener "casillas" pero NO "mesa de partes"
       if (texto.includes('casillas') && !texto.includes('mesa de partes')) {
-        // Buscar el enlace dentro del contenedor
-        const enlace = contenedor.querySelector('a.ui-commandlink, a[onclick], a');
+        const enlace = contenedor.querySelector('a');
         if (enlace) {
+          console.log('Encontrado enlace en btnservicios');
           enlace.click();
-          return { clickeado: true, texto: 'btnservicios casillas', metodo: 'contenedor_exacto' };
-        }
-        // Si el contenedor mismo es clickeable
-        if (contenedor.onclick || contenedor.getAttribute('onclick')) {
-          contenedor.click();
-          return { clickeado: true, texto: 'contenedor casillas', metodo: 'contenedor_click' };
+          return { clickeado: true, texto: 'btnservicios', metodo: 'clase_exacta' };
         }
       }
     }
     
     // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 2: Buscar por estructura de 3 columnas (col-md-4)
-    // La página tiene 3 opciones en columnas: SINOE, MPE, MPe ANC
+    // ESTRATEGIA 2: Buscar TODOS los enlaces con onclick que contengan submit
     // ═══════════════════════════════════════════════════════════════════
     
-    const columnas = document.querySelectorAll('.col-md-4, .col-xs-4, [class*="col-"][class*="-4"]');
+    const enlacesSubmit = document.querySelectorAll('a[onclick*="submit"]');
+    console.log('Enlaces con submit:', enlacesSubmit.length);
     
-    for (const columna of columnas) {
-      const texto = (columna.innerText || columna.textContent || '').toLowerCase();
+    for (const enlace of enlacesSubmit) {
+      // Subir 3 niveles para ver el contexto
+      let contexto = enlace;
+      for (let i = 0; i < 3; i++) {
+        if (contexto.parentElement) contexto = contexto.parentElement;
+      }
       
-      // Primera columna = Casillas Electrónicas (tiene "casillas" y NO tiene "mesa")
-      if (texto.includes('casillas') && texto.includes('electr') && !texto.includes('mesa')) {
-        const enlace = columna.querySelector('a.ui-commandlink, a[onclick], a');
-        if (enlace) {
-          enlace.click();
-          return { clickeado: true, texto: 'columna casillas', metodo: 'columna_grid' };
-        }
+      const textoContexto = (contexto.innerText || '').toLowerCase();
+      console.log('Enlace submit contexto:', textoContexto.substring(0, 50));
+      
+      if (textoContexto.includes('casillas') && !textoContexto.includes('mesa')) {
+        console.log('Match encontrado!');
+        enlace.click();
+        return { clickeado: true, texto: 'enlace_submit', metodo: 'onclick_submit' };
       }
     }
     
     // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 3: Buscar enlace con onclick que contenga submit
-    // Los enlaces de PrimeFaces usan: onclick="...submit('frmNuevo')..."
+    // ESTRATEGIA 3: Buscar el PRIMER panel/card que tenga imagen
+    // La página tiene 3 opciones, la primera es Casillas
     // ═══════════════════════════════════════════════════════════════════
     
-    const enlacesOnclick = document.querySelectorAll('a[onclick*="submit"], a.ui-commandlink');
+    const contenedoresConImagen = document.querySelectorAll('div');
     
-    for (const enlace of enlacesOnclick) {
-      // Subir al contenedor padre para ver el texto completo
-      let contenedor = enlace.parentElement;
-      for (let i = 0; i < 3 && contenedor; i++) {
-        const textoContenedor = (contenedor.innerText || '').toLowerCase();
+    for (const div of contenedoresConImagen) {
+      const tieneImagen = div.querySelector('img');
+      const tieneEnlace = div.querySelector('a[onclick]');
+      const texto = (div.innerText || '').toLowerCase();
+      
+      if (tieneImagen && tieneEnlace && texto.includes('casillas')) {
+        console.log('Panel con imagen encontrado');
+        tieneEnlace.click();
+        return { clickeado: true, texto: 'panel_imagen', metodo: 'div_con_imagen' };
+      }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // ESTRATEGIA 4: Buscar cualquier elemento clickeable con "casillas"
+    // ═══════════════════════════════════════════════════════════════════
+    
+    const todosElementos = document.querySelectorAll('a, button, [onclick]');
+    
+    for (const el of todosElementos) {
+      const texto = (el.innerText || el.textContent || '').toLowerCase();
+      
+      if (texto.includes('casillas') && texto.includes('electr')) {
+        console.log('Elemento con casillas electronicas:', texto.substring(0, 30));
+        el.click();
+        return { clickeado: true, texto: texto.substring(0, 30), metodo: 'texto_directo' };
+      }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // ESTRATEGIA 5 (ÚLTIMA): Primer enlace grande que NO sea instructivo
+    // ═══════════════════════════════════════════════════════════════════
+    
+    const todosEnlaces = document.querySelectorAll('a[onclick]');
+    
+    for (const enlace of todosEnlaces) {
+      const rect = enlace.getBoundingClientRect();
+      const texto = (enlace.innerText || '').toLowerCase();
+      
+      // Debe ser visible y no ser instructivo/manual
+      if (rect.width > 50 && rect.height > 20 && 
+          !texto.includes('instructivo') && 
+          !texto.includes('manual') &&
+          !texto.includes('cerrar')) {
         
-        if (textoContenedor.includes('casillas') && textoContenedor.includes('electr')) {
-          // Verificar que NO sea instructivo ni mesa de partes
-          if (!textoContenedor.includes('instructivo') && !textoContenedor.includes('mesa de partes')) {
-            enlace.click();
-            return { clickeado: true, texto: 'enlace primefaces', metodo: 'onclick_submit' };
-          }
-        }
-        contenedor = contenedor.parentElement;
-      }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 4: Buscar por imagen de SINOE (logo rojo)
-    // ═══════════════════════════════════════════════════════════════════
-    
-    const imagenes = document.querySelectorAll('img');
-    
-    for (const img of imagenes) {
-      const src = (img.src || '').toLowerCase();
-      const alt = (img.alt || '').toLowerCase();
-      
-      // Imagen del logo SINOE (no el logo general del PJ)
-      const esSinoe = (src.includes('sinoe') || alt.includes('sinoe')) && 
-                      !src.includes('logo') && !src.includes('header');
-      
-      if (esSinoe) {
-        // Subir hasta encontrar el contenedor clickeable
-        let padre = img.parentElement;
+        // Verificar que el padre contenga algo relacionado con SINOE
+        let padre = enlace.parentElement;
         for (let i = 0; i < 5 && padre; i++) {
           const textoPadre = (padre.innerText || '').toLowerCase();
-          
-          // Verificar que sea el de casillas (no mesa de partes)
-          if (textoPadre.includes('casillas') && !textoPadre.includes('mesa')) {
-            const enlace = padre.querySelector('a') || padre;
-            if (enlace.click) {
-              enlace.click();
-              return { clickeado: true, texto: 'imagen sinoe', metodo: 'imagen' };
-            }
+          if (textoPadre.includes('sinoe') || textoPadre.includes('casilla')) {
+            console.log('Enlace en contexto SINOE encontrado');
+            enlace.click();
+            return { clickeado: true, texto: 'primer_enlace_sinoe', metodo: 'fallback' };
           }
           padre = padre.parentElement;
         }
       }
     }
     
-    return { clickeado: false, metodo: 'ninguno' };
+    return { clickeado: false, metodo: 'ninguno', debug: 'Ninguna estrategia funcionó' };
   });
   
   if (!clickeado || !clickeado.clickeado) {
-    log('error', `CASILLAS:${requestId}`, '❌ No se encontró botón "Casillas Electrónicas"');
+    log('error', `CASILLAS:${requestId}`, '❌ No se encontró botón "Casillas Electrónicas"', { diagnostico, clickeado });
     return false;
   }
   
   log('success', `CASILLAS:${requestId}`, `✓ Clic en "${clickeado.texto}" (método: ${clickeado.metodo})`);
   
-  // Esperar navegación a sso-menu-app.xhtml
+  // Esperar navegación
   await delay(TIMEOUT.esperaClicCasillas);
   
   return true;
@@ -1899,7 +1945,7 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.8.2',
+    version: '4.8.3-debug',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
