@@ -1576,41 +1576,51 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
 // MIDDLEWARES
 // ============================================================
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));
 
-// Logging de requests
+// Rate limiting por IP
 app.use((req, res, next) => {
-  const start = Date.now();
-  res.on('finish', () => {
-    const ms = Date.now() - start;
-    if (req.path !== '/health') {
-      log('info', 'HTTP', `${req.method} ${req.path} - ${res.statusCode} (${ms}ms)`);
-    }
-  });
-  next();
-});
-
-// Autenticación básica
-const authMiddleware = (req, res, next) => {
-  // Excluir health y webhook de autenticación
-  if (req.path === '/health' || req.path.startsWith('/webhook/')) {
+  if (req.path === '/health') return next();
+  
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  const ahora = Date.now();
+  
+  if (!rateLimitCache.has(ip)) {
+    rateLimitCache.set(ip, { count: 1, timestamp: ahora });
     return next();
   }
   
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Token de autenticación requerido' });
+  const data = rateLimitCache.get(ip);
+  
+  if (ahora - data.timestamp > RATE_LIMIT.windowMs) {
+    rateLimitCache.set(ip, { count: 1, timestamp: ahora });
+    return next();
   }
   
-  const token = authHeader.split(' ')[1];
-  if (token !== API_KEY) {
-    return res.status(403).json({ error: 'Token inválido' });
+  data.count++;
+  
+  if (data.count > RATE_LIMIT.maxRequestsPerIp) {
+    return res.status(429).json({ success: false, error: 'Demasiadas solicitudes' });
   }
   
   next();
-};
+});
 
-app.use(authMiddleware);
+// Autenticación - acepta X-API-KEY o Authorization: Bearer
+app.use((req, res, next) => {
+  const publicPaths = ['/health', '/webhook/whatsapp'];
+  if (publicPaths.includes(req.path)) return next();
+  
+  // Acepta ambos formatos: X-API-KEY o Authorization: Bearer
+  const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
+  
+  if (apiKey !== API_KEY) {
+    log('warn', 'AUTH', `Acceso no autorizado a ${req.path}`);
+    return res.status(401).json({ success: false, error: 'Token de autenticación requerido' });
+  }
+  
+  next();
+});
 
 // ============================================================
 // ENDPOINTS
@@ -1712,67 +1722,37 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // Endpoint principal del scraper
 app.post('/scraper', async (req, res) => {
-  try {
-    const { sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado } = req.body;
-    
-    // Validaciones
-    if (!sinoeUsuario || !sinoePassword) {
-      return res.status(400).json({ error: 'Credenciales de SINOE requeridas' });
-    }
-    
-    if (!whatsappNumero) {
-      return res.status(400).json({ error: 'Número de WhatsApp requerido' });
-    }
-    
-    const numeroValidacion = validarNumeroWhatsApp(whatsappNumero);
-    if (!numeroValidacion.valido) {
-      return res.status(400).json({ error: numeroValidacion.error });
-    }
-    
-    // Rate limiting
-    const ahora = Date.now();
-    const ultimoRequest = rateLimitCache.get(numeroValidacion.numero);
-    if (ultimoRequest && (ahora - ultimoRequest) < RATE_LIMIT.minIntervaloMs) {
-      const segundosRestantes = Math.ceil((RATE_LIMIT.minIntervaloMs - (ahora - ultimoRequest)) / 1000);
-      return res.status(429).json({ 
-        error: `Espere ${segundosRestantes}s antes de intentar de nuevo`,
-        retryAfter: segundosRestantes
-      });
-    }
-    rateLimitCache.set(numeroValidacion.numero, ahora);
-    
-    // Verificar sesión existente
-    if (sesionesActivas.has(numeroValidacion.numero)) {
-      return res.status(409).json({ 
-        error: 'Ya hay una sesión activa para este número',
-        hint: 'Espere a que termine o envíe el CAPTCHA pendiente'
-      });
-    }
-    
-    log('info', 'API', `Iniciando scraper para ${enmascarar(numeroValidacion.numero)}`);
-    
-    // Ejecutar scraper (async, responde inmediatamente)
-    ejecutarScraper({
-      sinoeUsuario,
-      sinoePassword,
-      whatsappNumero: numeroValidacion.numero,
-      nombreAbogado: nombreAbogado || 'Usuario'
-    }).then(resultado => {
-      log('info', 'API', `Scraper finalizado: ${resultado.success ? 'ÉXITO' : 'FALLO'}`);
-    }).catch(error => {
-      log('error', 'API', `Error en scraper: ${error.message}`);
-    });
-    
-    res.status(202).json({ 
-      status: 'iniciado',
-      mensaje: 'Scraper iniciado. El abogado recibirá el CAPTCHA por WhatsApp.',
-      numero: enmascarar(numeroValidacion.numero)
-    });
-    
-  } catch (error) {
-    log('error', 'API', error.message);
-    res.status(500).json({ error: error.message });
+  metricas.requestsTotal++;
+  
+  const { sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado } = req.body;
+  
+  // Validaciones
+  if (!sinoeUsuario || !sinoePassword) {
+    return res.status(400).json({ success: false, error: 'Credenciales requeridas' });
   }
+  
+  const numeroValidacion = validarNumeroWhatsApp(whatsappNumero);
+  if (!numeroValidacion.valido) {
+    return res.status(400).json({ success: false, error: numeroValidacion.error });
+  }
+  
+  // Verificar sesión existente
+  if (sesionesActivas.has(numeroValidacion.numero)) {
+    return res.status(409).json({ success: false, error: 'Ya hay un proceso activo para este número' });
+  }
+  
+  // Responder inmediatamente
+  res.json({ success: true, message: 'Proceso iniciado' });
+  
+  // Ejecutar scraper en background
+  ejecutarScraper({
+    sinoeUsuario,
+    sinoePassword,
+    whatsappNumero: numeroValidacion.numero,
+    nombreAbogado: nombreAbogado || 'Dr(a).'
+  }).catch(error => {
+    log('error', 'SCRAPER', `Error no manejado: ${error.message}`);
+  });
 });
 
 // ============================================================
