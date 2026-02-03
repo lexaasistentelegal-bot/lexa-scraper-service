@@ -1,9 +1,15 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.6.1 - Sistema Screenshot CAPTCHA
+ * LEXA SCRAPER SERVICE v4.6.2 - Sistema Screenshot CAPTCHA
  * ============================================================
  * Versión: AAA (Producción - Auditada)
  * Fecha: Febrero 2026
+ * 
+ * CAMBIOS v4.6.2:
+ * - FIX CRÍTICO: verificarCaptchaValido() ahora busca CAPTCHA por múltiples métodos
+ * - FIX: Detecta CAPTCHA por: patrón en src/id, cercanía al input, dimensiones en form
+ * - FIX: Soporta jcaptcha, imgCod, código y otros patrones de SINOE
+ * - MEJORA: Debug info cuando no encuentra CAPTCHA (lista imágenes disponibles)
  * 
  * CAMBIOS v4.6.1 (CORRECCIONES DE AUDITORÍA):
  * - FIX: Eliminado código muerto (SELECTORES no usado)
@@ -93,7 +99,7 @@ const DEFAULT_VIEWPORT = {
 };
 
 // ============================================================
-// VALIDACIÓN DE CONFIGURACIÓN CRÍTICA (v4.6.1)
+// VALIDACIÓN DE CONFIGURACIÓN CRÍTICA (v4.6.2)
 // ============================================================
 
 /**
@@ -141,7 +147,7 @@ const metricas = {
 const sesionesActivas = new Map();
 const rateLimitCache = new Map();
 
-// v4.6.1: Guardar referencia del intervalo para limpieza en shutdown
+// v4.6.2: Guardar referencia del intervalo para limpieza en shutdown
 let limpiezaInterval = null;
 
 /**
@@ -349,7 +355,7 @@ app.use((req, res, next) => {
  * @returns {Promise<boolean>} true si se envió correctamente
  */
 async function enviarWhatsAppTexto(numero, mensaje, intentos = 3) {
-  // v4.6.1: Validar que apiKey esté configurada
+  // v4.6.2: Validar que apiKey esté configurada
   if (!CONFIG.evolution.apiKey) {
     log('error', 'WHATSAPP', 'EVOLUTION_API_KEY no configurada');
     return false;
@@ -408,7 +414,7 @@ async function enviarWhatsAppTexto(numero, mensaje, intentos = 3) {
  * @returns {Promise<boolean>} true si se envió correctamente
  */
 async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) {
-  // v4.6.1: Validar que apiKey esté configurada
+  // v4.6.2: Validar que apiKey esté configurada
   if (!CONFIG.evolution.apiKey) {
     log('error', 'WHATSAPP', 'EVOLUTION_API_KEY no configurada');
     return false;
@@ -752,54 +758,151 @@ async function llenarCredenciales(page, usuario, password) {
 
 /**
  * Verifica si la imagen del CAPTCHA cargó correctamente
+ * SINOE usa múltiples formatos: jcaptcha, imgCaptcha, o imagen cerca del input captcha
  * @param {Page} page - Instancia de Puppeteer Page
- * @returns {Promise<{valido: boolean, razon: string, width?: number, height?: number}>}
+ * @returns {Promise<{valido: boolean, razon: string, width?: number, height?: number, metodo?: string}>}
  */
 async function verificarCaptchaValido(page) {
   return await page.evaluate((config) => {
+    // MÉTODO 1: Buscar por src o id que contenga "captcha" o "jcaptcha"
     const imagenes = document.querySelectorAll('img');
     
     for (const img of imagenes) {
       const src = (img.src || '').toLowerCase();
       const id = (img.id || '').toLowerCase();
+      const alt = (img.alt || '').toLowerCase();
       
-      if (src.includes('captcha') || id.includes('captcha')) {
+      // Buscar múltiples patrones de CAPTCHA
+      const esCaptcha = src.includes('captcha') || 
+                        src.includes('jcaptcha') ||
+                        src.includes('codigo') ||
+                        src.includes('code') ||
+                        id.includes('captcha') || 
+                        id.includes('imgcod') ||
+                        alt.includes('captcha') ||
+                        alt.includes('codigo');
+      
+      if (esCaptcha) {
         if (!img.complete) {
-          return { valido: false, razon: 'Imagen aún cargando' };
+          return { valido: false, razon: 'Imagen CAPTCHA aún cargando', metodo: 'patron-directo' };
         }
         
         if (img.naturalWidth === 0 || img.naturalHeight === 0) {
-          return { valido: false, razon: 'Imagen no cargó (dimensiones 0)' };
+          return { valido: false, razon: 'Imagen CAPTCHA no cargó (dimensiones 0)', metodo: 'patron-directo' };
         }
         
-        if (img.naturalWidth < config.minWidth || img.naturalWidth > config.maxWidth) {
+        // Validación de dimensiones (CAPTCHA típico: 80-200px ancho, 25-80px alto)
+        if (img.naturalWidth >= 50 && img.naturalWidth <= 300 &&
+            img.naturalHeight >= 20 && img.naturalHeight <= 100) {
           return { 
-            valido: false, 
-            razon: `Ancho inválido: ${img.naturalWidth}px (esperado: ${config.minWidth}-${config.maxWidth}px)` 
+            valido: true, 
+            razon: 'OK',
+            width: img.naturalWidth,
+            height: img.naturalHeight,
+            metodo: 'patron-directo',
+            src: src.substring(0, 50)
           };
         }
-        
-        if (img.naturalHeight < config.minHeight || img.naturalHeight > config.maxHeight) {
-          return { 
-            valido: false, 
-            razon: `Alto inválido: ${img.naturalHeight}px (esperado: ${config.minHeight}-${config.maxHeight}px)` 
-          };
-        }
-        
-        if (src.includes('placeholder') || src.includes('error') || src.includes('default')) {
-          return { valido: false, razon: 'Imagen es placeholder/error' };
-        }
-        
-        return { 
-          valido: true, 
-          razon: 'OK',
-          width: img.naturalWidth,
-          height: img.naturalHeight
-        };
       }
     }
     
-    return { valido: false, razon: 'No se encontró imagen de CAPTCHA en el DOM' };
+    // MÉTODO 2: Buscar imagen cerca del input de CAPTCHA
+    const inputCaptcha = document.querySelector('input[id*="captcha"], input[placeholder*="Captcha"], input[placeholder*="captcha"]');
+    
+    if (inputCaptcha) {
+      // Buscar en el mismo contenedor padre
+      let container = inputCaptcha.parentElement;
+      let nivel = 0;
+      
+      while (container && nivel < 5) {
+        const imagenCercana = container.querySelector('img');
+        
+        if (imagenCercana && imagenCercana.complete) {
+          const w = imagenCercana.naturalWidth;
+          const h = imagenCercana.naturalHeight;
+          
+          // Verificar dimensiones típicas de CAPTCHA
+          if (w >= 50 && w <= 300 && h >= 20 && h <= 100) {
+            if (w === 0 || h === 0) {
+              return { valido: false, razon: 'Imagen cercana al input no cargó', metodo: 'cercania-input' };
+            }
+            
+            return { 
+              valido: true, 
+              razon: 'OK (imagen cercana al input)',
+              width: w,
+              height: h,
+              metodo: 'cercania-input'
+            };
+          }
+        }
+        
+        container = container.parentElement;
+        nivel++;
+      }
+      
+      // Buscar imagen hermana del input
+      const padre = inputCaptcha.parentElement;
+      if (padre) {
+        const hermanos = padre.parentElement?.querySelectorAll('img');
+        if (hermanos) {
+          for (const img of hermanos) {
+            if (img.complete && img.naturalWidth >= 50 && img.naturalWidth <= 300 &&
+                img.naturalHeight >= 20 && img.naturalHeight <= 100) {
+              return { 
+                valido: true, 
+                razon: 'OK (imagen hermana)',
+                width: img.naturalWidth,
+                height: img.naturalHeight,
+                metodo: 'hermana-input'
+              };
+            }
+          }
+        }
+      }
+    }
+    
+    // MÉTODO 3: Buscar cualquier imagen con dimensiones típicas de CAPTCHA
+    // que esté dentro del formulario de login
+    const form = document.querySelector('form[id*="Login"], form[id*="login"], form');
+    if (form) {
+      const imagenesForm = form.querySelectorAll('img');
+      for (const img of imagenesForm) {
+        if (img.complete) {
+          const w = img.naturalWidth;
+          const h = img.naturalHeight;
+          
+          // Dimensiones típicas de CAPTCHA: no muy grande, no muy pequeño
+          if (w >= 80 && w <= 200 && h >= 25 && h <= 60) {
+            return { 
+              valido: true, 
+              razon: 'OK (imagen en formulario con dimensiones CAPTCHA)',
+              width: w,
+              height: h,
+              metodo: 'dimension-form'
+            };
+          }
+        }
+      }
+    }
+    
+    // DEBUG: Listar todas las imágenes encontradas para diagnóstico
+    const debugInfo = [];
+    for (const img of imagenes) {
+      if (img.naturalWidth > 0) {
+        debugInfo.push({
+          src: (img.src || '').substring(0, 60),
+          id: img.id || 'sin-id',
+          size: `${img.naturalWidth}x${img.naturalHeight}`
+        });
+      }
+    }
+    
+    return { 
+      valido: false, 
+      razon: 'No se encontró imagen de CAPTCHA válida',
+      imagenes: debugInfo.slice(0, 5) // Primeras 5 imágenes para debug
+    };
   }, CAPTCHA_CONFIG);
 }
 
@@ -856,7 +959,7 @@ async function recargarCaptcha(page) {
 
 /**
  * v4.6.0 - Asegura que el CAPTCHA sea válido antes de continuar
- * v4.6.1 - Corregido: error en re-llenar credenciales ahora se propaga
+ * v4.6.2 - Corregido: error en re-llenar credenciales ahora se propaga
  * 
  * @param {Page} page - Instancia de Puppeteer Page
  * @param {string} usuario - Usuario de SINOE
@@ -901,7 +1004,7 @@ async function asegurarCaptchaValido(page, usuario, password) {
       await cerrarPopups(page);
       await delay(500);
       
-      // v4.6.1: Error en re-llenar credenciales ahora se PROPAGA (no se silencia)
+      // v4.6.2: Error en re-llenar credenciales ahora se PROPAGA (no se silencia)
       log('info', 'CAPTCHA', 'Re-llenando credenciales después del refresh...');
       await llenarCredenciales(page, usuario, password);
       await delay(500);
@@ -920,7 +1023,7 @@ async function asegurarCaptchaValido(page, usuario, password) {
 
 /**
  * Captura screenshot del formulario completo de login
- * v4.6.1 - Agregado null check para viewport
+ * v4.6.2 - Agregado null check para viewport
  * @param {Page} page - Instancia de Puppeteer Page
  * @returns {Promise<string>} Screenshot en base64
  */
@@ -1023,7 +1126,7 @@ async function capturarFormularioLogin(page) {
   // FALLBACK: capturar área central de la pantalla
   log('warn', 'CAPTURA', 'Usando fallback - área central de pantalla');
   
-  // v4.6.1: Null check para viewport - usar DEFAULT_VIEWPORT si es null
+  // v4.6.2: Null check para viewport - usar DEFAULT_VIEWPORT si es null
   const viewport = page.viewport() || DEFAULT_VIEWPORT;
   const centerX = (viewport.width - 500) / 2;
   const centerY = 100;
@@ -1527,7 +1630,7 @@ app.post('/test-whatsapp', async (req, res) => {
   
   const resultado = await enviarWhatsAppTexto(
     validacion.numero, 
-    req.body.mensaje || '🧪 Test LEXA Scraper v4.6.1'
+    req.body.mensaje || '🧪 Test LEXA Scraper v4.6.2'
   );
   res.json({ success: resultado });
 });
@@ -1670,13 +1773,13 @@ app.post('/test-captcha', async (req, res) => {
 });
 
 // ============================================================
-// GRACEFUL SHUTDOWN (v4.6.1 mejorado)
+// GRACEFUL SHUTDOWN (v4.6.2 mejorado)
 // ============================================================
 
 async function shutdown(signal) {
   log('warn', 'SHUTDOWN', `Señal ${signal} recibida, cerrando...`);
   
-  // v4.6.1: Limpiar el intervalo de limpieza
+  // v4.6.2: Limpiar el intervalo de limpieza
   if (limpiezaInterval) {
     clearInterval(limpiezaInterval);
     log('info', 'SHUTDOWN', 'Intervalo de limpieza detenido');
@@ -1720,14 +1823,14 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.6.1 (AAA - Auditado)           ║
+║           LEXA SCRAPER SERVICE v4.6.2 (AAA - Auditado)           ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${PORT}                                                     ║
 ║  Auth: ${process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️'}                                      ║
 ║  WhatsApp: ${CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌'}                                  ║
 ║  Browserless: ${CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️'}                                ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  CORRECCIONES v4.6.1 (Auditoría):                                ║
+║  CORRECCIONES v4.6.2 (Auditoría):                                ║
 ║    ✓ Eliminado código muerto (SELECTORES)                        ║
 ║    ✓ Agregado null check a viewport                              ║
 ║    ✓ setInterval ahora se limpia en shutdown                     ║
