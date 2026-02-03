@@ -1,508 +1,800 @@
+/**
+ * ============================================================
+ * LEXA SCRAPER SERVICE v4.1.0 - Sistema Screenshot CAPTCHA
+ * ============================================================
+ * Versión: AAA (Producción)
+ * Fecha: Febrero 2026
+ * 
+ * MEJORAS SOBRE v4.0.0:
+ * - Autenticación por API Key en todos los endpoints
+ * - Rate limiting por IP
+ * - Validación estricta de inputs
+ * - Manejo de race conditions
+ * - Reintentos automáticos para WhatsApp
+ * - Mejor captura de CAPTCHA con validación
+ * - Structured logging con niveles
+ * - Métricas básicas
+ * - Graceful shutdown
+ * - Datos sensibles enmascarados en logs
+ * ============================================================
+ */
+
 const express = require('express');
 const puppeteer = require('puppeteer-core');
+const crypto = require('crypto');
 
 const app = express();
-app.use(express.json());
 
+// ============================================================
+// CONFIGURACIÓN Y CONSTANTES
+// ============================================================
+
+const PORT = process.env.PORT || 3001;
+const API_KEY = process.env.API_KEY || crypto.randomUUID();
+
+// URLs de SINOE
+const SINOE_URLS = {
+  login: 'https://casillas.pj.gob.pe/sinoe/sso-validar.xhtml',
+  sessionActiva: 'sso-session-activa',
+  dashboard: 'login.xhtml',
+  bandeja: 'sso-menu-app.xhtml'
+};
+
+// Selectores CSS
+const SELECTORES = {
+  usuario: 'input[placeholder="Usuario"]',
+  password: 'input[placeholder="Contraseña"]',
+  captcha: 'input[placeholder="Ingrese Captcha"], #frmLogin\\:captcha',
+  captchaImg: 'img[id*="captcha"], img[src*="captcha"]',
+  btnIngresar: '#frmLogin\\:btnIngresar, button[type="submit"]',
+  tablaNotificaciones: 'table tbody tr, .ui-datatable-data tr'
+};
+
+// Timeouts
+const TIMEOUT = {
+  navegacion: 60000,
+  captcha: 300000,
+  api: 30000,
+  modal: 15000,
+  descarga: 120000
+};
+
+// Configuración externa
 const CONFIG = {
-  BROWSERLESS_WS: process.env.BROWSERLESS_URL || 'wss://browser.lexaasistentelegal.com',
-  BROWSERLESS_TOKEN: process.env.BROWSERLESS_TOKEN || '',
-  BROWSERLESS_DEBUGGER: process.env.BROWSERLESS_DEBUGGER || 'https://browser.lexaasistentelegal.com',
-  EVOLUTION_URL: process.env.EVOLUTION_URL || 'https://evo.lexaasistentelegal.com',
-  EVOLUTION_API_KEY: process.env.EVOLUTION_API_KEY || '',
-  EVOLUTION_INSTANCE: process.env.EVOLUTION_INSTANCE || 'lexa-bot',
-  TIMEOUT_CAPTCHA: 300000,  // 5 minutos
-  TIMEOUT_NAV: 60000        // 1 minuto
+  browserless: {
+    url: process.env.BROWSERLESS_URL || 'wss://browser.lexaasistentelegal.com',
+    token: process.env.BROWSERLESS_TOKEN
+  },
+  evolution: {
+    url: process.env.EVOLUTION_URL || 'https://evo.lexaasistentelegal.com',
+    apiKey: process.env.EVOLUTION_API_KEY,
+    instance: process.env.EVOLUTION_INSTANCE || 'lexa-bot'
+  }
+};
+
+// Rate limiting
+const RATE_LIMIT = {
+  windowMs: 60000,
+  maxRequestsPerIp: 30
 };
 
 // ============================================================
-// FUNCIÓN: Enviar WhatsApp vía Evolution API
+// MÉTRICAS
 // ============================================================
-async function enviarWhatsApp(numero, mensaje) {
-  const url = `${CONFIG.EVOLUTION_URL}/message/sendText/${CONFIG.EVOLUTION_INSTANCE}`;
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'apikey': CONFIG.EVOLUTION_API_KEY },
-      body: JSON.stringify({ number: numero, text: mensaje })
-    });
-    console.log(`[WA] Enviado a ${numero}: ${response.ok ? 'OK' : 'ERROR'}`);
-    return response.ok;
-  } catch (error) {
-    console.log(`[WA] Error: ${error.message}`);
-    return false;
-  }
-}
+
+const metricas = {
+  requestsTotal: 0,
+  scrapersIniciados: 0,
+  scrapersExitosos: 0,
+  scrapersFallidos: 0,
+  captchasRecibidos: 0,
+  tiempoPromedioMs: 0,
+  ultimoReinicio: new Date().toISOString()
+};
 
 // ============================================================
-// FUNCIÓN: Esperar un tiempo
+// ALMACENAMIENTO EN MEMORIA
 // ============================================================
+
+const sesionesActivas = new Map();
+const rateLimitCache = new Map();
+
+// Limpieza automática cada minuto
+setInterval(() => {
+  const ahora = Date.now();
+  
+  for (const [numero, sesion] of sesionesActivas.entries()) {
+    if (ahora - sesion.timestamp > 360000) {
+      log('warn', 'LIMPIEZA', `Sesión expirada: ${enmascarar(numero)}`);
+      if (sesion.reject) sesion.reject(new Error('Timeout: CAPTCHA no resuelto'));
+      if (sesion.browser) sesion.browser.close().catch(() => {});
+      sesionesActivas.delete(numero);
+    }
+  }
+  
+  for (const [ip, data] of rateLimitCache.entries()) {
+    if (ahora - data.timestamp > RATE_LIMIT.windowMs) {
+      rateLimitCache.delete(ip);
+    }
+  }
+}, 60000);
+
+// ============================================================
+// UTILIDADES
+// ============================================================
+
+function enmascarar(texto) {
+  if (!texto || texto.length < 6) return '***';
+  return texto.substring(0, 3) + '***' + texto.substring(texto.length - 2);
+}
+
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ============================================================
-// ENDPOINT: Health Check
-// ============================================================
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'lexa-scraper',
-    version: '2.0.0',
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get('/', (req, res) => {
-  res.json({ 
-    service: 'LEXA Scraper',
-    version: '2.0.0',
-    endpoints: ['/health', '/scraper', '/test-browserless']
-  });
-});
-
-// ============================================================
-// ENDPOINT: Test Browserless
-// ============================================================
-app.get('/test-browserless', async (req, res) => {
-  let browser = null;
-  try {
-    const wsUrl = `${CONFIG.BROWSERLESS_WS}?token=${CONFIG.BROWSERLESS_TOKEN}`;
-    console.log('[TEST] Conectando a Browserless...');
-    
-    browser = await puppeteer.connect({ browserWSEndpoint: wsUrl });
-    const version = await browser.version();
-    await browser.close();
-    
-    res.json({ success: true, browserVersion: version });
-  } catch (error) {
-    if (browser) try { await browser.close(); } catch (e) {}
-    res.json({ success: false, error: error.message });
-  }
-});
-
-// ============================================================
-// ENDPOINT: Scraper SINOE
-// ============================================================
-app.post('/scraper', async (req, res) => {
-  const { sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado = 'Doctor(a)' } = req.body;
+function log(nivel, contexto, mensaje, datos = {}) {
+  const timestamp = new Date().toISOString();
+  const iconos = { debug: '🔍', info: 'ℹ️', warn: '⚠️', error: '❌', success: '✅' };
   
-  if (!sinoeUsuario || !sinoePassword || !whatsappNumero) {
-    return res.json({ success: false, error: 'Faltan datos: sinoeUsuario, sinoePassword, whatsappNumero' });
+  if (process.env.NODE_ENV === 'production') {
+    console.log(JSON.stringify({ timestamp, nivel, contexto, mensaje, ...datos }));
+  } else {
+    console.log(`[${timestamp}] ${iconos[nivel] || '•'} [${contexto}] ${mensaje}`, 
+      Object.keys(datos).length > 0 ? datos : '');
+  }
+}
+
+function validarNumeroWhatsApp(numero) {
+  if (!numero || typeof numero !== 'string') {
+    return { valido: false, error: 'Número no proporcionado' };
   }
   
-  let browser = null;
+  const limpio = numero.replace(/[\s\-\+\(\)]/g, '');
   
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`[SCRAPER] Iniciando para ${nombreAbogado}`);
-  console.log(`[SCRAPER] Usuario SINOE: ${sinoeUsuario}`);
-  console.log(`${'='.repeat(60)}\n`);
+  if (!/^51\d{9}$/.test(limpio)) {
+    return { valido: false, error: 'Formato inválido. Use: 51XXXXXXXXX (11 dígitos)' };
+  }
   
-  try {
-    // ========================================
-    // PASO 1: Conectar a Browserless
-    // ========================================
-    console.log('[1/10] Conectando a Browserless...');
-    const wsUrl = `${CONFIG.BROWSERLESS_WS}?token=${CONFIG.BROWSERLESS_TOKEN}`;
-    browser = await puppeteer.connect({ browserWSEndpoint: wsUrl });
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    console.log('[1/10] ✓ Conectado a Browserless');
+  return { valido: true, numero: limpio };
+}
+
+function validarCaptcha(texto) {
+  if (!texto || typeof texto !== 'string') {
+    return { valido: false, error: 'Texto vacío' };
+  }
+  
+  const limpio = texto.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  
+  if (limpio.length < 4 || limpio.length > 6) {
+    return { 
+      valido: false, 
+      error: `El CAPTCHA debe tener 5 caracteres (recibido: ${limpio.length})`,
+      sugerencia: 'Escriba solo las letras/números que ve en la imagen.'
+    };
+  }
+  
+  return { valido: true, captcha: limpio };
+}
+
+// ============================================================
+// MIDDLEWARES
+// ============================================================
+
+app.use(express.json({ limit: '1mb' }));
+
+// Rate limiting
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();
+  
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  const ahora = Date.now();
+  
+  if (!rateLimitCache.has(ip)) {
+    rateLimitCache.set(ip, { count: 1, timestamp: ahora });
+    return next();
+  }
+  
+  const data = rateLimitCache.get(ip);
+  
+  if (ahora - data.timestamp > RATE_LIMIT.windowMs) {
+    rateLimitCache.set(ip, { count: 1, timestamp: ahora });
+    return next();
+  }
+  
+  data.count++;
+  
+  if (data.count > RATE_LIMIT.maxRequestsPerIp) {
+    return res.status(429).json({
+      success: false,
+      error: 'Demasiadas solicitudes. Intente en 1 minuto.'
+    });
+  }
+  
+  next();
+});
+
+// Autenticación (excepto /health y /webhook/whatsapp)
+app.use((req, res, next) => {
+  const publicPaths = ['/health', '/webhook/whatsapp'];
+  if (publicPaths.includes(req.path)) return next();
+  
+  const apiKey = req.headers['x-api-key'] || req.headers['apikey'];
+  
+  if (!apiKey || apiKey !== API_KEY) {
+    return res.status(401).json({
+      success: false,
+      error: 'API Key inválida',
+      hint: 'Incluya header X-API-KEY'
+    });
+  }
+  
+  next();
+});
+
+// Logging
+app.use((req, res, next) => {
+  metricas.requestsTotal++;
+  next();
+});
+
+// ============================================================
+// FUNCIONES WHATSAPP CON REINTENTOS
+// ============================================================
+
+async function enviarWhatsAppTexto(numero, mensaje, intentos = 3) {
+  for (let i = 1; i <= intentos; i++) {
+    try {
+      const url = `${CONFIG.evolution.url}/message/sendText/${CONFIG.evolution.instance}`;
+      
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': CONFIG.evolution.apiKey
+        },
+        body: JSON.stringify({ number: numero, text: mensaje }),
+        signal: AbortSignal.timeout(TIMEOUT.api)
+      });
+
+      if (response.ok) {
+        log('success', 'WHATSAPP', 'Texto enviado', { numero: enmascarar(numero) });
+        return true;
+      }
+      
+    } catch (error) {
+      log('warn', 'WHATSAPP', `Intento ${i}/${intentos} fallido`);
+    }
     
-    // ========================================
-    // PASO 2: Navegar a SINOE
-    // ========================================
-    console.log('[2/10] Abriendo SINOE...');
-    await page.goto('https://casillas.pj.gob.pe/sinoe/sso-validar.xhtml', {
-      waitUntil: 'networkidle2',
-      timeout: CONFIG.TIMEOUT_NAV
+    if (i < intentos) await delay(1000 * i);
+  }
+  
+  return false;
+}
+
+async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) {
+  if (!base64Image || base64Image.length < 100) {
+    log('error', 'WHATSAPP', 'Imagen inválida');
+    return false;
+  }
+  
+  for (let i = 1; i <= intentos; i++) {
+    try {
+      const url = `${CONFIG.evolution.url}/message/sendMedia/${CONFIG.evolution.instance}`;
+      
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': CONFIG.evolution.apiKey
+        },
+        body: JSON.stringify({
+          number: numero,
+          mediatype: 'image',
+          media: `data:image/png;base64,${base64Image}`,
+          caption: caption
+        }),
+        signal: AbortSignal.timeout(TIMEOUT.api)
+      });
+
+      if (response.ok) {
+        log('success', 'WHATSAPP', 'Imagen enviada', { numero: enmascarar(numero) });
+        return true;
+      }
+      
+    } catch (error) {
+      log('warn', 'WHATSAPP', `Imagen intento ${i}/${intentos} fallido`);
+    }
+    
+    if (i < intentos) await delay(1000 * i);
+  }
+  
+  return false;
+}
+
+// ============================================================
+// FUNCIONES DE SCRAPING
+// ============================================================
+
+async function llenarCampo(page, selector, valor) {
+  const campo = await page.$(selector);
+  if (!campo) throw new Error(`Campo no encontrado: ${selector}`);
+  
+  await campo.click({ clickCount: 3 });
+  await delay(100);
+  await page.keyboard.press('Backspace');
+  await delay(100);
+  await campo.type(valor, { delay: 50 });
+}
+
+async function capturarCaptcha(page) {
+  await page.waitForSelector(SELECTORES.captchaImg, { timeout: 10000 })
+    .catch(() => {});
+  
+  await delay(500);
+  
+  const captchaImg = await page.$(SELECTORES.captchaImg);
+  
+  if (captchaImg) {
+    const box = await captchaImg.boundingBox();
+    
+    if (box && box.width > 50 && box.height > 20) {
+      const screenshot = await captchaImg.screenshot({ encoding: 'base64' });
+      
+      if (screenshot && screenshot.length > 500) {
+        log('success', 'CAPTCHA', 'Screenshot capturado', { size: screenshot.length });
+        return screenshot;
+      }
+    }
+  }
+  
+  // Fallback: screenshot del formulario
+  log('warn', 'CAPTCHA', 'Usando fallback');
+  
+  const form = await page.$('form, .login-form, .ui-panel');
+  if (form) {
+    const formBox = await form.boundingBox();
+    if (formBox) {
+      return await page.screenshot({ 
+        encoding: 'base64',
+        clip: {
+          x: formBox.x,
+          y: formBox.y + formBox.height * 0.4,
+          width: formBox.width,
+          height: formBox.height * 0.4
+        }
+      });
+    }
+  }
+  
+  return await page.screenshot({ encoding: 'base64' });
+}
+
+async function buscarLinkCasillas(page) {
+  const links = await page.$$('a');
+  
+  for (const link of links) {
+    const texto = await link.evaluate(el => el.textContent?.toLowerCase() || '');
+    const href = await link.evaluate(el => el.href?.toLowerCase() || '');
+    
+    if (texto.includes('olvidó') || texto.includes('recuperar')) continue;
+    
+    if (texto.includes('sinoe') || texto.includes('casilla') || 
+        href.includes('sinoe') || href.includes('casilla')) {
+      return link;
+    }
+  }
+  
+  return null;
+}
+
+async function extraerNotificaciones(page) {
+  await page.waitForSelector('table, .ui-datatable', { timeout: TIMEOUT.navegacion })
+    .catch(() => {});
+  
+  await delay(2000);
+  
+  return await page.evaluate(() => {
+    const filas = document.querySelectorAll('table tbody tr, .ui-datatable-data tr');
+    const datos = [];
+    
+    filas.forEach((fila, index) => {
+      if (fila.cells?.length < 2) return;
+      const celdas = fila.querySelectorAll('td');
+      if (celdas.length === 0) return;
+      
+      const textos = Array.from(celdas).map(c => c.textContent?.trim() || '');
+      
+      datos.push({
+        indice: index + 1,
+        expediente: textos[0] || '',
+        juzgado: textos[1] || '',
+        fecha: textos[2] || '',
+        sumilla: textos[3] || '',
+        estado: textos[4] || '',
+        raw: textos
+      });
     });
     
-    // Esperar a que cargue completamente
-    await delay(2000);
+    return datos;
+  });
+}
+
+// ============================================================
+// FUNCIÓN PRINCIPAL DEL SCRAPER
+// ============================================================
+
+async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado }) {
+  let browser = null;
+  let page = null;
+  const inicioMs = Date.now();
+  const requestId = crypto.randomUUID().substring(0, 8);
+  
+  try {
+    metricas.scrapersIniciados++;
     
-    const currentUrl = page.url();
-    console.log(`[2/10] ✓ URL actual: ${currentUrl}`);
+    // PASO 1: Conectar a Browserless
+    log('info', `SCRAPER:${requestId}`, 'Conectando a Browserless...');
     
-    // Verificar si hay error de "parámetros no válidos"
-    const pageContent = await page.content();
-    if (pageContent.includes('PARAMETROS DE SEGURIDAD NO VALIDOS') || pageContent.includes('IR INICIO')) {
-      console.log('[2/10] Detectada página de error, buscando botón IR INICIO...');
-      
-      // Buscar y hacer clic en "IR INICIO"
-      const irInicioBtn = await page.$('a[href*="sso-validar"], button, a');
-      if (irInicioBtn) {
-        const buttons = await page.$$('a, button');
-        for (const btn of buttons) {
-          const text = await btn.evaluate(el => el.textContent || '');
-          if (text.includes('IR INICIO') || text.includes('INICIO')) {
-            await btn.click();
-            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: CONFIG.TIMEOUT_NAV }).catch(() => {});
-            await delay(2000);
-            break;
-          }
+    const wsEndpoint = CONFIG.browserless.token 
+      ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
+      : CONFIG.browserless.url;
+    
+    browser = await puppeteer.connect({
+      browserWSEndpoint: wsEndpoint,
+      defaultViewport: { width: 1280, height: 800 }
+    });
+    
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(TIMEOUT.navegacion);
+    
+    // PASO 2: Navegar a SINOE
+    log('info', `SCRAPER:${requestId}`, 'Navegando a SINOE...');
+    
+    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2' });
+    
+    // Manejar página de parámetros no válidos
+    const contenido = await page.content();
+    if (contenido.includes('PARAMETROS DE SEGURIDAD NO VALIDOS')) {
+      const buttons = await page.$$('button, a');
+      for (const btn of buttons) {
+        const texto = await btn.evaluate(el => el.textContent?.toUpperCase() || '');
+        if (texto.includes('INICIO')) {
+          await btn.click();
+          await page.waitForNavigation({ waitUntil: 'networkidle2' });
+          break;
         }
       }
     }
     
-    // ========================================
-    // PASO 3: Buscar campos de login
-    // ========================================
-    console.log('[3/10] Buscando campos de login...');
+    // PASO 3: Esperar campos
+    await page.waitForSelector(SELECTORES.usuario, { timeout: TIMEOUT.navegacion });
     
-    // Esperar a que aparezcan los campos
-    // SINOE usa inputs normales, pero pueden tener diferentes selectores
-    await delay(1000);
-    
-    // Intentar múltiples selectores para el campo de usuario
-    const userSelectors = [
-      'input[type="text"]:not([type="hidden"])',
-      'input[name*="usuario"]',
-      'input[name*="user"]',
-      'input[id*="usuario"]',
-      'input[id*="user"]',
-      'input.form-control',
-      'input[placeholder*="usuario"]',
-      'input[placeholder*="Usuario"]',
-      'form input[type="text"]',
-      'input:not([type="password"]):not([type="hidden"]):not([type="submit"])'
-    ];
-    
-    let campoUsuario = null;
-    for (const selector of userSelectors) {
-      try {
-        const inputs = await page.$$(selector);
-        if (inputs.length > 0) {
-          // Tomar el primer input de texto visible
-          for (const input of inputs) {
-            const isVisible = await input.evaluate(el => {
-              const style = window.getComputedStyle(el);
-              return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
-            });
-            if (isVisible) {
-              campoUsuario = input;
-              console.log(`[3/10] ✓ Campo usuario encontrado con: ${selector}`);
-              break;
-            }
-          }
-          if (campoUsuario) break;
-        }
-      } catch (e) {}
-    }
-    
-    // Buscar campo de contraseña
-    const campoPassword = await page.$('input[type="password"]');
-    
-    if (!campoUsuario) {
-      // Último intento: obtener todos los inputs visibles
-      console.log('[3/10] Buscando inputs de forma alternativa...');
-      const allInputs = await page.$$('input');
-      const visibleInputs = [];
-      
-      for (const input of allInputs) {
-        const props = await input.evaluate(el => ({
-          type: el.type,
-          name: el.name,
-          id: el.id,
-          visible: el.offsetParent !== null,
-          placeholder: el.placeholder
-        }));
-        
-        if (props.visible && props.type !== 'hidden' && props.type !== 'submit' && props.type !== 'button') {
-          visibleInputs.push({ input, props });
-        }
-      }
-      
-      console.log(`[3/10] Inputs visibles encontrados: ${visibleInputs.length}`);
-      visibleInputs.forEach((v, i) => console.log(`   Input ${i}: type=${v.props.type}, name=${v.props.name}, id=${v.props.id}`));
-      
-      // El primer input de texto es usuario, el de password es contraseña
-      for (const v of visibleInputs) {
-        if (v.props.type === 'text' && !campoUsuario) {
-          campoUsuario = v.input;
-        }
-      }
-    }
-    
-    if (!campoUsuario || !campoPassword) {
-      // Tomar screenshot para debug
-      const screenshot = await page.screenshot({ encoding: 'base64' });
-      console.log('[3/10] ✗ No se encontraron campos de login');
-      console.log('[3/10] Screenshot guardado en logs');
-      
-      await browser.close();
-      return res.json({ 
-        success: false, 
-        error: 'No se encontraron campos de login en SINOE. La página puede haber cambiado.',
-        screenshot: screenshot.substring(0, 200) + '...'
-      });
-    }
-    
-    console.log('[3/10] ✓ Campos de login encontrados');
-    
-    // ========================================
     // PASO 4: Llenar credenciales
-    // ========================================
-    console.log('[4/10] Llenando credenciales...');
+    log('info', `SCRAPER:${requestId}`, 'Llenando credenciales...');
+    await llenarCampo(page, SELECTORES.usuario, sinoeUsuario);
+    await delay(300);
+    await llenarCampo(page, SELECTORES.password, sinoePassword);
     
-    // Limpiar y llenar usuario
-    await campoUsuario.click({ clickCount: 3 });
-    await page.keyboard.press('Backspace');
-    await campoUsuario.type(sinoeUsuario, { delay: 50 });
+    // PASO 5: Capturar CAPTCHA
+    log('info', `SCRAPER:${requestId}`, 'Capturando CAPTCHA...');
+    await delay(1000);
+    const captchaBase64 = await capturarCaptcha(page);
     
-    // Limpiar y llenar contraseña
-    await campoPassword.click({ clickCount: 3 });
-    await page.keyboard.press('Backspace');
-    await campoPassword.type(sinoePassword, { delay: 50 });
+    if (!captchaBase64 || captchaBase64.length < 500) {
+      throw new Error('No se pudo capturar el CAPTCHA');
+    }
     
-    console.log('[4/10] ✓ Credenciales llenadas');
+    // PASO 6: Enviar imagen
+    log('info', `SCRAPER:${requestId}`, 'Enviando imagen por WhatsApp...');
     
-    // Guardar URL actual para detectar navegación
-    const urlLogin = page.url();
+    const caption = `📩 ${nombreAbogado}, escriba el código que ve en la imagen y envíelo como respuesta.\n\n⏱️ Tiene 5 minutos.\n🔒 Credenciales ya llenadas.`;
     
-    // ========================================
-    // PASO 5: Enviar WhatsApp con link del debugger
-    // ========================================
-    console.log('[5/10] Enviando WhatsApp con link de autorización...');
+    if (!await enviarWhatsAppImagen(whatsappNumero, captchaBase64, caption)) {
+      throw new Error('No se pudo enviar la imagen por WhatsApp');
+    }
     
-    const debuggerUrl = `${CONFIG.BROWSERLESS_DEBUGGER}/?token=${CONFIG.BROWSERLESS_TOKEN}`;
+    // PASO 7: Esperar respuesta
+    log('info', `SCRAPER:${requestId}`, 'Esperando respuesta del abogado...');
     
-    const mensajeCaptcha = `📩 *${nombreAbogado}*, nueva notificación SINOE detectada.
-
-🔐 *Autorice el acceso:*
-👉 ${debuggerUrl}
-
-📝 *Instrucciones:*
-1. Abra el link
-2. Escriba el CAPTCHA que ve en pantalla
-3. Presione "Ingresar"
-
-⏱️ Tiene 5 minutos.
-
----
-_LEXA Assistant_ 🤖`;
-
-    await enviarWhatsApp(whatsappNumero, mensajeCaptcha);
-    console.log('[5/10] ✓ WhatsApp enviado');
-    
-    // ========================================
-    // PASO 6: Esperar que el abogado resuelva el CAPTCHA
-    // ========================================
-    console.log('[6/10] Esperando resolución de CAPTCHA (máx 5 min)...');
-    console.log('[6/10] El abogado debe ingresar el CAPTCHA y presionar Ingresar');
-    
-    try {
-      // Esperar a que la URL cambie (significa que el login fue exitoso)
-      await page.waitForFunction(
-        (urlPrevia) => window.location.href !== urlPrevia,
-        { timeout: CONFIG.TIMEOUT_CAPTCHA },
-        urlLogin
-      );
-      
-      // Dar tiempo para que cargue la nueva página
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: CONFIG.TIMEOUT_NAV }).catch(() => {});
-      await delay(2000);
-      
-      console.log('[6/10] ✓ CAPTCHA resuelto - navegación detectada');
-      
-    } catch (timeoutError) {
-      console.log('[6/10] ✗ Timeout - CAPTCHA no resuelto en 5 minutos');
-      
-      await enviarWhatsApp(whatsappNumero, `⏰ *Tiempo agotado*\n\nEl tiempo para resolver el CAPTCHA expiró.\n\nPor favor, intente nuevamente.\n\n---\n_LEXA Assistant_ 🤖`);
-      
-      await browser.close();
-      return res.json({ 
-        success: false, 
-        error: 'Timeout: CAPTCHA no resuelto en 5 minutos', 
-        timeout: true 
+    const captchaTexto = await new Promise((resolve, reject) => {
+      sesionesActivas.set(whatsappNumero, {
+        page, browser, resolve, reject,
+        timestamp: Date.now(),
+        nombreAbogado, requestId
       });
-    }
-    
-    // ========================================
-    // PASO 7: Verificar login exitoso
-    // ========================================
-    let urlActual = page.url();
-    console.log(`[7/10] URL después de CAPTCHA: ${urlActual}`);
-    
-    // Verificar si hay sesión activa que necesita cerrarse
-    if (urlActual.includes('sso-session-activa')) {
-      console.log('[7/10] ⚠ Sesión activa detectada - notificando al abogado...');
       
-      await enviarWhatsApp(whatsappNumero, `⚠️ *Sesión activa detectada*\n\nHay otra sesión abierta.\n\n👉 Haga clic en "FINALIZAR SESIONES"\n👉 Resuelva el nuevo CAPTCHA\n\n---\n_LEXA Assistant_ 🤖`);
-      
-      // Esperar a que resuelva el segundo CAPTCHA
-      try {
-        await page.waitForFunction(
-          (urlPrevia) => window.location.href !== urlPrevia,
-          { timeout: CONFIG.TIMEOUT_CAPTCHA },
-          urlActual
-        );
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: CONFIG.TIMEOUT_NAV }).catch(() => {});
-        await delay(2000);
-        
-        console.log('[7/10] ✓ Segunda autorización completada');
-        
-      } catch (e) {
-        await browser.close();
-        return res.json({ 
-          success: false, 
-          error: 'Timeout: segundo CAPTCHA no resuelto', 
-          timeout: true 
-        });
-      }
-    }
-    
-    urlActual = page.url();
-    
-    // Verificar que estamos logueados
-    if (!urlActual.includes('login.xhtml') && !urlActual.includes('sso-menu-app')) {
-      console.log(`[7/10] ✗ Login fallido. URL inesperada: ${urlActual}`);
-      await browser.close();
-      return res.json({ 
-        success: false, 
-        error: `Login fallido. URL: ${urlActual}` 
-      });
-    }
-    
-    console.log('[7/10] ✓ Login exitoso');
-    
-    // ========================================
-    // PASO 8: Notificar éxito y navegar a Casillas
-    // ========================================
-    console.log('[8/10] Navegando a Casillas Electrónicas...');
-    
-    await enviarWhatsApp(whatsappNumero, `✅ *¡Autorización exitosa!*\n\nYa puede cerrar el navegador.\n\nEn unos minutos recibirá el resumen de sus notificaciones.\n\n---\n_LEXA Assistant_ 🤖`);
-    
-    // Buscar y hacer clic en "Casillas Electrónicas" o "SINOE"
-    const links = await page.$$('a');
-    for (const link of links) {
-      const text = await link.evaluate(el => el.textContent || '');
-      const href = await link.evaluate(el => el.href || '');
-      
-      if (text.includes('Casillas') || text.includes('SINOE') || href.includes('casillas')) {
-        console.log(`[8/10] Haciendo clic en: ${text.trim()}`);
-        await link.click();
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: CONFIG.TIMEOUT_NAV }).catch(() => {});
-        await delay(2000);
-        break;
-      }
-    }
-    
-    console.log('[8/10] ✓ Navegación completada');
-    
-    // ========================================
-    // PASO 9: Extraer notificaciones
-    // ========================================
-    console.log('[9/10] Extrayendo notificaciones...');
-    const notificaciones = [];
-    
-    try {
-      // Esperar a que cargue la tabla
-      await page.waitForSelector('table tbody tr, .ui-datatable tbody tr, div[class*="list"]', { timeout: 10000 });
-      
-      // Intentar extraer de tabla
-      const filas = await page.$$('table tbody tr, .ui-datatable-data tr');
-      console.log(`[9/10] Filas encontradas: ${filas.length}`);
-      
-      for (let i = 0; i < Math.min(filas.length, 10); i++) {
-        try {
-          const celdas = await filas[i].$$('td');
-          if (celdas.length >= 2) {
-            const textos = [];
-            for (const celda of celdas) {
-              const texto = await celda.evaluate(el => el.textContent?.trim() || '');
-              textos.push(texto);
-            }
-            
-            // Extraer datos según la estructura de SINOE
-            const notificacion = {
-              expediente: textos[0] || '',
-              juzgado: textos[1] || '',
-              fecha: textos[2] || '',
-              sumilla: textos[3] || '',
-              raw: textos.join(' | ')
-            };
-            
-            if (notificacion.expediente) {
-              notificaciones.push(notificacion);
-              console.log(`[9/10] → ${notificacion.expediente}`);
-            }
+      setTimeout(() => {
+        if (sesionesActivas.has(whatsappNumero)) {
+          const s = sesionesActivas.get(whatsappNumero);
+          if (s.requestId === requestId) {
+            sesionesActivas.delete(whatsappNumero);
+            reject(new Error('Timeout: CAPTCHA no resuelto en 5 minutos'));
           }
-        } catch (e) {
-          console.log(`[9/10] Error en fila ${i}: ${e.message}`);
         }
-      }
-      
-    } catch (e) {
-      console.log(`[9/10] No se encontró tabla de notificaciones: ${e.message}`);
-      
-      // Tomar screenshot de lo que hay
-      const screenshot = await page.screenshot({ encoding: 'base64' });
-      console.log('[9/10] Screenshot capturado para análisis');
+      }, TIMEOUT.captcha);
+    });
+    
+    metricas.captchasRecibidos++;
+    log('success', `SCRAPER:${requestId}`, `CAPTCHA recibido: ${captchaTexto}`);
+    
+    // PASO 8: Escribir CAPTCHA y login
+    const campoCaptcha = await page.$(SELECTORES.captcha);
+    if (!campoCaptcha) throw new Error('Campo CAPTCHA no encontrado');
+    
+    await campoCaptcha.click({ clickCount: 3 });
+    await delay(100);
+    await page.keyboard.press('Backspace');
+    await delay(100);
+    await campoCaptcha.type(captchaTexto.toUpperCase(), { delay: 30 });
+    
+    const urlAntes = page.url();
+    
+    const btn = await page.$(SELECTORES.btnIngresar);
+    if (btn) await btn.click();
+    else await page.keyboard.press('Enter');
+    
+    await page.waitForFunction(
+      url => window.location.href !== url,
+      { timeout: TIMEOUT.navegacion },
+      urlAntes
+    );
+    
+    await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
+    
+    // PASO 9: Verificar login
+    const urlActual = page.url();
+    const contenidoActual = await page.content();
+    
+    if (contenidoActual.toLowerCase().includes('captcha') && 
+        contenidoActual.toLowerCase().includes('incorrecto')) {
+      await enviarWhatsAppTexto(whatsappNumero, `❌ CAPTCHA incorrecto. Intente de nuevo.`);
+      throw new Error('CAPTCHA incorrecto');
     }
     
-    console.log(`[9/10] ✓ Notificaciones extraídas: ${notificaciones.length}`);
+    if (urlActual.includes(SINOE_URLS.sessionActiva)) {
+      await enviarWhatsAppTexto(whatsappNumero, `⚠️ Hay sesión activa. Ciérrela e intente de nuevo.`);
+      throw new Error('Sesión activa');
+    }
     
-    // ========================================
-    // PASO 10: Cerrar y retornar
-    // ========================================
-    console.log('[10/10] Cerrando navegador...');
-    await browser.close();
+    // PASO 10: Navegar a Casillas
+    const linkCasillas = await buscarLinkCasillas(page);
+    if (linkCasillas) {
+      await linkCasillas.click();
+      await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
+    }
     
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`[SCRAPER] ✓ COMPLETADO - ${notificaciones.length} notificaciones`);
-    console.log(`${'='.repeat(60)}\n`);
+    // PASO 11: Extraer notificaciones
+    log('info', `SCRAPER:${requestId}`, 'Extrayendo notificaciones...');
+    const notificaciones = await extraerNotificaciones(page);
     
-    return res.json({
+    // ÉXITO
+    const duracionMs = Date.now() - inicioMs;
+    metricas.scrapersExitosos++;
+    
+    const totalExitosos = metricas.scrapersExitosos;
+    metricas.tiempoPromedioMs = Math.round(
+      ((metricas.tiempoPromedioMs * (totalExitosos - 1)) + duracionMs) / totalExitosos
+    );
+    
+    await enviarWhatsAppTexto(whatsappNumero,
+      `✅ ${nombreAbogado}, acceso exitoso.\n\n📋 ${notificaciones.length} notificación(es) encontrada(s).\n\nProcesando...`
+    );
+    
+    log('success', `SCRAPER:${requestId}`, 'Completado', { duracionMs, notificaciones: notificaciones.length });
+    
+    return {
       success: true,
       notificaciones,
       total: notificaciones.length,
+      urlFinal: page.url(),
+      duracionMs,
       timestamp: new Date().toISOString()
-    });
-    
+    };
+
   } catch (error) {
-    console.error(`[SCRAPER] ✗ ERROR: ${error.message}`);
-    console.error(error.stack);
+    metricas.scrapersFallidos++;
+    log('error', `SCRAPER:${requestId}`, error.message);
     
-    if (browser) {
-      try { await browser.close(); } catch (e) {}
+    if (!error.message.includes('CAPTCHA incorrecto') && !error.message.includes('Sesión activa')) {
+      await enviarWhatsAppTexto(whatsappNumero, `❌ Error: ${error.message}`);
     }
     
-    return res.json({ 
-      success: false, 
+    return {
+      success: false,
       error: error.message,
+      timeout: error.message.includes('Timeout'),
+      duracionMs: Date.now() - inicioMs,
       timestamp: new Date().toISOString()
-    });
+    };
+
+  } finally {
+    sesionesActivas.delete(whatsappNumero);
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+// ============================================================
+// ENDPOINTS
+// ============================================================
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'lexa-scraper-service',
+    version: '4.1.0',
+    uptime: process.uptime(),
+    sesionesActivas: sesionesActivas.size,
+    metricas: {
+      exitosos: metricas.scrapersExitosos,
+      fallidos: metricas.scrapersFallidos,
+      tasaExito: metricas.scrapersIniciados > 0 
+        ? Math.round((metricas.scrapersExitosos / metricas.scrapersIniciados) * 100) + '%' : 'N/A'
+    }
+  });
+});
+
+app.post('/scraper', async (req, res) => {
+  const { sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado } = req.body;
+  
+  if (!sinoeUsuario || !sinoePassword) {
+    return res.status(400).json({ success: false, error: 'Faltan credenciales SINOE' });
+  }
+  
+  const validacion = validarNumeroWhatsApp(whatsappNumero);
+  if (!validacion.valido) {
+    return res.status(400).json({ success: false, error: validacion.error });
+  }
+  
+  if (sesionesActivas.has(validacion.numero)) {
+    return res.status(409).json({ success: false, error: 'Sesión activa para este número' });
+  }
+  
+  const resultado = await ejecutarScraper({
+    sinoeUsuario,
+    sinoePassword,
+    whatsappNumero: validacion.numero,
+    nombreAbogado: nombreAbogado || 'Estimado usuario'
+  });
+  
+  res.status(resultado.success ? 200 : (resultado.timeout ? 408 : 500)).json(resultado);
+});
+
+app.post('/webhook/whatsapp', async (req, res) => {
+  try {
+    const data = req.body;
+    
+    if (data.event !== 'messages.upsert') {
+      return res.status(200).json({ ignored: true });
+    }
+    
+    const message = data.data;
+    if (!message?.key?.remoteJid || !message?.message || message.key.fromMe) {
+      return res.status(200).json({ ignored: true });
+    }
+    
+    const numero = message.key.remoteJid.replace('@s.whatsapp.net', '').replace('@c.us', '');
+    
+    let texto = message.message.conversation || 
+                message.message.extendedTextMessage?.text || 
+                message.message.imageMessage?.caption || '';
+    
+    if (!texto) {
+      return res.status(200).json({ ignored: true, reason: 'no text' });
+    }
+    
+    if (!sesionesActivas.has(numero)) {
+      return res.status(200).json({ ignored: true, reason: 'no session' });
+    }
+    
+    const validacion = validarCaptcha(texto);
+    
+    if (!validacion.valido) {
+      await enviarWhatsAppTexto(numero, `⚠️ ${validacion.error}\n\n${validacion.sugerencia || ''}`);
+      return res.status(200).json({ ignored: true, reason: 'invalid captcha' });
+    }
+    
+    const sesion = sesionesActivas.get(numero);
+    sesion.resolve(validacion.captcha);
+    
+    log('success', 'WEBHOOK', 'CAPTCHA recibido', { numero: enmascarar(numero) });
+    
+    return res.status(200).json({ success: true });
+    
+  } catch (error) {
+    log('error', 'WEBHOOK', error.message);
+    return res.status(200).json({ error: error.message });
   }
 });
+
+app.get('/sesiones', (req, res) => {
+  const sesiones = [];
+  for (const [numero, sesion] of sesionesActivas.entries()) {
+    sesiones.push({
+      numero: enmascarar(numero),
+      nombreAbogado: sesion.nombreAbogado,
+      esperandoDesde: Math.round((Date.now() - sesion.timestamp) / 1000) + 's'
+    });
+  }
+  res.json({ total: sesionesActivas.size, sesiones });
+});
+
+app.get('/metricas', (req, res) => {
+  res.json({
+    ...metricas,
+    sesionesActivas: sesionesActivas.size,
+    memoriaUsada: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB',
+    uptime: Math.round(process.uptime()) + 's'
+  });
+});
+
+app.post('/test-whatsapp', async (req, res) => {
+  const validacion = validarNumeroWhatsApp(req.body.numero);
+  if (!validacion.valido) return res.status(400).json({ success: false, error: validacion.error });
+  
+  const resultado = await enviarWhatsAppTexto(validacion.numero, req.body.mensaje || '🧪 Test LEXA v4.1.0');
+  res.json({ success: resultado });
+});
+
+app.post('/test-conexion', async (req, res) => {
+  let browser = null;
+  try {
+    const ws = CONFIG.browserless.token 
+      ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
+      : CONFIG.browserless.url;
+    
+    browser = await puppeteer.connect({ browserWSEndpoint: ws });
+    const page = await browser.newPage();
+    await page.goto('https://www.google.com', { timeout: 30000 });
+    
+    res.json({ success: true, message: 'Conexión OK' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+// ============================================================
+// GRACEFUL SHUTDOWN
+// ============================================================
+
+async function shutdown(signal) {
+  log('warn', 'SHUTDOWN', `Señal ${signal} recibida`);
+  
+  for (const [, sesion] of sesionesActivas.entries()) {
+    if (sesion.reject) sesion.reject(new Error('Servidor reiniciándose'));
+    if (sesion.browser) await sesion.browser.close().catch(() => {});
+  }
+  
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 // ============================================================
 // INICIAR SERVIDOR
 // ============================================================
-const PORT = process.env.PORT || 3001;
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('');
-  console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║           LEXA SCRAPER SERVICE v2.0.0                      ║');
-  console.log('╠════════════════════════════════════════════════════════════╣');
-  console.log(`║  Servidor:     http://0.0.0.0:${PORT}                         ║`);
-  console.log(`║  Health:       http://0.0.0.0:${PORT}/health                  ║`);
-  console.log('╠════════════════════════════════════════════════════════════╣');
-  console.log(`║  Browserless:  ${CONFIG.BROWSERLESS_WS.substring(0, 40)}...  ║`);
-  console.log(`║  Evolution:    ${CONFIG.EVOLUTION_URL.substring(0, 40)}...   ║`);
-  console.log('╚════════════════════════════════════════════════════════════╝');
-  console.log('');
-});
-
-// Manejo de señales
-process.on('SIGTERM', () => {
-  console.log('[SCRAPER] Recibido SIGTERM, cerrando...');
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('[SCRAPER] Recibido SIGINT, cerrando...');
-  process.exit(0);
+app.listen(PORT, () => {
+  if (!process.env.API_KEY) {
+    log('warn', 'CONFIG', `API Key generada: ${API_KEY}`);
+  }
+  
+  console.log(`
+╔══════════════════════════════════════════════════════════════════╗
+║           LEXA SCRAPER SERVICE v4.1.0 (AAA)                      ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Puerto: ${PORT}                                                     ║
+║  Auth: ${process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️'}                                      ║
+║  Rate: ${RATE_LIMIT.maxRequestsPerIp} req/min/IP                                        ║
+╠══════════════════════════════════════════════════════════════════╣
+║  PÚBLICOS:                                                       ║
+║    GET  /health           POST /webhook/whatsapp                 ║
+║  PROTEGIDOS (X-API-KEY):                                         ║
+║    POST /scraper          GET  /sesiones                         ║
+║    GET  /metricas         POST /test-whatsapp                    ║
+║    POST /test-conexion                                           ║
+╚══════════════════════════════════════════════════════════════════╝
+  `);
 });
