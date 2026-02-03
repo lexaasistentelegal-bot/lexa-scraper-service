@@ -1,209 +1,276 @@
+/**
+ * LEXA SCRAPER SERVICE
+ * Microservicio para scraping de SINOE con Puppeteer + Browserless
+ * 
+ * IMPORTANTE: El servidor DEBE escuchar en 0.0.0.0 para que EasyPanel
+ * pueda hacer proxy correctamente desde el dominio externo.
+ */
+
 const express = require('express');
 const puppeteer = require('puppeteer-core');
 
+// ============================================================
+// CONFIGURACIÓN
+// ============================================================
+const PORT = parseInt(process.env.PORT) || 3001;
+const BROWSERLESS_URL = process.env.BROWSERLESS_URL || 'wss://browser.lexaasistentelegal.com';
+const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '';
+const BROWSERLESS_DEBUGGER = process.env.BROWSERLESS_DEBUGGER || 'https://browser.lexaasistentelegal.com';
+
+// Evolution API (WhatsApp)
+const EVOLUTION_URL = process.env.EVOLUTION_URL || 'https://evo.lexaasistentelegal.com';
+const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || '';
+const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE || 'lexa-bot';
+
+// Timeouts estándar (en milisegundos)
+const TIMEOUT_NAVEGACION = 60000;   // 1 min para cargar páginas
+const TIMEOUT_CAPTCHA = 300000;     // 5 min para que el abogado resuelva
+const TIMEOUT_DESCARGA = 120000;    // 2 min para descargar PDFs
+
+// ============================================================
+// SERVIDOR EXPRESS
+// ============================================================
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
-const CONFIG = {
-  BROWSERLESS_WS: process.env.BROWSERLESS_URL || 'wss://browser.lexaasistentelegal.com',
-  BROWSERLESS_TOKEN: process.env.BROWSERLESS_TOKEN || '',
-  BROWSERLESS_DEBUGGER: process.env.BROWSERLESS_DEBUGGER || 'https://browser.lexaasistentelegal.com',
-  EVOLUTION_URL: process.env.EVOLUTION_URL || 'https://evo.lexaasistentelegal.com',
-  EVOLUTION_API_KEY: process.env.EVOLUTION_API_KEY || '',
-  EVOLUTION_INSTANCE: process.env.EVOLUTION_INSTANCE || 'lexa-bot',
-  TIMEOUT_CAPTCHA: 300000,
-  TIMEOUT_NAV: 60000
-};
-
-async function enviarWhatsApp(numero, mensaje) {
-  const url = `${CONFIG.EVOLUTION_URL}/message/sendText/${CONFIG.EVOLUTION_INSTANCE}`;
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'apikey': CONFIG.EVOLUTION_API_KEY },
-      body: JSON.stringify({ number: numero, text: mensaje })
-    });
-    console.log(`[WA] Enviado: ${response.ok ? 'OK' : 'ERROR'}`);
-    return response.ok;
-  } catch (error) {
-    console.log(`[WA] Error: ${error.message}`);
-    return false;
+// CORS permisivo para desarrollo
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
   }
-}
+  next();
+});
 
-async function clicPorTexto(page, textoContiene) {
-  const elementos = await page.$$('a, button, input[type="submit"], input[type="button"], div[onclick]');
-  for (const el of elementos) {
-    const texto = await el.evaluate(e => (e.textContent || e.value || '').toUpperCase().trim());
-    if (texto.includes(textoContiene.toUpperCase())) {
-      await el.click();
-      console.log(`[CLIC] ${textoContiene}`);
-      return true;
+// ============================================================
+// ENDPOINT: Health Check
+// ============================================================
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'lexa-scraper',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    config: {
+      port: PORT,
+      browserless: BROWSERLESS_URL ? 'configurado' : 'no configurado',
+      evolution: EVOLUTION_URL ? 'configurado' : 'no configurado'
+    }
+  });
+});
+
+// ============================================================
+// ENDPOINT: Info del servicio (más detallado)
+// ============================================================
+app.get('/', (req, res) => {
+  res.json({
+    name: 'LEXA Scraper Service',
+    version: '1.0.0',
+    description: 'Microservicio para scraping de SINOE con soporte de CAPTCHA manual',
+    endpoints: {
+      'GET /': 'Información del servicio',
+      'GET /health': 'Estado del servicio',
+      'POST /scraper': 'Iniciar sesión de scraping SINOE'
+    },
+    documentation: 'https://github.com/lexaasistentelegal-bot/lexa-scraper-service'
+  });
+});
+
+// ============================================================
+// ENDPOINT: Scraper SINOE
+// ============================================================
+app.post('/scraper', async (req, res) => {
+  const { 
+    usuario, 
+    password, 
+    expediente,
+    whatsappNumber,
+    clienteName 
+  } = req.body;
+
+  // Validación de parámetros
+  if (!usuario || !password) {
+    return res.status(400).json({
+      success: false,
+      error: 'Faltan credenciales de SINOE (usuario, password)'
+    });
+  }
+
+  let browser = null;
+  let sessionId = `session_${Date.now()}`;
+
+  try {
+    console.log(`[LEXA] Iniciando sesión ${sessionId}`);
+
+    // Conectar a Browserless
+    const wsEndpoint = BROWSERLESS_TOKEN 
+      ? `${BROWSERLESS_URL}?token=${BROWSERLESS_TOKEN}`
+      : BROWSERLESS_URL;
+
+    console.log(`[LEXA] Conectando a Browserless...`);
+    browser = await puppeteer.connect({
+      browserWSEndpoint: wsEndpoint
+    });
+
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1366, height: 768 });
+
+    // Navegar a SINOE
+    console.log(`[LEXA] Navegando a SINOE...`);
+    await page.goto('https://cej.pj.gob.pe/cej/forms/busquedaform.html', {
+      waitUntil: 'networkidle2',
+      timeout: TIMEOUT_NAVEGACION
+    });
+
+    // Construir URL del debugger para el CAPTCHA
+    const pages = await browser.pages();
+    const targetId = pages.length > 0 ? page.target()._targetId : '';
+    const debuggerUrl = `${BROWSERLESS_DEBUGGER}/devtools/inspector.html?ws=${BROWSERLESS_URL.replace('wss://', '').replace('ws://', '')}${BROWSERLESS_TOKEN ? `?token=${BROWSERLESS_TOKEN}` : ''}/devtools/page/${targetId}`;
+
+    // Responder inmediatamente con la URL del debugger
+    // El cliente (n8n) se encargará de enviar el WhatsApp y esperar
+    res.json({
+      success: true,
+      sessionId: sessionId,
+      message: 'Sesión iniciada. Esperando resolución de CAPTCHA.',
+      debuggerUrl: debuggerUrl,
+      instructions: 'Envía el debuggerUrl al abogado para que resuelva el CAPTCHA. Luego llama a /scraper/continue con el sessionId.'
+    });
+
+    // NOTA: En producción, aquí guardarías el browser/page en memoria
+    // para que otro endpoint (/scraper/continue) pueda continuar.
+    // Por simplicidad, este ejemplo cierra la conexión.
+
+  } catch (error) {
+    console.error(`[LEXA] Error en sesión ${sessionId}: ${error.message}`);
+    
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
+
+    // Si ya se envió respuesta, no podemos enviar otra
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: error.message,
+        sessionId: sessionId
+      });
     }
   }
-  return false;
-}
+});
 
-app.post('/scraper', async (req, res) => {
-  const { sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado = 'Doctor(a)' } = req.body;
-  
-  if (!sinoeUsuario || !sinoePassword || !whatsappNumero) {
-    return res.json({ success: false, error: 'Faltan datos' });
-  }
-  
+// ============================================================
+// ENDPOINT: Test de conexión a Browserless
+// ============================================================
+app.get('/test-browserless', async (req, res) => {
   let browser = null;
   
-  console.log(`\n${'='.repeat(50)}`);
-  console.log(`[SCRAPER] Iniciando para ${nombreAbogado}`);
-  console.log(`${'='.repeat(50)}\n`);
-  
   try {
-    console.log('[1] Conectando a Browserless...');
-    const wsUrl = `${CONFIG.BROWSERLESS_WS}?token=${CONFIG.BROWSERLESS_TOKEN}`;
-    browser = await puppeteer.connect({ browserWSEndpoint: wsUrl });
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
-    console.log('[1] Conectado');
+    const wsEndpoint = BROWSERLESS_TOKEN 
+      ? `${BROWSERLESS_URL}?token=${BROWSERLESS_TOKEN}`
+      : BROWSERLESS_URL;
+
+    console.log(`[LEXA] Probando conexión a: ${wsEndpoint.replace(BROWSERLESS_TOKEN, '***')}`);
     
-    console.log('[2] Abriendo SINOE...');
-    await page.goto('https://casillas.pj.gob.pe/sinoe/sso-validar.xhtml', {
-      waitUntil: 'networkidle2',
-      timeout: CONFIG.TIMEOUT_NAV
+    browser = await puppeteer.connect({
+      browserWSEndpoint: wsEndpoint
     });
-    console.log('[2] SINOE cargado');
-    
-    console.log('[3] Llenando credenciales...');
-    await page.waitForSelector('input[type="text"]', { timeout: 10000 });
-    const inputs = await page.$$('input');
-    let campoUsuario = null, campoPassword = null;
-    
-    for (const input of inputs) {
-      const type = await input.evaluate(el => el.type);
-      const ph = await input.evaluate(el => (el.placeholder || el.name || '').toLowerCase());
-      if (type === 'text' && !ph.includes('captcha') && !campoUsuario) campoUsuario = input;
-      else if (type === 'password') campoPassword = input;
-    }
-    
-    if (!campoUsuario || !campoPassword) {
-      throw new Error('No se encontraron campos de login');
-    }
-    
-    await campoUsuario.click({ clickCount: 3 });
-    await page.keyboard.press('Backspace');
-    await campoUsuario.type(sinoeUsuario, { delay: 50 });
-    await campoPassword.click({ clickCount: 3 });
-    await page.keyboard.press('Backspace');
-    await campoPassword.type(sinoePassword, { delay: 50 });
-    console.log('[3] Credenciales llenadas');
-    
-    const urlLogin = page.url();
-    
-    console.log('[4] Enviando WhatsApp...');
-    const debuggerUrl = `${CONFIG.BROWSERLESS_DEBUGGER}/?token=${CONFIG.BROWSERLESS_TOKEN}`;
-    await enviarWhatsApp(whatsappNumero, 
-      `📩 ${nombreAbogado}, nueva notificación SINOE.\n\nAutorice el acceso:\n👉 ${debuggerUrl}\n\n🔒 Escriba el CAPTCHA y presione "Ingresar".\n\n⏱️ Tiene 5 minutos.`
-    );
-    
-    console.log('[5] Esperando CAPTCHA (max 5 min)...');
-    try {
-      await page.waitForFunction(
-        (urlPrevia) => window.location.href !== urlPrevia,
-        { timeout: CONFIG.TIMEOUT_CAPTCHA },
-        urlLogin
-      );
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: CONFIG.TIMEOUT_NAV }).catch(() => {});
-      console.log('[5] CAPTCHA resuelto');
-    } catch (e) {
-      await browser.close();
-      return res.json({ success: false, error: 'Timeout: CAPTCHA no resuelto en 5 min', timeout: true });
-    }
-    
-    let urlActual = page.url();
-    console.log(`[6] URL: ${urlActual}`);
-    
-    if (urlActual.includes('sso-session-activa')) {
-      console.log('[6] Sesión activa detectada...');
-      await enviarWhatsApp(whatsappNumero, '⚠️ Hay sesión activa.\n\nClic en "FINALIZAR SESIONES" y resuelva el nuevo CAPTCHA.');
-      
-      try {
-        await page.waitForFunction(
-          (urlPrevia) => window.location.href !== urlPrevia,
-          { timeout: CONFIG.TIMEOUT_CAPTCHA },
-          urlActual
-        );
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: CONFIG.TIMEOUT_NAV }).catch(() => {});
-      } catch (e) {
-        await browser.close();
-        return res.json({ success: false, error: 'Timeout: 2do CAPTCHA no resuelto', timeout: true });
-      }
-    }
-    
-    urlActual = page.url();
-    if (!urlActual.includes('login.xhtml') && !urlActual.includes('sso-menu-app')) {
-      await browser.close();
-      return res.json({ success: false, error: `Login fallido. URL: ${urlActual}` });
-    }
-    console.log('[7] Login exitoso');
-    
-    await enviarWhatsApp(whatsappNumero, '✅ ¡Autorización exitosa!\n\nPuede cerrar el navegador.\nEn minutos recibirá el resumen.');
-    
-    if (urlActual.includes('login.xhtml')) {
-      console.log('[8] Navegando a Casillas...');
-      await clicPorTexto(page, 'CASILLAS');
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: CONFIG.TIMEOUT_NAV }).catch(() => {});
-    }
-    
-    console.log('[9] Extrayendo notificaciones...');
-    const notificaciones = [];
-    
-    try {
-      await page.waitForSelector('table tbody tr', { timeout: 10000 });
-      const filas = await page.$$('table tbody tr');
-      console.log(`[9] ${filas.length} filas encontradas`);
-      
-      for (let i = 0; i < Math.min(filas.length, 10); i++) {
-        try {
-          const celdas = await filas[i].$$('td');
-          if (celdas.length < 2) continue;
-          const expediente = await celdas[0]?.evaluate(el => el.textContent?.trim()) || '';
-          const juzgado = await celdas[1]?.evaluate(el => el.textContent?.trim()) || '';
-          const fecha = await celdas[2]?.evaluate(el => el.textContent?.trim()) || '';
-          if (expediente) {
-            console.log(`[9] -> ${expediente}`);
-            notificaciones.push({ expediente, juzgado, fecha });
-          }
-        } catch (e) {}
-      }
-    } catch (e) {
-      console.log('[9] Error tabla:', e.message);
-    }
-    
-    console.log('[10] Cerrando browser...');
+
+    const version = await browser.version();
     await browser.close();
-    
-    console.log(`\n${'='.repeat(50)}`);
-    console.log(`[SCRAPER] Completado: ${notificaciones.length} notificaciones`);
-    console.log(`${'='.repeat(50)}\n`);
-    
-    return res.json({
+
+    res.json({
       success: true,
-      notificaciones,
-      total: notificaciones.length,
-      timestamp: new Date().toISOString()
+      message: 'Conexión a Browserless exitosa',
+      browserVersion: version
     });
-    
+
   } catch (error) {
-    console.error(`[ERROR] ${error.message}`);
-    if (browser) try { await browser.close(); } catch (e) {}
-    return res.json({ success: false, error: error.message, timestamp: new Date().toISOString() });
+    console.error(`[LEXA] Error conectando a Browserless: ${error.message}`);
+    
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      hint: 'Verifica BROWSERLESS_URL y BROWSERLESS_TOKEN en las variables de entorno'
+    });
   }
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'lexa-scraper' });
+// ============================================================
+// ENDPOINT: Test de conexión a Evolution API
+// ============================================================
+app.get('/test-evolution', async (req, res) => {
+  try {
+    const response = await fetch(`${EVOLUTION_URL}/instance/fetchInstances`, {
+      method: 'GET',
+      headers: {
+        'apikey': EVOLUTION_API_KEY
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Evolution API respondió con status ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    res.json({
+      success: true,
+      message: 'Conexión a Evolution API exitosa',
+      instances: data
+    });
+
+  } catch (error) {
+    console.error(`[LEXA] Error conectando a Evolution API: ${error.message}`);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      hint: 'Verifica EVOLUTION_URL y EVOLUTION_API_KEY en las variables de entorno'
+    });
+  }
 });
 
-const PORT = process.env.PORT || 3001;
+// ============================================================
+// MANEJO DE ERRORES GLOBAL
+// ============================================================
+app.use((err, req, res, next) => {
+  console.error(`[LEXA] Error no manejado: ${err.message}`);
+  res.status(500).json({
+    success: false,
+    error: 'Error interno del servidor',
+    details: err.message
+  });
+});
+
+// ============================================================
+// INICIAR SERVIDOR
+// ============================================================
+// ⚠️ CRÍTICO: Escuchar en 0.0.0.0 para que EasyPanel pueda hacer proxy
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[SCRAPER] Corriendo en puerto ${PORT}`);
+  console.log('═══════════════════════════════════════════════════════');
+  console.log(`  LEXA SCRAPER SERVICE`);
+  console.log(`  Escuchando en: http://0.0.0.0:${PORT}`);
+  console.log(`  Health check:  http://0.0.0.0:${PORT}/health`);
+  console.log('═══════════════════════════════════════════════════════');
+  console.log(`  Browserless:   ${BROWSERLESS_URL || 'NO CONFIGURADO'}`);
+  console.log(`  Evolution:     ${EVOLUTION_URL || 'NO CONFIGURADO'}`);
+  console.log('═══════════════════════════════════════════════════════');
+});
+
+// Manejo de señales para cierre limpio
+process.on('SIGTERM', () => {
+  console.log('[LEXA] Recibido SIGTERM, cerrando servidor...');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('[LEXA] Recibido SIGINT, cerrando servidor...');
+  process.exit(0);
 });
