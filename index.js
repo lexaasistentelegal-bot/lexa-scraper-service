@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.8.1 - AUDITADO Y CORREGIDO
+ * LEXA SCRAPER SERVICE v4.8.2 - HOTFIX NAVEGACIÓN CASILLAS
  * ============================================================
  * Versión: PRODUCCIÓN
  * Fecha: Febrero 2026
@@ -32,6 +32,16 @@
  * BUG #6 - ENDPOINTS DE DEBUG:
  *   ANTES: Eliminados
  *   AHORA: Restaurados /test-credenciales y /test-captcha
+ * 
+ * HOTFIX v4.8.2 - NAVEGACIÓN A CASILLAS:
+ * ======================================
+ * PROBLEMA: Hacía clic en "instructivo" en lugar de "Casillas Electrónicas"
+ * SOLUCIÓN: 
+ *   - Excluir explícitamente enlaces con "instructivo", "manual", "guía"
+ *   - Prioridad 1: Buscar "casillas electr" exacto
+ *   - Prioridad 2: Buscar panel con imagen de SINOE
+ *   - Prioridad 3: Buscar imagen con alt/src "casilla"
+ *   - Prioridad 4: Último recurso - enlace grande que no sea instructivo
  * 
  * FLUJO DE SESIÓN ACTIVA (NUEVO):
  * 1. Detectar página "sso-session-activa.xhtml"
@@ -963,48 +973,163 @@ async function navegarACasillas(page, requestId) {
   log('info', `CASILLAS:${requestId}`, 'Buscando enlace a Casillas Electrónicas...');
   
   const clickeado = await evaluarSeguro(page, () => {
-    const enlaces = document.querySelectorAll('a, button, div[onclick]');
+    // Lista negra estricta - NUNCA hacer clic en elementos con estas palabras
+    const LISTA_NEGRA = [
+      'instructivo', 'manual', 'guía', 'guia', 'ayuda', 'help', 
+      'tutorial', 'soporte', 'descargar', 'pdf', 'documento'
+    ];
     
-    for (const el of enlaces) {
-      const texto = (el.textContent || '').toLowerCase();
-      const href = el.getAttribute('href') || '';
+    // Función helper para verificar si debe evitarse
+    function debeEvitar(texto) {
+      const textoLower = texto.toLowerCase();
+      return LISTA_NEGRA.some(palabra => textoLower.includes(palabra));
+    }
+    
+    // Función helper para verificar si es el enlace correcto
+    function esEnlaceCasillas(texto) {
+      const t = texto.toLowerCase();
+      // Debe contener "casillas" Y "electrónicas" (o variante sin tilde)
+      return (t.includes('casillas') && (t.includes('electrónicas') || t.includes('electronicas'))) ||
+             // O ser específicamente el texto corto "casillas electrónicas"
+             t.trim() === 'casillas electrónicas' ||
+             t.trim() === 'casillas electronicas';
+    }
+    
+    const todosEnlaces = document.querySelectorAll('a, button, div[onclick], span[onclick]');
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // ESTRATEGIA 1: Buscar texto EXACTO "Casillas Electrónicas"
+    // ═══════════════════════════════════════════════════════════════════
+    for (const el of todosEnlaces) {
+      const textoDirecto = (el.innerText || el.textContent || '').trim();
       
-      if (texto.includes('casillas') || texto.includes('sinoe') || href.includes('casilla')) {
+      // PRIMERO verificar lista negra
+      if (debeEvitar(textoDirecto)) continue;
+      
+      // Buscar coincidencia exacta o muy cercana
+      if (esEnlaceCasillas(textoDirecto)) {
         const rect = el.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {
           el.click();
-          return { clickeado: true, texto: texto.substring(0, 30) };
+          return { 
+            clickeado: true, 
+            texto: textoDirecto.substring(0, 30), 
+            metodo: 'texto_exacto' 
+          };
         }
       }
     }
     
-    // Por imagen con alt
+    // ═══════════════════════════════════════════════════════════════════
+    // ESTRATEGIA 2: Buscar imagen de SINOE y subir al padre clickeable
+    // ═══════════════════════════════════════════════════════════════════
     const imagenes = document.querySelectorAll('img');
+    
     for (const img of imagenes) {
-      const alt = (img.alt || '').toLowerCase();
       const src = (img.src || '').toLowerCase();
+      const alt = (img.alt || '').toLowerCase();
       
-      if (alt.includes('sinoe') || src.includes('sinoe')) {
-        let padre = img.parentElement;
-        for (let i = 0; i < 3 && padre; i++) {
-          if (padre.tagName === 'A' || padre.onclick) {
+      // Solo imágenes relacionadas con SINOE/casillas
+      if (!src.includes('sinoe') && !src.includes('casilla') && 
+          !alt.includes('sinoe') && !alt.includes('casilla')) {
+        continue;
+      }
+      
+      // Subir hasta 5 niveles buscando elemento clickeable
+      let padre = img.parentElement;
+      for (let i = 0; i < 5 && padre; i++) {
+        const textoPadre = (padre.innerText || padre.textContent || '').trim();
+        
+        // Verificar lista negra del padre completo
+        if (debeEvitar(textoPadre)) {
+          break; // Salir del loop de padres
+        }
+        
+        // Si el padre es clickeable y tiene texto relacionado
+        const esClickeable = padre.tagName === 'A' || 
+                            padre.onclick || 
+                            padre.getAttribute('onclick') ||
+                            padre.getAttribute('href');
+        
+        if (esClickeable && textoPadre.toLowerCase().includes('casilla')) {
+          const rect = padre.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
             padre.click();
-            return { clickeado: true, texto: 'imagen SINOE' };
+            return { 
+              clickeado: true, 
+              texto: 'imagen_sinoe', 
+              metodo: 'imagen_padre' 
+            };
           }
-          padre = padre.parentElement;
+        }
+        
+        padre = padre.parentElement;
+      }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // ESTRATEGIA 3: Buscar por href que contenga 'casilla' o 'bandeja'
+    // ═══════════════════════════════════════════════════════════════════
+    const enlaces = document.querySelectorAll('a[href]');
+    
+    for (const enlace of enlaces) {
+      const href = (enlace.getAttribute('href') || '').toLowerCase();
+      const texto = (enlace.innerText || enlace.textContent || '').trim();
+      
+      // Verificar lista negra
+      if (debeEvitar(texto) || debeEvitar(href)) continue;
+      
+      // href debe contener casilla/bandeja/notifica
+      if (href.includes('casilla') || href.includes('bandeja') || href.includes('notifica')) {
+        const rect = enlace.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          enlace.click();
+          return { 
+            clickeado: true, 
+            texto: texto.substring(0, 30) || 'href_casilla', 
+            metodo: 'href' 
+          };
         }
       }
     }
     
-    return { clickeado: false };
+    // ═══════════════════════════════════════════════════════════════════
+    // ESTRATEGIA 4: Primera opción visual grande (panel con imagen)
+    // ═══════════════════════════════════════════════════════════════════
+    const paneles = document.querySelectorAll('[class*="panel"], [class*="card"], [class*="opcion"], [class*="menu-item"]');
+    
+    for (const panel of paneles) {
+      const textoPanel = (panel.innerText || panel.textContent || '').trim();
+      const tieneImagen = panel.querySelector('img');
+      
+      // Debe tener imagen, contener "casilla", y NO estar en lista negra
+      if (tieneImagen && 
+          textoPanel.toLowerCase().includes('casilla') && 
+          !debeEvitar(textoPanel)) {
+        
+        const clickeable = panel.querySelector('a') || panel;
+        const rect = clickeable.getBoundingClientRect();
+        
+        if (rect.width > 50 && rect.height > 50) {
+          clickeable.click();
+          return { 
+            clickeado: true, 
+            texto: 'panel_casillas', 
+            metodo: 'panel' 
+          };
+        }
+      }
+    }
+    
+    return { clickeado: false, metodo: 'ninguno' };
   });
   
   if (!clickeado || !clickeado.clickeado) {
-    log('warn', `CASILLAS:${requestId}`, 'No se encontró enlace a Casillas');
+    log('warn', `CASILLAS:${requestId}`, 'No se encontró enlace a Casillas Electrónicas');
     return false;
   }
   
-  log('info', `CASILLAS:${requestId}`, `Clic en: "${clickeado.texto}"`);
+  log('success', `CASILLAS:${requestId}`, `✓ Clic en "${clickeado.texto}" (método: ${clickeado.metodo})`);
   await delay(TIMEOUT.esperaClicCasillas);
   
   return true;
@@ -1508,7 +1633,7 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.8.1',
+    version: '4.8.2',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
