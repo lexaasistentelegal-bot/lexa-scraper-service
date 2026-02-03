@@ -1,21 +1,13 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.1.0 - Sistema Screenshot CAPTCHA
+ * LEXA SCRAPER SERVICE v4.1.1 - Sistema Screenshot CAPTCHA
  * ============================================================
  * Versión: AAA (Producción)
  * Fecha: Febrero 2026
  * 
- * MEJORAS SOBRE v4.0.0:
- * - Autenticación por API Key en todos los endpoints
- * - Rate limiting por IP
- * - Validación estricta de inputs
- * - Manejo de race conditions
- * - Reintentos automáticos para WhatsApp
- * - Mejor captura de CAPTCHA con validación
- * - Structured logging con niveles
- * - Métricas básicas
- * - Graceful shutdown
- * - Datos sensibles enmascarados en logs
+ * CORRECCIÓN v4.1.1:
+ * - Formato de imagen corregido para Evolution API
+ * - API Key actualizada
  * ============================================================
  */
 
@@ -261,8 +253,11 @@ async function enviarWhatsAppTexto(numero, mensaje, intentos = 3) {
         return true;
       }
       
+      const errorBody = await response.text();
+      log('warn', 'WHATSAPP', `Intento ${i}/${intentos} fallido`, { status: response.status, error: errorBody });
+      
     } catch (error) {
-      log('warn', 'WHATSAPP', `Intento ${i}/${intentos} fallido`);
+      log('warn', 'WHATSAPP', `Intento ${i}/${intentos} error: ${error.message}`);
     }
     
     if (i < intentos) await delay(1000 * i);
@@ -273,7 +268,7 @@ async function enviarWhatsAppTexto(numero, mensaje, intentos = 3) {
 
 async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) {
   if (!base64Image || base64Image.length < 100) {
-    log('error', 'WHATSAPP', 'Imagen inválida');
+    log('error', 'WHATSAPP', 'Imagen inválida o muy pequeña');
     return false;
   }
   
@@ -281,6 +276,8 @@ async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) 
     try {
       const url = `${CONFIG.evolution.url}/message/sendMedia/${CONFIG.evolution.instance}`;
       
+      // Evolution API v2.x requiere el base64 SIN el prefijo data:image
+      // y necesita el campo fileName
       const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -290,8 +287,9 @@ async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) 
         body: JSON.stringify({
           number: numero,
           mediatype: 'image',
-          media: `data:image/png;base64,${base64Image}`,
-          caption: caption
+          media: base64Image,
+          caption: caption,
+          fileName: 'captcha.png'
         }),
         signal: AbortSignal.timeout(TIMEOUT.api)
       });
@@ -301,8 +299,11 @@ async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) 
         return true;
       }
       
+      const errorBody = await response.text();
+      log('warn', 'WHATSAPP', `Imagen intento ${i}/${intentos} fallido`, { status: response.status, error: errorBody });
+      
     } catch (error) {
-      log('warn', 'WHATSAPP', `Imagen intento ${i}/${intentos} fallido`);
+      log('warn', 'WHATSAPP', `Imagen intento ${i}/${intentos} error: ${error.message}`);
     }
     
     if (i < intentos) await delay(1000 * i);
@@ -330,7 +331,7 @@ async function capturarCaptcha(page) {
   await page.waitForSelector(SELECTORES.captchaImg, { timeout: 10000 })
     .catch(() => {});
   
-  await delay(500);
+  await delay(1000);
   
   const captchaImg = await page.$(SELECTORES.captchaImg);
   
@@ -347,8 +348,8 @@ async function capturarCaptcha(page) {
     }
   }
   
-  // Fallback: screenshot del formulario
-  log('warn', 'CAPTCHA', 'Usando fallback');
+  // Fallback: screenshot del área del formulario
+  log('warn', 'CAPTCHA', 'Usando fallback - captura de área');
   
   const form = await page.$('form, .login-form, .ui-panel');
   if (form) {
@@ -621,7 +622,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'lexa-scraper-service',
-    version: '4.1.0',
+    version: '4.1.1',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
@@ -731,7 +732,7 @@ app.post('/test-whatsapp', async (req, res) => {
   const validacion = validarNumeroWhatsApp(req.body.numero);
   if (!validacion.valido) return res.status(400).json({ success: false, error: validacion.error });
   
-  const resultado = await enviarWhatsAppTexto(validacion.numero, req.body.mensaje || '🧪 Test LEXA v4.1.0');
+  const resultado = await enviarWhatsAppTexto(validacion.numero, req.body.mensaje || '🧪 Test LEXA v4.1.1');
   res.json({ success: resultado });
 });
 
@@ -783,15 +784,14 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.1.0 (AAA)                      ║
+║           LEXA SCRAPER SERVICE v4.1.1 (AAA)                      ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${PORT}                                                     ║
 ║  Auth: ${process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️'}                                      ║
-║  Rate: ${RATE_LIMIT.maxRequestsPerIp} req/min/IP                                        ║
+║  Evolution: ${CONFIG.evolution.url}                ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  PÚBLICOS:                                                       ║
+║  ENDPOINTS:                                                      ║
 ║    GET  /health           POST /webhook/whatsapp                 ║
-║  PROTEGIDOS (X-API-KEY):                                         ║
 ║    POST /scraper          GET  /sesiones                         ║
 ║    GET  /metricas         POST /test-whatsapp                    ║
 ║    POST /test-conexion                                           ║
