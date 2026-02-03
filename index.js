@@ -159,10 +159,13 @@ const metricas = {
   captchasRecibidos: 0,
   captchasRecargados: 0,
   captchasFallidos: 0,
-  // v4.8.1: Nuevas métricas
-  sesionesFinalizadas: 0,      // Cuántas veces se finalizó sesión activa automáticamente
+  // v4.8.1: Métricas de sesión
+  sesionesFinalizadas: 0,
   erroresFrameIgnorados: 0,
   reintentosLectura: 0,
+  // v4.8.2: Métricas de descarga
+  consolidadosDescargados: 0,
+  modalesAbiertos: 0,
   tiempoPromedioMs: 0,
   ultimoReinicio: new Date().toISOString()
 };
@@ -970,153 +973,109 @@ async function capturarFormularioLogin(page) {
 // ============================================================
 
 async function navegarACasillas(page, requestId) {
-  log('info', `CASILLAS:${requestId}`, 'Buscando enlace a Casillas Electrónicas...');
+  log('info', `CASILLAS:${requestId}`, 'Buscando botón "Casillas Electrónicas"...');
   
   const clickeado = await evaluarSeguro(page, () => {
-    // Lista negra estricta - NUNCA hacer clic en elementos con estas palabras
-    const LISTA_NEGRA = [
-      'instructivo', 'manual', 'guía', 'guia', 'ayuda', 'help', 
-      'tutorial', 'soporte', 'descargar', 'pdf', 'documento'
-    ];
-    
-    // Función helper para verificar si debe evitarse
-    function debeEvitar(texto) {
-      const textoLower = texto.toLowerCase();
-      return LISTA_NEGRA.some(palabra => textoLower.includes(palabra));
-    }
-    
-    // Función helper para verificar si es el enlace correcto
-    function esEnlaceCasillas(texto) {
-      const t = texto.toLowerCase();
-      // Debe contener "casillas" Y "electrónicas" (o variante sin tilde)
-      return (t.includes('casillas') && (t.includes('electrónicas') || t.includes('electronicas'))) ||
-             // O ser específicamente el texto corto "casillas electrónicas"
-             t.trim() === 'casillas electrónicas' ||
-             t.trim() === 'casillas electronicas';
-    }
-    
-    const todosEnlaces = document.querySelectorAll('a, button, div[onclick], span[onclick]');
-    
     // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 1: Buscar texto EXACTO "Casillas Electrónicas"
+    // ESTRATEGIA 1: Selector exacto del HTML de SINOE
+    // El botón está en: div.bggradient.btnservicios > a.ui-commandlink
     // ═══════════════════════════════════════════════════════════════════
-    for (const el of todosEnlaces) {
-      const textoDirecto = (el.innerText || el.textContent || '').trim();
+    
+    // Buscar el contenedor específico del botón de Casillas
+    const contenedores = document.querySelectorAll('.btnservicios, .bggradient, [class*="btnservicio"]');
+    
+    for (const contenedor of contenedores) {
+      const texto = (contenedor.innerText || contenedor.textContent || '').toLowerCase();
       
-      // PRIMERO verificar lista negra
-      if (debeEvitar(textoDirecto)) continue;
-      
-      // Buscar coincidencia exacta o muy cercana
-      if (esEnlaceCasillas(textoDirecto)) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          el.click();
-          return { 
-            clickeado: true, 
-            texto: textoDirecto.substring(0, 30), 
-            metodo: 'texto_exacto' 
-          };
+      // Debe contener "casillas" pero NO "mesa de partes"
+      if (texto.includes('casillas') && !texto.includes('mesa de partes')) {
+        // Buscar el enlace dentro del contenedor
+        const enlace = contenedor.querySelector('a.ui-commandlink, a[onclick], a');
+        if (enlace) {
+          enlace.click();
+          return { clickeado: true, texto: 'btnservicios casillas', metodo: 'contenedor_exacto' };
+        }
+        // Si el contenedor mismo es clickeable
+        if (contenedor.onclick || contenedor.getAttribute('onclick')) {
+          contenedor.click();
+          return { clickeado: true, texto: 'contenedor casillas', metodo: 'contenedor_click' };
         }
       }
     }
     
     // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 2: Buscar imagen de SINOE y subir al padre clickeable
+    // ESTRATEGIA 2: Buscar por estructura de 3 columnas (col-md-4)
+    // La página tiene 3 opciones en columnas: SINOE, MPE, MPe ANC
     // ═══════════════════════════════════════════════════════════════════
+    
+    const columnas = document.querySelectorAll('.col-md-4, .col-xs-4, [class*="col-"][class*="-4"]');
+    
+    for (const columna of columnas) {
+      const texto = (columna.innerText || columna.textContent || '').toLowerCase();
+      
+      // Primera columna = Casillas Electrónicas (tiene "casillas" y NO tiene "mesa")
+      if (texto.includes('casillas') && texto.includes('electr') && !texto.includes('mesa')) {
+        const enlace = columna.querySelector('a.ui-commandlink, a[onclick], a');
+        if (enlace) {
+          enlace.click();
+          return { clickeado: true, texto: 'columna casillas', metodo: 'columna_grid' };
+        }
+      }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // ESTRATEGIA 3: Buscar enlace con onclick que contenga submit
+    // Los enlaces de PrimeFaces usan: onclick="...submit('frmNuevo')..."
+    // ═══════════════════════════════════════════════════════════════════
+    
+    const enlacesOnclick = document.querySelectorAll('a[onclick*="submit"], a.ui-commandlink');
+    
+    for (const enlace of enlacesOnclick) {
+      // Subir al contenedor padre para ver el texto completo
+      let contenedor = enlace.parentElement;
+      for (let i = 0; i < 3 && contenedor; i++) {
+        const textoContenedor = (contenedor.innerText || '').toLowerCase();
+        
+        if (textoContenedor.includes('casillas') && textoContenedor.includes('electr')) {
+          // Verificar que NO sea instructivo ni mesa de partes
+          if (!textoContenedor.includes('instructivo') && !textoContenedor.includes('mesa de partes')) {
+            enlace.click();
+            return { clickeado: true, texto: 'enlace primefaces', metodo: 'onclick_submit' };
+          }
+        }
+        contenedor = contenedor.parentElement;
+      }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // ESTRATEGIA 4: Buscar por imagen de SINOE (logo rojo)
+    // ═══════════════════════════════════════════════════════════════════
+    
     const imagenes = document.querySelectorAll('img');
     
     for (const img of imagenes) {
       const src = (img.src || '').toLowerCase();
       const alt = (img.alt || '').toLowerCase();
       
-      // Solo imágenes relacionadas con SINOE/casillas
-      if (!src.includes('sinoe') && !src.includes('casilla') && 
-          !alt.includes('sinoe') && !alt.includes('casilla')) {
-        continue;
-      }
+      // Imagen del logo SINOE (no el logo general del PJ)
+      const esSinoe = (src.includes('sinoe') || alt.includes('sinoe')) && 
+                      !src.includes('logo') && !src.includes('header');
       
-      // Subir hasta 5 niveles buscando elemento clickeable
-      let padre = img.parentElement;
-      for (let i = 0; i < 5 && padre; i++) {
-        const textoPadre = (padre.innerText || padre.textContent || '').trim();
-        
-        // Verificar lista negra del padre completo
-        if (debeEvitar(textoPadre)) {
-          break; // Salir del loop de padres
-        }
-        
-        // Si el padre es clickeable y tiene texto relacionado
-        const esClickeable = padre.tagName === 'A' || 
-                            padre.onclick || 
-                            padre.getAttribute('onclick') ||
-                            padre.getAttribute('href');
-        
-        if (esClickeable && textoPadre.toLowerCase().includes('casilla')) {
-          const rect = padre.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0) {
-            padre.click();
-            return { 
-              clickeado: true, 
-              texto: 'imagen_sinoe', 
-              metodo: 'imagen_padre' 
-            };
+      if (esSinoe) {
+        // Subir hasta encontrar el contenedor clickeable
+        let padre = img.parentElement;
+        for (let i = 0; i < 5 && padre; i++) {
+          const textoPadre = (padre.innerText || '').toLowerCase();
+          
+          // Verificar que sea el de casillas (no mesa de partes)
+          if (textoPadre.includes('casillas') && !textoPadre.includes('mesa')) {
+            const enlace = padre.querySelector('a') || padre;
+            if (enlace.click) {
+              enlace.click();
+              return { clickeado: true, texto: 'imagen sinoe', metodo: 'imagen' };
+            }
           }
-        }
-        
-        padre = padre.parentElement;
-      }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 3: Buscar por href que contenga 'casilla' o 'bandeja'
-    // ═══════════════════════════════════════════════════════════════════
-    const enlaces = document.querySelectorAll('a[href]');
-    
-    for (const enlace of enlaces) {
-      const href = (enlace.getAttribute('href') || '').toLowerCase();
-      const texto = (enlace.innerText || enlace.textContent || '').trim();
-      
-      // Verificar lista negra
-      if (debeEvitar(texto) || debeEvitar(href)) continue;
-      
-      // href debe contener casilla/bandeja/notifica
-      if (href.includes('casilla') || href.includes('bandeja') || href.includes('notifica')) {
-        const rect = enlace.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          enlace.click();
-          return { 
-            clickeado: true, 
-            texto: texto.substring(0, 30) || 'href_casilla', 
-            metodo: 'href' 
-          };
-        }
-      }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 4: Primera opción visual grande (panel con imagen)
-    // ═══════════════════════════════════════════════════════════════════
-    const paneles = document.querySelectorAll('[class*="panel"], [class*="card"], [class*="opcion"], [class*="menu-item"]');
-    
-    for (const panel of paneles) {
-      const textoPanel = (panel.innerText || panel.textContent || '').trim();
-      const tieneImagen = panel.querySelector('img');
-      
-      // Debe tener imagen, contener "casilla", y NO estar en lista negra
-      if (tieneImagen && 
-          textoPanel.toLowerCase().includes('casilla') && 
-          !debeEvitar(textoPanel)) {
-        
-        const clickeable = panel.querySelector('a') || panel;
-        const rect = clickeable.getBoundingClientRect();
-        
-        if (rect.width > 50 && rect.height > 50) {
-          clickeable.click();
-          return { 
-            clickeado: true, 
-            texto: 'panel_casillas', 
-            metodo: 'panel' 
-          };
+          padre = padre.parentElement;
         }
       }
     }
@@ -1125,59 +1084,307 @@ async function navegarACasillas(page, requestId) {
   });
   
   if (!clickeado || !clickeado.clickeado) {
-    log('warn', `CASILLAS:${requestId}`, 'No se encontró enlace a Casillas Electrónicas');
+    log('error', `CASILLAS:${requestId}`, '❌ No se encontró botón "Casillas Electrónicas"');
     return false;
   }
   
   log('success', `CASILLAS:${requestId}`, `✓ Clic en "${clickeado.texto}" (método: ${clickeado.metodo})`);
+  
+  // Esperar navegación a sso-menu-app.xhtml
   await delay(TIMEOUT.esperaClicCasillas);
   
   return true;
 }
 
 async function extraerNotificaciones(page, requestId) {
-  log('info', `NOTIF:${requestId}`, 'Extrayendo notificaciones...');
+  log('info', `NOTIF:${requestId}`, 'Extrayendo notificaciones de la tabla...');
+  
+  // Esperar a que la tabla cargue
+  await delay(3000);
   
   const datos = await evaluarSeguro(page, () => {
     const notifs = [];
-    const tablas = document.querySelectorAll('table');
     
-    for (const tabla of tablas) {
-      const filas = tabla.querySelectorAll('tbody tr');
-      
-      if (filas.length === 0) continue;
-      
-      filas.forEach((fila, index) => {
-        const celdas = fila.querySelectorAll('td');
-        if (celdas.length < 5) return;
-        
-        const notif = {
-          numero: index + 1,
-          nNotificacion: (celdas[1]?.textContent || '').trim(),
-          expediente: (celdas[2]?.textContent || '').trim(),
-          sumilla: (celdas[3]?.textContent || '').trim(),
-          organoJurisdiccional: (celdas[4]?.textContent || '').trim(),
-          fecha: (celdas[5]?.textContent || '').trim()
-        };
-        
-        if (notif.expediente || notif.nNotificacion) {
-          notifs.push(notif);
-        }
-      });
-      
-      if (notifs.length > 0) break;
+    // Buscar la tabla de notificaciones
+    const tabla = document.querySelector('table[role="grid"], .ui-datatable table, table.ui-widget-content');
+    
+    if (!tabla) {
+      return { error: 'No se encontró tabla de notificaciones' };
     }
     
-    return notifs;
+    const filas = tabla.querySelectorAll('tbody tr[role="row"], tbody tr[data-ri]');
+    
+    filas.forEach((fila, index) => {
+      const celdas = fila.querySelectorAll('td');
+      if (celdas.length < 5) return;
+      
+      // Buscar el botón rojo de descarga en la fila
+      const botonDescarga = fila.querySelector('button.ui-button, a.ui-button, [class*="ui-button"]');
+      
+      const notif = {
+        index: index,
+        nNotificacion: (celdas[1]?.innerText || '').trim(),
+        expediente: (celdas[2]?.innerText || '').trim(),
+        sumilla: (celdas[3]?.innerText || '').trim(),
+        organoJurisdiccional: (celdas[4]?.innerText || '').trim(),
+        fecha: (celdas[5]?.innerText || '').trim() || (celdas[6]?.innerText || '').trim(),
+        tieneBotonDescarga: !!botonDescarga,
+        dataRi: fila.getAttribute('data-ri') || index.toString()
+      };
+      
+      if (notif.expediente || notif.nNotificacion) {
+        notifs.push(notif);
+      }
+    });
+    
+    return { notificaciones: notifs, total: notifs.length };
   });
   
-  if (!datos || datos.length === 0) {
-    log('warn', `NOTIF:${requestId}`, 'No se encontraron notificaciones');
+  if (!datos || datos.error) {
+    log('warn', `NOTIF:${requestId}`, datos?.error || 'Error extrayendo notificaciones');
     return [];
   }
   
-  log('success', `NOTIF:${requestId}`, `${datos.length} notificaciones encontradas`);
-  return datos;
+  log('success', `NOTIF:${requestId}`, `${datos.total} notificaciones encontradas`);
+  return datos.notificaciones;
+}
+
+/**
+ * Hace clic en el botón rojo de una notificación para abrir el modal de anexos
+ */
+async function abrirModalAnexos(page, requestId, indexFila) {
+  log('info', `MODAL:${requestId}`, `Abriendo modal de anexos para fila ${indexFila}...`);
+  
+  const resultado = await evaluarSeguro(page, (idx) => {
+    // Buscar la fila por índice
+    const filas = document.querySelectorAll('tbody tr[role="row"], tbody tr[data-ri]');
+    
+    if (idx >= filas.length) {
+      return { exito: false, error: `Fila ${idx} no existe (total: ${filas.length})` };
+    }
+    
+    const fila = filas[idx];
+    
+    // Buscar el botón de descarga/ver en la fila (el botón rojo)
+    // Puede ser: button, a con clase ui-button, o elemento con icono de descarga
+    const selectoresBoton = [
+      'button.ui-button',
+      'a.ui-button', 
+      '[class*="ui-button"]',
+      'button[onclick]',
+      'a[onclick*="dlg"]',
+      '.ui-row-toggler',
+      'button[id*="btn"]'
+    ];
+    
+    let boton = null;
+    for (const selector of selectoresBoton) {
+      boton = fila.querySelector(selector);
+      if (boton) break;
+    }
+    
+    // Si no encontró con selectores, buscar cualquier botón o enlace en las últimas celdas
+    if (!boton) {
+      const celdas = fila.querySelectorAll('td');
+      for (let i = celdas.length - 1; i >= Math.max(0, celdas.length - 3); i--) {
+        boton = celdas[i].querySelector('button, a[onclick], [onclick]');
+        if (boton) break;
+      }
+    }
+    
+    if (!boton) {
+      return { exito: false, error: 'No se encontró botón de descarga en la fila' };
+    }
+    
+    boton.click();
+    return { exito: true, texto: boton.innerText || 'botón encontrado' };
+  }, indexFila);
+  
+  if (!resultado || !resultado.exito) {
+    log('warn', `MODAL:${requestId}`, resultado?.error || 'Error abriendo modal');
+    return false;
+  }
+  
+  log('info', `MODAL:${requestId}`, 'Clic realizado, esperando modal...');
+  
+  // Esperar a que el modal se abra
+  await delay(3000);
+  
+  // Verificar que el modal esté abierto
+  const modalAbierto = await evaluarSeguro(page, () => {
+    const modal = document.querySelector('.ui-dialog[aria-hidden="false"], .ui-dialog:not([style*="display: none"]), [role="dialog"]:not([aria-hidden="true"])');
+    if (modal) {
+      const texto = (modal.innerText || '').toLowerCase();
+      return { 
+        abierto: true, 
+        tieneConsolidado: texto.includes('consolidado'),
+        tieneAnexos: texto.includes('anexo') || texto.includes('lista')
+      };
+    }
+    return { abierto: false };
+  });
+  
+  if (!modalAbierto || !modalAbierto.abierto) {
+    log('warn', `MODAL:${requestId}`, 'Modal no se abrió');
+    return false;
+  }
+  
+  log('success', `MODAL:${requestId}`, 'Modal abierto correctamente', modalAbierto);
+  metricas.modalesAbiertos++;
+  return true;
+}
+
+/**
+ * Hace clic en el botón "Consolidado" dentro del modal para descargar el PDF
+ */
+async function descargarConsolidado(page, requestId) {
+  log('info', `DESCARGA:${requestId}`, 'Buscando botón "Consolidado"...');
+  
+  const resultado = await evaluarSeguro(page, () => {
+    // Buscar dentro del modal abierto
+    const modal = document.querySelector('.ui-dialog[aria-hidden="false"], .ui-dialog:not([style*="display: none"])');
+    
+    if (!modal) {
+      return { exito: false, error: 'Modal no encontrado' };
+    }
+    
+    // Buscar el botón "Consolidado" - múltiples estrategias
+    
+    // Estrategia 1: Por ID exacto (visto en el HTML)
+    let boton = modal.querySelector('#frmAnexos\\:btnDescargaTodo, [id*="btnDescarga"], [id*="Consolidado"]');
+    
+    // Estrategia 2: Por texto "Consolidado"
+    if (!boton) {
+      const botones = modal.querySelectorAll('button, a.ui-button');
+      for (const btn of botones) {
+        const texto = (btn.innerText || btn.textContent || '').toLowerCase();
+        if (texto.includes('consolidado')) {
+          boton = btn;
+          break;
+        }
+      }
+    }
+    
+    // Estrategia 3: Por span con texto "Consolidado" dentro de botón
+    if (!boton) {
+      const spans = modal.querySelectorAll('span.ui-button-text');
+      for (const span of spans) {
+        if ((span.innerText || '').toLowerCase().includes('consolidado')) {
+          boton = span.closest('button') || span.parentElement;
+          break;
+        }
+      }
+    }
+    
+    if (!boton) {
+      return { exito: false, error: 'Botón Consolidado no encontrado en el modal' };
+    }
+    
+    boton.click();
+    return { exito: true, texto: 'Consolidado' };
+  });
+  
+  if (!resultado || !resultado.exito) {
+    log('warn', `DESCARGA:${requestId}`, resultado?.error || 'Error al descargar');
+    return false;
+  }
+  
+  log('success', `DESCARGA:${requestId}`, '✓ Clic en "Consolidado" - descarga iniciada');
+  
+  // Incrementar métrica
+  metricas.consolidadosDescargados++;
+  
+  // Esperar a que la descarga se procese
+  await delay(5000);
+  
+  return true;
+}
+
+/**
+ * Cierra el modal actual
+ */
+async function cerrarModal(page, requestId) {
+  log('info', `MODAL:${requestId}`, 'Cerrando modal...');
+  
+  const cerrado = await evaluarSeguro(page, () => {
+    // Buscar botón de cerrar en el modal
+    const modal = document.querySelector('.ui-dialog[aria-hidden="false"], .ui-dialog:not([style*="display: none"])');
+    
+    if (!modal) return { exito: true, mensaje: 'No hay modal abierto' };
+    
+    // Buscar botón X o "Cerrar"
+    const botonCerrar = modal.querySelector(
+      '.ui-dialog-titlebar-close, ' +
+      'button[aria-label="Close"], ' +
+      'button.ui-dialog-titlebar-icon, ' +
+      'a.ui-dialog-titlebar-icon'
+    );
+    
+    if (botonCerrar) {
+      botonCerrar.click();
+      return { exito: true, mensaje: 'Clic en X' };
+    }
+    
+    // Buscar botón "Cerrar" por texto
+    const botones = modal.querySelectorAll('button');
+    for (const btn of botones) {
+      if ((btn.innerText || '').toLowerCase().includes('cerrar')) {
+        btn.click();
+        return { exito: true, mensaje: 'Clic en Cerrar' };
+      }
+    }
+    
+    return { exito: false, mensaje: 'No se encontró botón de cerrar' };
+  });
+  
+  await delay(1000);
+  
+  return cerrado?.exito || false;
+}
+
+/**
+ * Procesa las primeras N notificaciones descargando sus consolidados
+ */
+async function procesarNotificaciones(page, requestId, notificaciones, maxDescargas = 3) {
+  const resultados = [];
+  const total = Math.min(notificaciones.length, maxDescargas);
+  
+  log('info', `PROCESO:${requestId}`, `Procesando ${total} de ${notificaciones.length} notificaciones...`);
+  
+  for (let i = 0; i < total; i++) {
+    const notif = notificaciones[i];
+    log('info', `PROCESO:${requestId}`, `[${i+1}/${total}] Procesando: ${notif.expediente}`);
+    
+    // 1. Abrir el modal de anexos
+    const modalAbierto = await abrirModalAnexos(page, requestId, i);
+    
+    if (!modalAbierto) {
+      log('warn', `PROCESO:${requestId}`, `No se pudo abrir modal para ${notif.expediente}`);
+      resultados.push({ expediente: notif.expediente, descargado: false, error: 'Modal no abrió' });
+      continue;
+    }
+    
+    // 2. Descargar el consolidado
+    const descargado = await descargarConsolidado(page, requestId);
+    
+    resultados.push({
+      expediente: notif.expediente,
+      nNotificacion: notif.nNotificacion,
+      descargado: descargado,
+      fecha: notif.fecha
+    });
+    
+    // 3. Cerrar el modal
+    await cerrarModal(page, requestId);
+    
+    // 4. Esperar antes de la siguiente
+    await delay(2000);
+  }
+  
+  const exitosos = resultados.filter(r => r.descargado).length;
+  log('success', `PROCESO:${requestId}`, `Procesadas ${exitosos}/${total} notificaciones`);
+  
+  return resultados;
 }
 
 // ============================================================
@@ -1521,15 +1728,52 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     // PASO 15: Navegar a Casillas Electrónicas
     // ═══════════════════════════════════════════════════════════════════
     
+    log('info', `SCRAPER:${requestId}`, 'Navegando a Casillas Electrónicas...');
     await delay(3000);
-    await navegarACasillas(page, requestId);
+    
+    const navegoACasillas = await navegarACasillas(page, requestId);
+    
+    if (!navegoACasillas) {
+      await enviarWhatsAppTexto(whatsappNumero, 
+        `⚠️ ${nombreAbogado}, login exitoso pero no se pudo acceder a Casillas Electrónicas.`
+      );
+      throw new Error('No se pudo navegar a Casillas Electrónicas');
+    }
+    
+    // Esperar a que cargue la tabla de notificaciones
     await delay(TIMEOUT.esperaCargaTabla);
     
     // ═══════════════════════════════════════════════════════════════════
     // PASO 16: Extraer notificaciones
     // ═══════════════════════════════════════════════════════════════════
     
+    log('info', `SCRAPER:${requestId}`, 'Extrayendo lista de notificaciones...');
     const notificaciones = await extraerNotificaciones(page, requestId);
+    
+    if (notificaciones.length === 0) {
+      await enviarWhatsAppTexto(whatsappNumero,
+        `✅ ${nombreAbogado}, acceso exitoso a SINOE.\n\n📋 No hay notificaciones pendientes.`
+      );
+      
+      const duracionMs = Date.now() - inicioMs;
+      metricas.scrapersExitosos++;
+      
+      return { success: true, notificaciones: [], duracionMs, requestId };
+    }
+    
+    // Notificar al usuario que se encontraron notificaciones
+    await enviarWhatsAppTexto(whatsappNumero,
+      `📋 ${nombreAbogado}, se encontraron ${notificaciones.length} notificación(es).\n\n⏳ Descargando consolidados de las primeras 3...`
+    );
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // PASO 17: Procesar notificaciones (descargar consolidados)
+    // ═══════════════════════════════════════════════════════════════════
+    
+    log('info', `SCRAPER:${requestId}`, 'Procesando notificaciones...');
+    const resultadosDescarga = await procesarNotificaciones(page, requestId, notificaciones, 3);
+    
+    const descargasExitosas = resultadosDescarga.filter(r => r.descargado).length;
     
     // ═══════════════════════════════════════════════════════════════════
     // ÉXITO
@@ -1544,13 +1788,35 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       ((metricas.tiempoPromedioMs * (totalExitosos - 1)) + duracionMs) / totalExitosos
     );
     
-    await enviarWhatsAppTexto(whatsappNumero,
-      `✅ ${nombreAbogado}, acceso exitoso a SINOE.\n\n📋 ${notificaciones.length} notificación(es) encontrada(s).\n\n⏱️ Tiempo: ${Math.round(duracionMs/1000)}s`
-    );
+    // Construir mensaje de resumen
+    let resumen = `✅ ${nombreAbogado}, proceso completado.\n\n`;
+    resumen += `📋 ${notificaciones.length} notificación(es) encontrada(s)\n`;
+    resumen += `📥 ${descargasExitosas} consolidado(s) descargado(s)\n`;
+    resumen += `⏱️ Tiempo: ${Math.round(duracionMs/1000)}s\n\n`;
     
-    log('success', `SCRAPER:${requestId}`, 'Scraper completado', { duracionMs, notificaciones: notificaciones.length });
+    if (descargasExitosas > 0) {
+      resumen += `📄 Expedientes procesados:\n`;
+      resultadosDescarga.forEach((r, i) => {
+        const estado = r.descargado ? '✓' : '✗';
+        resumen += `${estado} ${r.expediente}\n`;
+      });
+    }
     
-    return { success: true, notificaciones, duracionMs, requestId };
+    await enviarWhatsAppTexto(whatsappNumero, resumen);
+    
+    log('success', `SCRAPER:${requestId}`, 'Scraper completado', { 
+      duracionMs, 
+      notificaciones: notificaciones.length,
+      descargasExitosas 
+    });
+    
+    return { 
+      success: true, 
+      notificaciones, 
+      descargas: resultadosDescarga,
+      duracionMs, 
+      requestId 
+    };
     
   } catch (error) {
     metricas.scrapersFallidos++;
@@ -1640,6 +1906,8 @@ app.get('/health', (req, res) => {
       scrapersExitosos: metricas.scrapersExitosos,
       scrapersFallidos: metricas.scrapersFallidos,
       sesionesFinalizadas: metricas.sesionesFinalizadas,
+      consolidadosDescargados: metricas.consolidadosDescargados,
+      modalesAbiertos: metricas.modalesAbiertos,
       erroresFrameIgnorados: metricas.erroresFrameIgnorados,
       tiempoPromedioMs: metricas.tiempoPromedioMs
     }
@@ -1850,7 +2118,7 @@ app.post('/test-credenciales', async (req, res) => {
   }
 });
 
-// v4.8.1: Test de CAPTCHA restaurado
+// v4.8.2: Test de CAPTCHA restaurado
 app.post('/test-captcha', async (req, res) => {
   let browser = null;
   
@@ -1879,6 +2147,124 @@ app.post('/test-captcha', async (req, res) => {
       captcha: estadoCaptcha,
       screenshotSize: screenshot ? screenshot.length : 0
     });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+// v4.8.2: DEBUG - Capturar página post-login para analizar estructura
+app.post('/debug-post-login', async (req, res) => {
+  const { usuario, password, captcha } = req.body;
+  let browser = null;
+  
+  if (!usuario || !password || !captcha) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Requiere: usuario, password, captcha' 
+    });
+  }
+  
+  try {
+    const ws = CONFIG.browserless.token 
+      ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
+      : CONFIG.browserless.url;
+    
+    browser = await puppeteer.connect({ browserWSEndpoint: ws, defaultViewport: DEFAULT_VIEWPORT });
+    const page = await browser.newPage();
+    
+    // Navegar a SINOE
+    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+    await delay(3000);
+    await cerrarPopups(page, 'DEBUG');
+    await delay(1000);
+    
+    // Llenar credenciales
+    await llenarCredenciales(page, usuario, password);
+    await delay(1000);
+    
+    // Escribir CAPTCHA proporcionado
+    const campoCaptcha = await page.$('input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[id*="captcha"]');
+    if (campoCaptcha) {
+      await campoCaptcha.click({ clickCount: 3 });
+      await page.keyboard.press('Backspace');
+      await campoCaptcha.type(captcha.toUpperCase(), { delay: 50 });
+    }
+    
+    // Hacer login
+    const btnLogin = await page.$('button[type="submit"], input[type="submit"]');
+    if (btnLogin) await btnLogin.click();
+    else await page.keyboard.press('Enter');
+    
+    // Esperar
+    await delay(15000);
+    
+    // Cerrar popups
+    await cerrarPopups(page, 'DEBUG');
+    await delay(1000);
+    
+    // Capturar información de la página
+    const urlActual = page.url();
+    const contenidoHTML = await page.content();
+    const screenshot = await page.screenshot({ encoding: 'base64', fullPage: true });
+    
+    // Analizar estructura de la página
+    const analisis = await page.evaluate(() => {
+      const resultado = {
+        enlaces: [],
+        imagenes: [],
+        paneles: [],
+        botones: [],
+        textoCompleto: document.body.innerText.substring(0, 2000)
+      };
+      
+      // Todos los enlaces
+      document.querySelectorAll('a').forEach(a => {
+        resultado.enlaces.push({
+          texto: (a.innerText || a.textContent || '').trim().substring(0, 100),
+          href: a.getAttribute('href') || '',
+          visible: a.offsetWidth > 0 && a.offsetHeight > 0
+        });
+      });
+      
+      // Todas las imágenes
+      document.querySelectorAll('img').forEach(img => {
+        resultado.imagenes.push({
+          src: img.src.substring(img.src.lastIndexOf('/') + 1),
+          alt: img.alt || '',
+          width: img.naturalWidth,
+          height: img.naturalHeight
+        });
+      });
+      
+      // Paneles/divs con clase panel
+      document.querySelectorAll('[class*="panel"], [class*="card"], [class*="menu"]').forEach(p => {
+        resultado.paneles.push({
+          clase: p.className,
+          texto: (p.innerText || '').substring(0, 100)
+        });
+      });
+      
+      // Botones
+      document.querySelectorAll('button, input[type="button"], input[type="submit"]').forEach(b => {
+        resultado.botones.push({
+          texto: (b.innerText || b.value || '').trim(),
+          tipo: b.type || b.tagName
+        });
+      });
+      
+      return resultado;
+    });
+    
+    res.json({ 
+      success: true,
+      url: urlActual,
+      analisis,
+      htmlLength: contenidoHTML.length,
+      screenshot: screenshot.substring(0, 1000) + '...(truncado)'
+    });
+    
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   } finally {
@@ -1920,28 +2306,28 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║               LEXA SCRAPER SERVICE v4.8.1 - AUDITADO Y CORREGIDO              ║
+║          LEXA SCRAPER SERVICE v4.8.2 - DESCARGA DE CONSOLIDADOS               ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${String(PORT).padEnd(70)}║
 ║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
 ║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
 ║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  CORRECCIONES v4.8.1 (Auditoría Profesional):                                 ║
+║  FLUJO COMPLETO v4.8.2:                                                       ║
 ║                                                                               ║
-║    ✓ BUG #1: Sesión activa → Ahora clic automático en FINALIZAR SESIONES      ║
-║    ✓ BUG #2: Memory leak → setTimeout cancelado con clearTimeout              ║
-║    ✓ BUG #3: Limpieza → Cancela timeoutId en limpieza automática              ║
-║    ✓ BUG #4: Detección → Ahora detecta "finalizar sesion" en contenido        ║
-║    ✓ BUG #5: UX → Mensaje descriptivo cuando página expira                    ║
-║    ✓ BUG #6: Debug → Restaurados /test-credenciales y /test-captcha           ║
+║    1. Login con CAPTCHA manual (5 min timeout)                                ║
+║    2. Manejo automático de sesión activa                                      ║
+║    3. Navegación a "Casillas Electrónicas" (4 estrategias)                    ║
+║    4. Extracción de lista de notificaciones                                   ║
+║    5. Clic en botón rojo → Abre modal de anexos                               ║
+║    6. Clic en "Consolidado" → Descarga PDF                                    ║
+║    7. Procesa las primeras 3 notificaciones automáticamente                   ║
 ║                                                                               ║
-║  FLUJO SESIÓN ACTIVA (NUEVO):                                                 ║
-║    1. Detecta página "sso-session-activa"                                     ║
-║    2. Cierra popup COMUNICADO                                                 ║
-║    3. Clic automático en FINALIZAR SESIONES                                   ║
-║    4. Espera redirección al login                                             ║
-║    5. Reintenta proceso completo                                              ║
+║  CORRECCIONES INCLUIDAS:                                                      ║
+║    ✓ Sesión activa → clic automático en FINALIZAR SESIONES                    ║
+║    ✓ Memory leak setTimeout corregido                                         ║
+║    ✓ No hace clic en "instructivo" (lista negra)                              ║
+║    ✓ Selectores exactos del HTML de SINOE                                     ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                                   ║
 ║    GET  /health              POST /webhook/whatsapp                           ║
