@@ -1395,20 +1395,43 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       await page.keyboard.press('Enter');
     }
     
-    await page.waitForFunction(
-      url => window.location.href !== url,
-      { timeout: TIMEOUT.navegacion },
-      urlAntes
-    ).catch(() => {});
-    
-    await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
-    await delay(2000);
-    
+    // Esperar a que cambie la URL o timeout
+    try {
+      await page.waitForFunction(
+        url => window.location.href !== url,
+        { timeout: TIMEOUT.navegacion },
+        urlAntes
+      );
+    } catch (e) {
+      log('warn', `SCRAPER:${requestId}`, 'Timeout esperando cambio de URL, continuando...');
+    }
+
+    // Esperar navegación con manejo de error robusto
+    try {
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+    } catch (e) {
+      log('warn', `SCRAPER:${requestId}`, 'Timeout en waitForNavigation, continuando...');
+    }
+
+    // CRÍTICO: Esperar a que el frame esté listo
+    await delay(3000);
+
     // PASO 13: Verificar resultado del login
     log('info', `SCRAPER:${requestId}`, 'Verificando resultado del login...');
-    
-    const urlActual = page.url();
-    const contenidoActual = await page.content();
+
+    // Esperar a que la página tenga contenido antes de acceder
+    let urlActual, contenidoActual;
+    try {
+      await page.waitForSelector('body', { timeout: 10000 });
+      urlActual = page.url();
+      contenidoActual = await page.content();
+    } catch (frameError) {
+      log('error', `SCRAPER:${requestId}`, `Error accediendo al frame: ${frameError.message}`);
+      // Intentar reconectar o esperar más
+      await delay(2000);
+      urlActual = page.url();
+      contenidoActual = await page.content();
+    }
     
     if (contenidoActual.toLowerCase().includes('captcha') && 
         (contenidoActual.toLowerCase().includes('incorrecto') || 
