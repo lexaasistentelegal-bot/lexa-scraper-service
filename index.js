@@ -1,32 +1,44 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.8.0 - Solución Probada "Requesting main frame too early!"
+ * LEXA SCRAPER SERVICE v4.8.1 - AUDITADO Y CORREGIDO
  * ============================================================
- * Versión: PRODUCCIÓN - SOLUCIÓN DEFINITIVA
+ * Versión: PRODUCCIÓN
  * Fecha: Febrero 2026
  * Autor: CTO SINOE Assistant
  * 
- * CAMBIOS v4.8.0 vs v4.7.0:
- * =========================
+ * CORRECCIONES v4.8.1 vs v4.8.0 (Auditoría Profesional):
+ * ======================================================
  * 
- * PROBLEMA: El error "Requesting main frame too early!" ocurre porque:
- * - SINOE usa JSF/PrimeFaces que hace redirect via JavaScript
- * - El redirect destruye el frame antes de crear el nuevo
- * - Puppeteer lanza error si accedemos al frame durante esta transición
+ * BUG #1 CRÍTICO - SESIÓN ACTIVA:
+ *   ANTES: Fallaba y pedía al usuario cerrar manualmente
+ *   AHORA: Hace clic automático en "FINALIZAR SESIONES" y reintenta login
  * 
- * SOLUCIÓN v4.8.0 (PROBADA):
- * - NO usar page.mainFrame() en ningún listener
- * - NO usar waitForNavigation (es poco confiable con JSF)
- * - Después del clic: esperar tiempo FIJO de 15 segundos SIN TOCAR el page
- * - Luego: intentar leer con page.url() y page.content() con try-catch
- * - Si falla: esperar 3 segundos más y reintentar (máximo 30 intentos = 90 seg)
- * - Detectar login exitoso por URL O por contenido de la página
+ * BUG #2 CRÍTICO - MEMORY LEAK SETTIMEOUT:
+ *   ANTES: setTimeout del CAPTCHA seguía activo después de resolver
+ *   AHORA: Se guarda timeoutId y se cancela con clearTimeout
  * 
- * FLUJO POST-LOGIN:
- * 1. Después del login exitoso, detectar las 3 opciones (SINOE, MPE, MPe ANC)
- * 2. Hacer clic en "Casillas Electrónicas" (primera opción)
- * 3. Esperar la tabla de notificaciones
- * 4. Navegar por las notificaciones y descargar consolidados
+ * BUG #3 - LIMPIEZA AUTOMÁTICA:
+ *   ANTES: No cancelaba timeoutId en limpieza
+ *   AHORA: Cancela timeoutId antes de eliminar sesión
+ * 
+ * BUG #4 - DETECCIÓN SESIÓN ACTIVA:
+ *   ANTES: Solo detectaba por URL y "sesión activa"
+ *   AHORA: También detecta "finalizar sesion" en contenido
+ * 
+ * BUG #5 - CAMPO CAPTCHA EXPIRADO:
+ *   ANTES: Error genérico si el campo desapareció
+ *   AHORA: Mensaje descriptivo "página expiró"
+ * 
+ * BUG #6 - ENDPOINTS DE DEBUG:
+ *   ANTES: Eliminados
+ *   AHORA: Restaurados /test-credenciales y /test-captcha
+ * 
+ * FLUJO DE SESIÓN ACTIVA (NUEVO):
+ * 1. Detectar página "sso-session-activa.xhtml"
+ * 2. Cerrar popup de COMUNICADO si existe
+ * 3. Hacer clic en botón "FINALIZAR SESIONES"
+ * 4. Esperar redirección al login
+ * 5. Reintentar proceso completo de login
  * ============================================================
  */
 
@@ -51,7 +63,7 @@ const SINOE_URLS = {
   bandeja: 'sso-menu-app.xhtml'
 };
 
-// v4.8.0: Timeouts reajustados
+// Timeouts (en milisegundos)
 const TIMEOUT = {
   navegacion: 60000,           // 1 minuto para cargar páginas
   captcha: 300000,             // 5 minutos para que el abogado resuelva
@@ -60,17 +72,21 @@ const TIMEOUT = {
   elemento: 15000,             // 15 segundos para elementos DOM
   imagenCarga: 5000,           // 5 segundos para imágenes
   
-  // v4.8.0: Tiempos específicos para el problema del frame
-  esperaPostClick: 15000,      // 15 seg de espera FIJA después del clic (NO TOCAR PAGE)
+  // Tiempos para el problema del frame
+  esperaPostClick: 15000,      // 15 seg de espera FIJA después del clic
   esperaEntreReintentos: 3000, // 3 seg entre cada reintento de lectura
-  maxReintentosLectura: 30,    // 30 intentos máximo (30 * 3 = 90 seg adicionales)
+  maxReintentosLectura: 30,    // 30 intentos máximo
   
-  // Navegación dentro de SINOE post-login
+  // Navegación post-login
   esperaClicCasillas: 10000,   // 10 seg después de clic en Casillas
-  esperaCargaTabla: 8000       // 8 seg para cargar tabla de notificaciones
+  esperaCargaTabla: 8000,      // 8 seg para cargar tabla
+  
+  // v4.8.1: Tiempos para sesión activa
+  esperaFinalizarSesion: 5000, // 5 seg después de clic en FINALIZAR
+  esperaPostFinalizacion: 8000 // 8 seg para que recargue el login
 };
 
-// v4.8.0: Errores que indican frame en transición (ignorar y reintentar)
+// Errores que indican frame en transición (ignorar y reintentar)
 const ERRORES_FRAME = [
   'Requesting main frame too early',
   'Execution context was destroyed',
@@ -133,7 +149,8 @@ const metricas = {
   captchasRecibidos: 0,
   captchasRecargados: 0,
   captchasFallidos: 0,
-  // v4.8.0: Métricas de diagnóstico
+  // v4.8.1: Nuevas métricas
+  sesionesFinalizadas: 0,      // Cuántas veces se finalizó sesión activa automáticamente
   erroresFrameIgnorados: 0,
   reintentosLectura: 0,
   tiempoPromedioMs: 0,
@@ -146,7 +163,7 @@ const metricas = {
 
 const sesionesActivas = new Map();
 const rateLimitCache = new Map();
-const webhooksRecientes = new Map(); // Para detectar duplicados
+const webhooksRecientes = new Map();
 let limpiezaInterval = null;
 
 // ============================================================
@@ -178,10 +195,6 @@ function enmascarar(texto) {
   return str.substring(0, 3) + '***' + str.substring(str.length - 2);
 }
 
-/**
- * v4.8.0: Detecta si un error es de frame en transición
- * ESTOS ERRORES SE IGNORAN Y SE REINTENTA
- */
 function esErrorDeFrame(error) {
   if (!error || !error.message) return false;
   const mensaje = error.message.toLowerCase();
@@ -218,28 +231,32 @@ function validarCaptcha(texto) {
   return { valido: true, captcha: limpio };
 }
 
+// v4.8.1: Limpieza mejorada - ahora cancela timeoutId
 function iniciarLimpiezaAutomatica() {
   limpiezaInterval = setInterval(() => {
     const ahora = Date.now();
     
-    // Limpiar sesiones expiradas
     for (const [numero, sesion] of sesionesActivas.entries()) {
       if (ahora - sesion.timestamp > 360000) { // 6 minutos
         log('warn', 'LIMPIEZA', `Sesión expirada: ${enmascarar(numero)}`);
+        
+        // v4.8.1: Cancelar timeout antes de eliminar
+        if (sesion.timeoutId) {
+          clearTimeout(sesion.timeoutId);
+        }
+        
         if (sesion.reject) sesion.reject(new Error('Timeout: CAPTCHA no resuelto'));
         if (sesion.browser) sesion.browser.close().catch(() => {});
         sesionesActivas.delete(numero);
       }
     }
     
-    // Limpiar rate limit cache
     for (const [ip, data] of rateLimitCache.entries()) {
       if (ahora - data.timestamp > RATE_LIMIT.windowMs) {
         rateLimitCache.delete(ip);
       }
     }
     
-    // Limpiar webhooks recientes (5 minutos)
     for (const [key, timestamp] of webhooksRecientes.entries()) {
       if (ahora - timestamp > 300000) {
         webhooksRecientes.delete(key);
@@ -251,13 +268,9 @@ function iniciarLimpiezaAutomatica() {
 }
 
 // ============================================================
-// v4.8.0: FUNCIONES DE LECTURA SEGURA (SOLUCIÓN AL ERROR)
+// FUNCIONES DE LECTURA SEGURA
 // ============================================================
 
-/**
- * v4.8.0: Lee la URL de forma segura
- * Retorna null si el frame no está disponible (NO lanza error)
- */
 async function leerUrlSegura(page) {
   try {
     return page.url();
@@ -270,10 +283,6 @@ async function leerUrlSegura(page) {
   }
 }
 
-/**
- * v4.8.0: Lee el contenido HTML de forma segura
- * Retorna null si el frame no está disponible (NO lanza error)
- */
 async function leerContenidoSeguro(page) {
   try {
     return await page.content();
@@ -286,10 +295,6 @@ async function leerContenidoSeguro(page) {
   }
 }
 
-/**
- * v4.8.0: Ejecuta page.evaluate() de forma segura
- * Retorna null si falla por frame en transición
- */
 async function evaluarSeguro(page, fn, ...args) {
   try {
     return await page.evaluate(fn, ...args);
@@ -303,67 +308,51 @@ async function evaluarSeguro(page, fn, ...args) {
 }
 
 /**
- * v4.8.0: FUNCIÓN PRINCIPAL - Espera a que el frame esté disponible después del clic
- * 
- * ESTRATEGIA:
- * 1. NO usar waitForNavigation (no es confiable con JSF)
- * 2. Esperar tiempo fijo SIN TOCAR el page
- * 3. Luego intentar leer URL y contenido con try-catch
- * 4. Si falla, esperar más y reintentar
- * 
- * @returns {Promise<{url: string, contenido: string, exito: boolean}>}
+ * Espera a que el frame esté disponible y lee la página
  */
 async function esperarYLeerPagina(page, requestId, urlAntes) {
-  // PASO 1: Esperar tiempo fijo SIN TOCAR el page
   log('info', `LECTURA:${requestId}`, `Esperando ${TIMEOUT.esperaPostClick/1000}s sin tocar el page...`);
   await delay(TIMEOUT.esperaPostClick);
   
-  // PASO 2: Intentar leer con reintentos
   for (let intento = 1; intento <= TIMEOUT.maxReintentosLectura; intento++) {
     metricas.reintentosLectura++;
     
-    // Intentar leer URL
     const url = await leerUrlSegura(page);
     
     if (url === null) {
-      log('debug', `LECTURA:${requestId}`, `Intento ${intento}/${TIMEOUT.maxReintentosLectura}: URL no disponible aún`);
+      log('debug', `LECTURA:${requestId}`, `Intento ${intento}/${TIMEOUT.maxReintentosLectura}: URL no disponible`);
       await delay(TIMEOUT.esperaEntreReintentos);
       continue;
     }
     
-    // Intentar leer contenido
     const contenido = await leerContenidoSeguro(page);
     
     if (contenido === null) {
-      log('debug', `LECTURA:${requestId}`, `Intento ${intento}/${TIMEOUT.maxReintentosLectura}: Contenido no disponible aún`);
+      log('debug', `LECTURA:${requestId}`, `Intento ${intento}/${TIMEOUT.maxReintentosLectura}: Contenido no disponible`);
       await delay(TIMEOUT.esperaEntreReintentos);
       continue;
     }
     
-    // Verificar que el contenido sea válido (no vacío)
     if (contenido.length < 500) {
-      log('debug', `LECTURA:${requestId}`, `Intento ${intento}/${TIMEOUT.maxReintentosLectura}: Contenido muy corto (${contenido.length} bytes)`);
+      log('debug', `LECTURA:${requestId}`, `Intento ${intento}/${TIMEOUT.maxReintentosLectura}: Contenido muy corto`);
       await delay(TIMEOUT.esperaEntreReintentos);
       continue;
     }
     
-    // ¡Éxito!
     log('success', `LECTURA:${requestId}`, `Página leída en intento ${intento}`, {
       url: url.substring(0, 50),
-      bytes: contenido.length,
-      cambioUrl: url !== urlAntes
+      bytes: contenido.length
     });
     
     return { url, contenido, exito: true };
   }
   
-  // Timeout total
-  log('error', `LECTURA:${requestId}`, 'No se pudo leer la página después de todos los reintentos');
+  log('error', `LECTURA:${requestId}`, 'No se pudo leer la página');
   return { url: urlAntes, contenido: '', exito: false };
 }
 
 /**
- * v4.8.0: Analiza el resultado del login basado en URL y contenido
+ * v4.8.1: Analiza el resultado del login con detección mejorada de sesión activa
  */
 function analizarResultadoLogin(url, contenido, urlAntes) {
   const urlLower = url.toLowerCase();
@@ -373,23 +362,25 @@ function analizarResultadoLogin(url, contenido, urlAntes) {
   if (contenidoLower.includes('captcha') && 
       (contenidoLower.includes('incorrecto') || 
        contenidoLower.includes('inválido') ||
-       contenidoLower.includes('error'))) {
+       contenidoLower.includes('invalido'))) {
     return { tipo: 'captcha_incorrecto', mensaje: 'CAPTCHA incorrecto' };
   }
   
-  // 2. Sesión activa
+  // 2. v4.8.1: Sesión activa - detección mejorada
   if (urlLower.includes('session-activa') || 
+      urlLower.includes('sso-session-activa') ||
       contenidoLower.includes('sesión activa') ||
-      contenidoLower.includes('sesion activa')) {
-    return { tipo: 'sesion_activa', mensaje: 'Ya existe una sesión activa' };
+      contenidoLower.includes('sesion activa') ||
+      contenidoLower.includes('finalizar sesion') ||
+      contenidoLower.includes('finalizar sesión')) {
+    return { tipo: 'sesion_activa', mensaje: 'Sesión activa detectada' };
   }
   
-  // 3. Login exitoso - detectar página de bienvenida con las 3 opciones
-  // La página post-login tiene "Bienvenido(a):" y los enlaces a SINOE, MPE, MPe ANC
+  // 3. Login exitoso - página de bienvenida con las 3 opciones
   if (contenidoLower.includes('bienvenido') ||
       contenidoLower.includes('casillas electrónicas') ||
       contenidoLower.includes('casillas electronicas') ||
-      contenidoLower.includes('mesa de partes') ||
+      contenidoLower.includes('mesa de partes electr') ||
       urlLower.includes('login.xhtml') ||
       urlLower.includes('menu-app')) {
     return { tipo: 'login_exitoso', mensaje: 'Login exitoso' };
@@ -400,9 +391,9 @@ function analizarResultadoLogin(url, contenido, urlAntes) {
     return { tipo: 'login_exitoso', mensaje: 'Login exitoso (URL cambió)' };
   }
   
-  // 5. Indeterminado pero sin error visible
+  // 5. Indeterminado
   if (!contenidoLower.includes('error') && !contenidoLower.includes('invalid')) {
-    return { tipo: 'indeterminado', mensaje: 'Resultado no determinado, continuando...' };
+    return { tipo: 'indeterminado', mensaje: 'Resultado indeterminado' };
   }
   
   return { tipo: 'error_desconocido', mensaje: 'Error desconocido' };
@@ -426,7 +417,6 @@ async function enviarWhatsAppTexto(numero, texto) {
       })
     });
     
-    const data = await response.json();
     log('success', 'WHATSAPP', 'Texto enviado', { numero: enmascarar(numero), longitud: texto.length });
     return true;
   } catch (error) {
@@ -452,8 +442,7 @@ async function enviarWhatsAppImagen(numero, base64, caption) {
       })
     });
     
-    const data = await response.json();
-    log('success', 'WHATSAPP', 'Imagen enviada', { numero: enmascarar(numero), size: base64.length, captionLength: caption.length });
+    log('success', 'WHATSAPP', 'Imagen enviada', { numero: enmascarar(numero), size: base64.length });
     return true;
   } catch (error) {
     log('error', 'WHATSAPP', `Error enviando imagen: ${error.message}`);
@@ -462,7 +451,7 @@ async function enviarWhatsAppImagen(numero, base64, caption) {
 }
 
 // ============================================================
-// FUNCIONES DE SINOE
+// FUNCIONES DE SINOE - POPUPS
 // ============================================================
 
 async function hayPopupVisible(page) {
@@ -493,8 +482,8 @@ async function hayPopupVisible(page) {
   }
 }
 
-async function cerrarPopups(page) {
-  log('info', 'POPUP', 'Verificando si hay popups para cerrar...');
+async function cerrarPopups(page, contexto = 'POPUP') {
+  log('info', contexto, 'Verificando si hay popups para cerrar...');
   
   const maxIntentos = 5;
   
@@ -503,12 +492,12 @@ async function cerrarPopups(page) {
     
     if (!tienePopup) {
       if (intento === 1) {
-        log('info', 'POPUP', 'No hay popups visibles');
+        log('info', contexto, 'No hay popups visibles');
       }
       return true;
     }
     
-    log('info', 'POPUP', `Intento ${intento}/${maxIntentos} de cerrar popup...`);
+    log('info', contexto, `Intento ${intento}/${maxIntentos} de cerrar popup...`);
     
     try {
       const clicExitoso = await page.evaluate(() => {
@@ -522,7 +511,7 @@ async function cerrarPopups(page) {
         ];
         
         for (const btn of botones) {
-          const texto = (btn.textContent || '').toLowerCase();
+          const texto = (btn.textContent || '').toLowerCase().trim();
           const titulo = (btn.getAttribute('title') || '').toLowerCase();
           const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
           
@@ -531,9 +520,10 @@ async function cerrarPopups(page) {
             texto.includes('aceptar') || texto.includes('accept') ||
             texto.includes('ok') || texto.includes('entendido') ||
             titulo.includes('cerrar') || titulo.includes('close') ||
-            ariaLabel.includes('close');
+            ariaLabel.includes('close') ||
+            btn.classList.contains('ui-dialog-titlebar-close');
           
-          if (esBotonCerrar || btn.classList.contains('ui-dialog-titlebar-close')) {
+          if (esBotonCerrar) {
             const style = window.getComputedStyle(btn);
             if (style.display !== 'none' && style.visibility !== 'hidden') {
               btn.click();
@@ -552,27 +542,116 @@ async function cerrarPopups(page) {
       });
       
       if (clicExitoso) {
-        log('info', 'POPUP', `Clic en botón: "${clicExitoso}"`);
+        log('info', contexto, `Clic en: "${clicExitoso}"`);
         await delay(500);
         
         const abierto = await hayPopupVisible(page);
         if (!abierto) {
-          log('success', 'POPUP', `Popup cerrado después de ${(intento-1) * 500}ms`);
+          log('success', contexto, 'Popup cerrado');
           return true;
         }
       }
     } catch (error) {
       if (!esErrorDeFrame(error)) {
-        log('warn', 'POPUP', `Error en intento ${intento}: ${error.message}`);
+        log('warn', contexto, `Error: ${error.message}`);
       }
     }
     
     await delay(500);
   }
   
-  log('warn', 'POPUP', 'No se pudo cerrar el popup después de todos los intentos');
+  log('warn', contexto, 'No se pudo cerrar el popup');
   return false;
 }
+
+// ============================================================
+// v4.8.1: MANEJO DE SESIÓN ACTIVA - FUNCIÓN NUEVA
+// ============================================================
+
+/**
+ * v4.8.1: Maneja la página de sesión activa haciendo clic en FINALIZAR SESIONES
+ * 
+ * @param {Page} page - Instancia de Puppeteer
+ * @param {string} requestId - ID para logging
+ * @returns {Promise<boolean>} true si se finalizó exitosamente
+ */
+async function manejarSesionActiva(page, requestId) {
+  log('info', `SESION:${requestId}`, '🔄 Manejando sesión activa...');
+  
+  // Paso 1: Cerrar cualquier popup (COMUNICADO, etc)
+  log('info', `SESION:${requestId}`, 'Cerrando popups previos...');
+  await cerrarPopups(page, `SESION:${requestId}`);
+  await delay(1000);
+  
+  // Paso 2: Buscar y hacer clic en "FINALIZAR SESIONES" o "FINALIZAR SESIÓN"
+  log('info', `SESION:${requestId}`, 'Buscando botón FINALIZAR SESIONES...');
+  
+  const clickeado = await evaluarSeguro(page, () => {
+    // Buscar por texto en botones y enlaces
+    const elementos = document.querySelectorAll('button, a, input[type="submit"], input[type="button"], .ui-button');
+    
+    for (const el of elementos) {
+      const texto = (el.textContent || '').toUpperCase().trim();
+      const valor = (el.value || '').toUpperCase().trim();
+      const onclick = (el.getAttribute('onclick') || '').toLowerCase();
+      
+      const esBotonFinalizar = 
+        texto.includes('FINALIZAR') || 
+        valor.includes('FINALIZAR') ||
+        onclick.includes('finalizar');
+      
+      if (esBotonFinalizar) {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        
+        if (rect.width > 0 && rect.height > 0 && 
+            style.display !== 'none' && style.visibility !== 'hidden') {
+          el.click();
+          return { clickeado: true, texto: texto.substring(0, 30) || valor.substring(0, 30) };
+        }
+      }
+    }
+    
+    return { clickeado: false };
+  });
+  
+  if (!clickeado || !clickeado.clickeado) {
+    log('warn', `SESION:${requestId}`, 'No se encontró botón FINALIZAR SESIONES');
+    return false;
+  }
+  
+  log('success', `SESION:${requestId}`, `✓ Clic en "${clickeado.texto}"`);
+  metricas.sesionesFinalizadas++;
+  
+  // Paso 3: Esperar a que se procese el clic
+  log('info', `SESION:${requestId}`, `Esperando ${TIMEOUT.esperaFinalizarSesion/1000}s...`);
+  await delay(TIMEOUT.esperaFinalizarSesion);
+  
+  // Paso 4: Esperar más y verificar que estamos en el login
+  await delay(TIMEOUT.esperaPostFinalizacion);
+  
+  const urlActual = await leerUrlSegura(page);
+  
+  if (urlActual && urlActual.includes('sso-validar')) {
+    log('success', `SESION:${requestId}`, 'Redirigido al login exitosamente');
+    return true;
+  }
+  
+  // Si no estamos en el login, intentar navegar manualmente
+  log('info', `SESION:${requestId}`, 'Navegando manualmente al login...');
+  try {
+    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+    await delay(3000);
+    return true;
+  } catch (error) {
+    log('error', `SESION:${requestId}`, `Error navegando: ${error.message}`);
+    return false;
+  }
+}
+
+// ============================================================
+// FUNCIONES DE SINOE - CREDENCIALES Y CAPTCHA
+// ============================================================
 
 async function llenarCredenciales(page, usuario, password) {
   log('info', 'CREDENCIALES', 'Buscando y llenando campos de login...');
@@ -581,30 +660,23 @@ async function llenarCredenciales(page, usuario, password) {
     const inputs = document.querySelectorAll('input');
     let campoUsuario = null;
     let campoPassword = null;
-    let usuarioEncontrado = false;
-    let passwordEncontrado = false;
     let usuarioLlenado = false;
     let passwordLlenado = false;
     const errores = [];
     
     for (const input of inputs) {
       const tipo = (input.type || '').toLowerCase();
-      const id = (input.id || '').toLowerCase();
-      const name = (input.name || '').toLowerCase();
       const placeholder = (input.placeholder || '').toLowerCase();
+      const id = (input.id || '').toLowerCase();
       
       // Campo de usuario: text que no sea captcha
       if (tipo === 'text' && !placeholder.includes('captcha') && !id.includes('captcha')) {
-        if (!campoUsuario) {
-          campoUsuario = input;
-          usuarioEncontrado = true;
-        }
+        if (!campoUsuario) campoUsuario = input;
       }
       
       // Campo de password
       if (tipo === 'password') {
         campoPassword = input;
-        passwordEncontrado = true;
       }
     }
     
@@ -617,7 +689,7 @@ async function llenarCredenciales(page, usuario, password) {
         campoUsuario.dispatchEvent(new Event('change', { bubbles: true }));
         usuarioLlenado = true;
       } catch (e) {
-        errores.push(`Error llenando usuario: ${e.message}`);
+        errores.push(`Error usuario: ${e.message}`);
       }
     }
     
@@ -630,54 +702,47 @@ async function llenarCredenciales(page, usuario, password) {
         campoPassword.dispatchEvent(new Event('change', { bubbles: true }));
         passwordLlenado = true;
       } catch (e) {
-        errores.push(`Error llenando password: ${e.message}`);
+        errores.push(`Error password: ${e.message}`);
       }
     }
     
-    return { usuarioEncontrado, passwordEncontrado, usuarioLlenado, passwordLlenado, errores };
+    return { usuarioLlenado, passwordLlenado, errores };
   }, usuario, password);
   
-  log('info', 'CREDENCIALES', 'Resultado del llenado:', resultado);
+  log('info', 'CREDENCIALES', 'Resultado:', resultado);
   
   if (!resultado.usuarioLlenado || !resultado.passwordLlenado) {
     throw new Error('No se pudieron llenar las credenciales: ' + (resultado.errores.join(', ') || 'campos no encontrados'));
   }
   
-  // Verificación
   await delay(500);
   
+  // Verificación
   const verificacion = await page.evaluate(() => {
     const inputs = document.querySelectorAll('input');
-    let usuarioTieneValor = false;
-    let passwordTieneValor = false;
+    let usuarioOk = false;
+    let passwordOk = false;
     let usuarioValor = '';
     
     for (const input of inputs) {
       if (input.type === 'text' && !input.placeholder?.toLowerCase().includes('captcha')) {
         if (input.value && input.value.length > 0) {
-          usuarioTieneValor = true;
+          usuarioOk = true;
           usuarioValor = input.value.substring(0, 3) + '***';
         }
       }
-      if (input.type === 'password') {
-        if (input.value && input.value.length > 0) {
-          passwordTieneValor = true;
-        }
+      if (input.type === 'password' && input.value && input.value.length > 0) {
+        passwordOk = true;
       }
     }
     
-    return { 
-      usuarioTieneValor, 
-      passwordTieneValor, 
-      usuarioValor,
-      passwordValor: passwordTieneValor ? '***' : '(vacío)'
-    };
+    return { usuarioOk, passwordOk, usuarioValor };
   });
   
-  log('info', 'CREDENCIALES', 'Verificación final:', verificacion);
+  log('info', 'CREDENCIALES', 'Verificación:', verificacion);
   
-  if (!verificacion.usuarioTieneValor || !verificacion.passwordTieneValor) {
-    throw new Error('Las credenciales no quedaron guardadas en los campos');
+  if (!verificacion.usuarioOk || !verificacion.passwordOk) {
+    throw new Error('Credenciales no quedaron en los campos');
   }
   
   log('success', 'CREDENCIALES', 'Campos llenados correctamente');
@@ -688,55 +753,41 @@ async function verificarCaptchaValido(page) {
   return await page.evaluate((config) => {
     const imagenes = document.querySelectorAll('img');
     
-    // Método 1: Buscar por patrones en src, id o alt
+    // Método 1: Por patrones en src, id o alt
     for (const img of imagenes) {
       const src = (img.src || '').toLowerCase();
       const id = (img.id || '').toLowerCase();
       const alt = (img.alt || '').toLowerCase();
       
-      const esCaptcha = src.includes('captcha') || 
-                        src.includes('jcaptcha') ||
-                        src.includes('codigo') ||
-                        id.includes('captcha') || 
-                        id.includes('imgcod') ||
-                        alt.includes('captcha');
+      const esCaptcha = src.includes('captcha') || src.includes('jcaptcha') ||
+                        id.includes('captcha') || alt.includes('captcha');
       
       if (esCaptcha) {
-        if (!img.complete) {
-          return { valido: false, razon: 'Imagen CAPTCHA aún cargando' };
-        }
-        
-        if (img.naturalWidth === 0 || img.naturalHeight === 0) {
+        if (!img.complete || img.naturalWidth === 0) {
           return { valido: false, razon: 'Imagen CAPTCHA no cargó' };
         }
         
         if (img.naturalWidth >= config.minWidth && img.naturalWidth <= config.maxWidth &&
             img.naturalHeight >= config.minHeight && img.naturalHeight <= config.maxHeight) {
-          return { 
-            valido: true, 
-            width: img.naturalWidth,
-            height: img.naturalHeight
-          };
+          return { valido: true, width: img.naturalWidth, height: img.naturalHeight };
         }
       }
     }
     
-    // Método 2: Buscar imagen cercana al input de CAPTCHA
-    const inputCaptcha = document.querySelector('input[id*="captcha"], input[placeholder*="Captcha"], input[placeholder*="captcha"], input[placeholder*="CAPTCHA"]');
+    // Método 2: Cerca del input de CAPTCHA
+    const inputCaptcha = document.querySelector('input[id*="captcha"], input[placeholder*="captcha"], input[placeholder*="CAPTCHA"]');
     
     if (inputCaptcha) {
       let container = inputCaptcha.parentElement;
       let nivel = 0;
       
       while (container && nivel < 5) {
-        const imagenCercana = container.querySelector('img');
+        const img = container.querySelector('img');
         
-        if (imagenCercana && imagenCercana.complete) {
-          const w = imagenCercana.naturalWidth;
-          const h = imagenCercana.naturalHeight;
-          
-          if (w >= config.minWidth && w <= config.maxWidth && h >= config.minHeight && h <= config.maxHeight && w > 0 && h > 0) {
-            return { valido: true, width: w, height: h };
+        if (img && img.complete && img.naturalWidth > 0) {
+          if (img.naturalWidth >= 40 && img.naturalWidth <= 200 &&
+              img.naturalHeight >= 20 && img.naturalHeight <= 80) {
+            return { valido: true, width: img.naturalWidth, height: img.naturalHeight };
           }
         }
         
@@ -745,11 +796,11 @@ async function verificarCaptchaValido(page) {
       }
     }
     
-    // Método 3: Buscar cualquier imagen pequeña en el formulario
+    // Método 3: Cualquier imagen pequeña en form
     const form = document.querySelector('form');
     if (form) {
       for (const img of form.querySelectorAll('img')) {
-        if (img.complete && img.naturalWidth >= 40 && img.naturalWidth <= 200 && 
+        if (img.complete && img.naturalWidth >= 40 && img.naturalWidth <= 200 &&
             img.naturalHeight >= 20 && img.naturalHeight <= 80) {
           return { valido: true, width: img.naturalWidth, height: img.naturalHeight };
         }
@@ -765,6 +816,7 @@ async function recargarCaptcha(page) {
   
   const recargado = await page.evaluate(() => {
     const elementos = document.querySelectorAll('a, button, img, span, i');
+    
     for (const el of elementos) {
       const onclick = el.getAttribute('onclick') || '';
       if (onclick.toLowerCase().includes('captcha') || onclick.toLowerCase().includes('refresh')) {
@@ -773,11 +825,11 @@ async function recargarCaptcha(page) {
       }
     }
     
-    const captchaImg = document.querySelector('img[src*="captcha"], img[id*="captcha"]');
+    const captchaImg = document.querySelector('img[src*="captcha"]');
     if (captchaImg) {
       const rect = captchaImg.getBoundingClientRect();
-      const elementosCerca = document.elementsFromPoint(rect.right + 25, rect.top + rect.height / 2);
-      for (const el of elementosCerca) {
+      const cercanos = document.elementsFromPoint(rect.right + 25, rect.top + rect.height / 2);
+      for (const el of cercanos) {
         if (el.tagName === 'A' || el.tagName === 'BUTTON' || el.onclick) {
           el.click();
           return { clicked: true };
@@ -801,7 +853,7 @@ async function recargarCaptcha(page) {
     return true;
   }
   
-  log('warn', 'CAPTCHA', 'No se encontró botón de recarga del CAPTCHA');
+  log('warn', 'CAPTCHA', 'No se encontró botón de recarga');
   return false;
 }
 
@@ -827,19 +879,15 @@ async function asegurarCaptchaValido(page, usuario, password) {
     
     const recargado = await recargarCaptcha(page);
     
-    if (recargado) {
-      await delay(CAPTCHA_CONFIG.esperaEntreCarga);
-    } else {
-      log('info', 'CAPTCHA', 'No se encontró botón de recarga. Refrescando página completa...');
+    if (!recargado) {
+      log('info', 'CAPTCHA', 'Refrescando página completa...');
       
       await page.reload({ waitUntil: 'networkidle2' });
       await delay(CAPTCHA_CONFIG.esperaDespuesRefresh);
       
-      log('info', 'CAPTCHA', 'Cerrando popups después del refresh...');
-      await cerrarPopups(page);
+      await cerrarPopups(page, 'CAPTCHA');
       await delay(500);
       
-      log('info', 'CAPTCHA', 'Re-llenando credenciales después del refresh...');
       await llenarCredenciales(page, usuario, password);
       await delay(500);
     }
@@ -848,14 +896,14 @@ async function asegurarCaptchaValido(page, usuario, password) {
   }
   
   metricas.captchasFallidos++;
-  throw new Error(`El CAPTCHA no cargó correctamente después de ${maxIntentos} intentos`);
+  throw new Error(`CAPTCHA no cargó después de ${maxIntentos} intentos`);
 }
 
 async function capturarFormularioLogin(page) {
   log('info', 'CAPTURA', 'Capturando formulario de login...');
   
   if (await hayPopupVisible(page)) {
-    await cerrarPopups(page);
+    await cerrarPopups(page, 'CAPTURA');
     await delay(500);
   }
   
@@ -890,19 +938,13 @@ async function capturarFormularioLogin(page) {
   });
   
   if (!formularioInfo.found) {
-    log('warn', 'CAPTURA', 'No se encontró formulario, capturando página completa');
-    const buffer = await page.screenshot({ encoding: 'base64' });
-    return buffer;
+    log('warn', 'CAPTURA', 'Formulario no encontrado, capturando página completa');
+    return await page.screenshot({ encoding: 'base64' });
   }
   
-  log('info', 'CAPTURA', `Formulario encontrado (${formularioInfo.selector})`, {
-    x: formularioInfo.x,
-    y: formularioInfo.y,
-    width: formularioInfo.width,
-    height: formularioInfo.height
-  });
+  log('info', 'CAPTURA', `Formulario encontrado (${formularioInfo.selector})`);
   
-  const buffer = await page.screenshot({
+  return await page.screenshot({
     encoding: 'base64',
     clip: {
       x: formularioInfo.x,
@@ -911,34 +953,23 @@ async function capturarFormularioLogin(page) {
       height: formularioInfo.height
     }
   });
-  
-  log('success', 'CAPTURA', 'Screenshot del formulario capturado', { bytes: buffer.length });
-  return buffer;
 }
 
-/**
- * v4.8.0: Navega a Casillas Electrónicas después del login
- * (la primera de las 3 opciones: SINOE, MPE, MPe ANC)
- */
+// ============================================================
+// FUNCIONES DE SINOE - POST-LOGIN
+// ============================================================
+
 async function navegarACasillas(page, requestId) {
   log('info', `CASILLAS:${requestId}`, 'Buscando enlace a Casillas Electrónicas...');
   
-  // Buscar el enlace/botón de Casillas
   const clickeado = await evaluarSeguro(page, () => {
-    // Buscar por texto
     const enlaces = document.querySelectorAll('a, button, div[onclick]');
     
     for (const el of enlaces) {
       const texto = (el.textContent || '').toLowerCase();
       const href = el.getAttribute('href') || '';
-      const onclick = el.getAttribute('onclick') || '';
       
-      // Buscar "Casillas Electrónicas" o "SINOE"
-      if (texto.includes('casillas') || 
-          texto.includes('sinoe') ||
-          href.includes('casilla') ||
-          onclick.includes('casilla')) {
-        // Verificar que sea visible
+      if (texto.includes('casillas') || texto.includes('sinoe') || href.includes('casilla')) {
         const rect = el.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {
           el.click();
@@ -947,17 +978,16 @@ async function navegarACasillas(page, requestId) {
       }
     }
     
-    // Buscar por imagen con alt
+    // Por imagen con alt
     const imagenes = document.querySelectorAll('img');
     for (const img of imagenes) {
       const alt = (img.alt || '').toLowerCase();
       const src = (img.src || '').toLowerCase();
       
-      if (alt.includes('casilla') || alt.includes('sinoe') || src.includes('sinoe')) {
-        // Clic en el padre si es clickeable
+      if (alt.includes('sinoe') || src.includes('sinoe')) {
         let padre = img.parentElement;
         for (let i = 0; i < 3 && padre; i++) {
-          if (padre.tagName === 'A' || padre.onclick || padre.getAttribute('onclick')) {
+          if (padre.tagName === 'A' || padre.onclick) {
             padre.click();
             return { clickeado: true, texto: 'imagen SINOE' };
           }
@@ -970,29 +1000,21 @@ async function navegarACasillas(page, requestId) {
   });
   
   if (!clickeado || !clickeado.clickeado) {
-    log('warn', `CASILLAS:${requestId}`, 'No se encontró enlace a Casillas - puede que ya estemos en la bandeja');
+    log('warn', `CASILLAS:${requestId}`, 'No se encontró enlace a Casillas');
     return false;
   }
   
   log('info', `CASILLAS:${requestId}`, `Clic en: "${clickeado.texto}"`);
-  
-  // Esperar a que cargue
-  log('info', `CASILLAS:${requestId}`, `Esperando ${TIMEOUT.esperaClicCasillas/1000}s a que cargue Casillas...`);
   await delay(TIMEOUT.esperaClicCasillas);
   
   return true;
 }
 
-/**
- * v4.8.0: Extrae las notificaciones de la tabla
- */
 async function extraerNotificaciones(page, requestId) {
-  log('info', `NOTIF:${requestId}`, 'Extrayendo notificaciones de la tabla...');
+  log('info', `NOTIF:${requestId}`, 'Extrayendo notificaciones...');
   
   const datos = await evaluarSeguro(page, () => {
     const notifs = [];
-    
-    // Buscar tabla de notificaciones
     const tablas = document.querySelectorAll('table');
     
     for (const tabla of tablas) {
@@ -1002,18 +1024,15 @@ async function extraerNotificaciones(page, requestId) {
       
       filas.forEach((fila, index) => {
         const celdas = fila.querySelectorAll('td');
-        if (celdas.length < 5) return; // Necesitamos al menos 5 columnas
+        if (celdas.length < 5) return;
         
-        // Extraer datos según la estructura de SINOE
         const notif = {
           numero: index + 1,
           nNotificacion: (celdas[1]?.textContent || '').trim(),
           expediente: (celdas[2]?.textContent || '').trim(),
           sumilla: (celdas[3]?.textContent || '').trim(),
           organoJurisdiccional: (celdas[4]?.textContent || '').trim(),
-          fecha: (celdas[5]?.textContent || '').trim(),
-          // Buscar botón de descarga (el botón rojo)
-          tieneBotonDescarga: !!fila.querySelector('button, a[onclick*="descarga"], .ui-button')
+          fecha: (celdas[5]?.textContent || '').trim()
         };
         
         if (notif.expediente || notif.nNotificacion) {
@@ -1021,7 +1040,6 @@ async function extraerNotificaciones(page, requestId) {
         }
       });
       
-      // Si encontramos notificaciones, no seguir buscando en otras tablas
       if (notifs.length > 0) break;
     }
     
@@ -1029,92 +1047,12 @@ async function extraerNotificaciones(page, requestId) {
   });
   
   if (!datos || datos.length === 0) {
-    log('warn', `NOTIF:${requestId}`, 'No se encontraron notificaciones en la tabla');
+    log('warn', `NOTIF:${requestId}`, 'No se encontraron notificaciones');
     return [];
   }
   
   log('success', `NOTIF:${requestId}`, `${datos.length} notificaciones encontradas`);
   return datos;
-}
-
-/**
- * v4.8.0: Hace clic en el botón rojo de descarga de una notificación
- */
-async function abrirModalDescarga(page, indiceNotificacion, requestId) {
-  log('info', `DESCARGA:${requestId}`, `Abriendo modal de descarga para notificación ${indiceNotificacion}...`);
-  
-  const abierto = await evaluarSeguro(page, (indice) => {
-    const tablas = document.querySelectorAll('table');
-    
-    for (const tabla of tablas) {
-      const filas = tabla.querySelectorAll('tbody tr');
-      
-      if (filas.length === 0) continue;
-      
-      // Encontrar la fila correcta
-      const fila = filas[indice - 1]; // indice es 1-based
-      if (!fila) continue;
-      
-      // Buscar el botón rojo de descarga (última columna generalmente)
-      const botones = fila.querySelectorAll('button, a.ui-button, .ui-button');
-      
-      for (const btn of botones) {
-        // El botón de descarga suele ser rojo o tener icono de descarga
-        const clase = (btn.className || '').toLowerCase();
-        const onclick = btn.getAttribute('onclick') || '';
-        
-        if (clase.includes('ui-button') || onclick.includes('ajax') || onclick.includes('descarga')) {
-          btn.click();
-          return { clickeado: true };
-        }
-      }
-    }
-    
-    return { clickeado: false };
-  }, indiceNotificacion);
-  
-  if (!abierto || !abierto.clickeado) {
-    log('warn', `DESCARGA:${requestId}`, 'No se encontró botón de descarga');
-    return false;
-  }
-  
-  // Esperar a que aparezca el modal
-  await delay(2000);
-  return true;
-}
-
-/**
- * v4.8.0: Hace clic en "Consolidado" para descargar todos los archivos
- */
-async function descargarConsolidado(page, requestId) {
-  log('info', `CONSOLIDADO:${requestId}`, 'Buscando botón de Consolidado...');
-  
-  const descargado = await evaluarSeguro(page, () => {
-    // Buscar botón "Consolidado" en el modal
-    const botones = document.querySelectorAll('button, a');
-    
-    for (const btn of botones) {
-      const texto = (btn.textContent || '').toLowerCase().trim();
-      
-      if (texto.includes('consolidado')) {
-        btn.click();
-        return { clickeado: true, texto };
-      }
-    }
-    
-    return { clickeado: false };
-  });
-  
-  if (!descargado || !descargado.clickeado) {
-    log('warn', `CONSOLIDADO:${requestId}`, 'No se encontró botón de Consolidado');
-    return false;
-  }
-  
-  log('success', `CONSOLIDADO:${requestId}`, 'Clic en Consolidado - descarga iniciada');
-  
-  // Esperar a que inicie la descarga
-  await delay(3000);
-  return true;
 }
 
 // ============================================================
@@ -1126,6 +1064,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
   let page = null;
   const inicioMs = Date.now();
   const requestId = crypto.randomUUID().substring(0, 8);
+  let timeoutCaptchaId = null; // v4.8.1: Para poder cancelar el timeout
   
   try {
     metricas.scrapersIniciados++;
@@ -1166,9 +1105,8 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     // ═══════════════════════════════════════════════════════════════════
     
     const contenidoInicial = await leerContenidoSeguro(page);
-    if (contenidoInicial && (contenidoInicial.includes('PARAMETROS DE SEGURIDAD NO VALIDOS') || 
-        contenidoInicial.includes('PARAMETROS NO VALIDOS'))) {
-      log('info', `SCRAPER:${requestId}`, 'Página de parámetros detectada, navegando al inicio...');
+    if (contenidoInicial && contenidoInicial.includes('PARAMETROS')) {
+      log('info', `SCRAPER:${requestId}`, 'Página de parámetros detectada...');
       
       await page.evaluate(() => {
         const botones = document.querySelectorAll('button, a');
@@ -1176,10 +1114,9 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
           const texto = (btn.textContent || '').toUpperCase();
           if (texto.includes('INICIO') || texto.includes('IR')) {
             btn.click();
-            return true;
+            return;
           }
         }
-        return false;
       });
       
       await delay(3000);
@@ -1189,8 +1126,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     // PASO 4: Cerrar popups
     // ═══════════════════════════════════════════════════════════════════
     
-    log('info', `SCRAPER:${requestId}`, 'Verificando y cerrando popups...');
-    await cerrarPopups(page);
+    await cerrarPopups(page, `SCRAPER:${requestId}`);
     await delay(1000);
     
     // ═══════════════════════════════════════════════════════════════════
@@ -1212,19 +1148,19 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     // PASO 7: Asegurar CAPTCHA válido
     // ═══════════════════════════════════════════════════════════════════
     
-    log('info', `SCRAPER:${requestId}`, 'Verificando que el CAPTCHA sea válido...');
+    log('info', `SCRAPER:${requestId}`, 'Verificando CAPTCHA...');
     await asegurarCaptchaValido(page, sinoeUsuario, sinoePassword);
     
     // ═══════════════════════════════════════════════════════════════════
     // PASO 8: Capturar formulario
     // ═══════════════════════════════════════════════════════════════════
     
-    log('info', `SCRAPER:${requestId}`, 'Capturando formulario de login...');
+    log('info', `SCRAPER:${requestId}`, 'Capturando formulario...');
     
     const screenshotBase64 = await capturarFormularioLogin(page);
     
     if (!screenshotBase64 || screenshotBase64.length < 1000) {
-      throw new Error('No se pudo capturar el formulario de login');
+      throw new Error('No se pudo capturar el formulario');
     }
     
     log('success', `SCRAPER:${requestId}`, 'Formulario capturado', { bytes: screenshotBase64.length });
@@ -1242,23 +1178,14 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     }
     
     // ═══════════════════════════════════════════════════════════════════
-    // PASO 10: Esperar respuesta del abogado
+    // PASO 10: Esperar respuesta del abogado (v4.8.1: con timeout cancelable)
     // ═══════════════════════════════════════════════════════════════════
     
     log('info', `SCRAPER:${requestId}`, 'Esperando respuesta del abogado (máx 5 min)...');
     
     const captchaTexto = await new Promise((resolve, reject) => {
-      sesionesActivas.set(whatsappNumero, {
-        page, 
-        browser, 
-        resolve, 
-        reject,
-        timestamp: Date.now(),
-        nombreAbogado, 
-        requestId
-      });
-      
-      setTimeout(() => {
+      // v4.8.1: Guardar el timeout ID para poder cancelarlo después
+      timeoutCaptchaId = setTimeout(() => {
         if (sesionesActivas.has(whatsappNumero)) {
           const s = sesionesActivas.get(whatsappNumero);
           if (s.requestId === requestId) {
@@ -1267,21 +1194,40 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
           }
         }
       }, TIMEOUT.captcha);
+      
+      sesionesActivas.set(whatsappNumero, {
+        page, 
+        browser, 
+        resolve, 
+        reject,
+        timeoutId: timeoutCaptchaId, // v4.8.1: Guardar referencia al timeout
+        timestamp: Date.now(),
+        nombreAbogado, 
+        requestId
+      });
     });
+    
+    // v4.8.1: Cancelar el timeout porque ya se resolvió
+    if (timeoutCaptchaId) {
+      clearTimeout(timeoutCaptchaId);
+      timeoutCaptchaId = null;
+    }
     
     metricas.captchasRecibidos++;
     log('success', `SCRAPER:${requestId}`, `CAPTCHA recibido: ${captchaTexto}`);
     
     // ═══════════════════════════════════════════════════════════════════
-    // PASO 11: Escribir CAPTCHA
+    // PASO 11: Verificar que el campo CAPTCHA aún existe (v4.8.1)
     // ═══════════════════════════════════════════════════════════════════
     
-    log('info', `SCRAPER:${requestId}`, 'Escribiendo CAPTCHA en el formulario...');
+    log('info', `SCRAPER:${requestId}`, 'Escribiendo CAPTCHA...');
     
     const campoCaptcha = await page.$('input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[placeholder*="captcha"], input[id*="captcha"]');
     
     if (!campoCaptcha) {
-      throw new Error('Campo de CAPTCHA no encontrado');
+      // v4.8.1: Mensaje descriptivo cuando la página expiró
+      await enviarWhatsAppTexto(whatsappNumero, '⚠️ La página de SINOE expiró mientras esperaba. Por favor intente de nuevo.');
+      throw new Error('Campo CAPTCHA no encontrado - la página pudo haber expirado');
     }
     
     await campoCaptcha.click({ clickCount: 3 });
@@ -1291,91 +1237,173 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     await campoCaptcha.type(captchaTexto.toUpperCase(), { delay: 50 });
     
     // ═══════════════════════════════════════════════════════════════════
-    // PASO 12: HACER CLIC EN LOGIN (v4.8.0 - ESTRATEGIA NUEVA)
+    // PASO 12: Hacer clic en LOGIN
     // ═══════════════════════════════════════════════════════════════════
     
     const urlAntes = await leerUrlSegura(page) || SINOE_URLS.login;
     
-    log('info', `SCRAPER:${requestId}`, 'Haciendo clic en botón de login...', { urlAntes: urlAntes.substring(0, 50) });
+    log('info', `SCRAPER:${requestId}`, 'Haciendo clic en botón de login...');
     
-    // Buscar y hacer clic en el botón de submit
     const btnIngresar = await page.$('button[type="submit"], input[type="submit"], .ui-button[type="submit"]');
     
     if (btnIngresar) {
       await btnIngresar.click();
-      log('info', `SCRAPER:${requestId}`, 'Clic en botón de submit realizado');
     } else {
-      log('warn', `SCRAPER:${requestId}`, 'Botón no encontrado, usando Enter');
       await page.keyboard.press('Enter');
     }
     
     // ═══════════════════════════════════════════════════════════════════
-    // PASO 13: ESPERAR Y LEER PÁGINA (v4.8.0 - SOLUCIÓN AL ERROR)
+    // PASO 13: Esperar y leer página
     // ═══════════════════════════════════════════════════════════════════
     
-    log('info', `SCRAPER:${requestId}`, 'Esperando resultado del login (estrategia v4.8.0)...');
+    log('info', `SCRAPER:${requestId}`, 'Esperando resultado...');
     
     const resultadoPagina = await esperarYLeerPagina(page, requestId, urlAntes);
     
     if (!resultadoPagina.exito) {
-      // Intentar tomar screenshot de error
-      try {
-        const errorScreenshot = await page.screenshot({ encoding: 'base64' });
-        log('info', `SCRAPER:${requestId}`, 'Screenshot de error capturado');
-      } catch (e) {
-        log('warn', `SCRAPER:${requestId}`, 'No se pudo capturar screenshot de error');
-      }
-      
-      await enviarWhatsAppTexto(whatsappNumero, 
-        '❌ Error: No se pudo acceder a SINOE después del login. Por favor intente de nuevo.'
-      );
+      await enviarWhatsAppTexto(whatsappNumero, '❌ Error: No se pudo acceder a SINOE. Intente de nuevo.');
       throw new Error('No se pudo leer la página después del login');
     }
     
     // ═══════════════════════════════════════════════════════════════════
-    // PASO 14: ANALIZAR RESULTADO DEL LOGIN
+    // PASO 14: Analizar resultado y manejar casos especiales
     // ═══════════════════════════════════════════════════════════════════
     
-    const resultado = analizarResultadoLogin(resultadoPagina.url, resultadoPagina.contenido, urlAntes);
+    // Cerrar popups primero (COMUNICADO, etc)
+    await cerrarPopups(page, `SCRAPER:${requestId}`);
+    await delay(500);
     
-    log('info', `SCRAPER:${requestId}`, 'Resultado del análisis:', resultado);
+    // Volver a leer después de cerrar popups
+    const urlActual = await leerUrlSegura(page) || resultadoPagina.url;
+    const contenidoActual = await leerContenidoSeguro(page) || resultadoPagina.contenido;
+    
+    const resultado = analizarResultadoLogin(urlActual, contenidoActual, urlAntes);
+    
+    log('info', `SCRAPER:${requestId}`, 'Resultado:', resultado);
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // v4.8.1: MANEJO AUTOMÁTICO DE SESIÓN ACTIVA
+    // ═══════════════════════════════════════════════════════════════════
+    
+    if (resultado.tipo === 'sesion_activa') {
+      log('warn', `SCRAPER:${requestId}`, '🔄 Sesión activa detectada - finalizando automáticamente...');
+      
+      await enviarWhatsAppTexto(whatsappNumero, '⏳ Sesión activa detectada. Finalizando automáticamente...');
+      
+      const sesionFinalizada = await manejarSesionActiva(page, requestId);
+      
+      if (!sesionFinalizada) {
+        await enviarWhatsAppTexto(whatsappNumero, '❌ No se pudo finalizar la sesión anterior. Ciérrela manualmente en SINOE e intente de nuevo.');
+        throw new Error('No se pudo finalizar la sesión activa automáticamente');
+      }
+      
+      // ═══════════════════════════════════════════════════════════════════
+      // REINTENTAR LOGIN COMPLETO DESPUÉS DE FINALIZAR SESIÓN
+      // ═══════════════════════════════════════════════════════════════════
+      
+      log('info', `SCRAPER:${requestId}`, '🔄 Reintentando login después de finalizar sesión...');
+      
+      await cerrarPopups(page, `SCRAPER:${requestId}`);
+      await delay(1000);
+      
+      // Esperar campos de login
+      await page.waitForSelector('input[type="text"], input[type="password"]', { timeout: TIMEOUT.elemento });
+      
+      // Llenar credenciales de nuevo
+      await llenarCredenciales(page, sinoeUsuario, sinoePassword);
+      await delay(1000);
+      
+      // Verificar CAPTCHA de nuevo
+      await asegurarCaptchaValido(page, sinoeUsuario, sinoePassword);
+      
+      // Capturar y enviar nuevo CAPTCHA
+      const nuevoScreenshot = await capturarFormularioLogin(page);
+      await enviarWhatsAppImagen(whatsappNumero, nuevoScreenshot, 
+        `📩 ${nombreAbogado}, la sesión anterior fue cerrada.\n\nEscriba el NUEVO código CAPTCHA:\n\n⏱️ Tiene 5 minutos.`
+      );
+      
+      // Esperar nuevo CAPTCHA con timeout cancelable
+      let nuevoTimeoutId = null;
+      const nuevoCaptcha = await new Promise((resolve, reject) => {
+        nuevoTimeoutId = setTimeout(() => {
+          if (sesionesActivas.has(whatsappNumero)) {
+            sesionesActivas.delete(whatsappNumero);
+            reject(new Error('Timeout: CAPTCHA no resuelto'));
+          }
+        }, TIMEOUT.captcha);
+        
+        sesionesActivas.set(whatsappNumero, {
+          page, browser, resolve, reject, 
+          timeoutId: nuevoTimeoutId,
+          timestamp: Date.now(), 
+          nombreAbogado, requestId
+        });
+      });
+      
+      // Cancelar timeout
+      if (nuevoTimeoutId) clearTimeout(nuevoTimeoutId);
+      
+      // Escribir nuevo CAPTCHA
+      const nuevoCampoCaptcha = await page.$('input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[id*="captcha"]');
+      if (nuevoCampoCaptcha) {
+        await nuevoCampoCaptcha.click({ clickCount: 3 });
+        await page.keyboard.press('Backspace');
+        await nuevoCampoCaptcha.type(nuevoCaptcha.toUpperCase(), { delay: 50 });
+      }
+      
+      // Hacer login de nuevo
+      const nuevoUrlAntes = await leerUrlSegura(page);
+      const nuevoBtn = await page.$('button[type="submit"], input[type="submit"]');
+      if (nuevoBtn) await nuevoBtn.click();
+      else await page.keyboard.press('Enter');
+      
+      // Esperar resultado del segundo intento
+      const nuevoResultado = await esperarYLeerPagina(page, requestId, nuevoUrlAntes);
+      
+      if (!nuevoResultado.exito) {
+        await enviarWhatsAppTexto(whatsappNumero, '❌ Error en el segundo intento. Por favor intente de nuevo.');
+        throw new Error('Fallo en segundo intento después de finalizar sesión');
+      }
+      
+      // Verificar que ahora sí sea login exitoso
+      const nuevoAnalisis = analizarResultadoLogin(nuevoResultado.url, nuevoResultado.contenido, nuevoUrlAntes);
+      
+      if (nuevoAnalisis.tipo !== 'login_exitoso' && nuevoAnalisis.tipo !== 'indeterminado') {
+        await enviarWhatsAppTexto(whatsappNumero, `❌ ${nuevoAnalisis.mensaje}. Intente de nuevo.`);
+        throw new Error(`Error en segundo intento: ${nuevoAnalisis.mensaje}`);
+      }
+      
+      log('success', `SCRAPER:${requestId}`, 'Login exitoso en segundo intento');
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // MANEJAR OTROS TIPOS DE RESULTADO
+    // ═══════════════════════════════════════════════════════════════════
     
     if (resultado.tipo === 'captcha_incorrecto') {
-      await enviarWhatsAppTexto(whatsappNumero, '❌ CAPTCHA incorrecto. Por favor intente de nuevo.');
+      await enviarWhatsAppTexto(whatsappNumero, '❌ CAPTCHA incorrecto. Intente de nuevo.');
       throw new Error('CAPTCHA incorrecto');
     }
     
-    if (resultado.tipo === 'sesion_activa') {
-      await enviarWhatsAppTexto(whatsappNumero, '❌ Ya hay una sesión activa en SINOE. Ciérrela e intente de nuevo.');
-      throw new Error('Sesión activa existente');
-    }
-    
     if (resultado.tipo === 'error_desconocido') {
-      await enviarWhatsAppTexto(whatsappNumero, '❌ Error al iniciar sesión. Por favor intente de nuevo.');
+      await enviarWhatsAppTexto(whatsappNumero, '❌ Error al iniciar sesión. Intente de nuevo.');
       throw new Error('Error de login desconocido');
     }
     
     log('success', `SCRAPER:${requestId}`, 'Login exitoso en SINOE');
     
     // ═══════════════════════════════════════════════════════════════════
-    // PASO 15: NAVEGAR A CASILLAS ELECTRÓNICAS
+    // PASO 15: Navegar a Casillas Electrónicas
     // ═══════════════════════════════════════════════════════════════════
     
-    log('info', `SCRAPER:${requestId}`, 'Navegando a Casillas Electrónicas...');
-    
-    // Esperar un poco para que la página de bienvenida cargue completamente
     await delay(3000);
-    
     await navegarACasillas(page, requestId);
-    
-    // Esperar a que cargue la tabla
     await delay(TIMEOUT.esperaCargaTabla);
     
     // ═══════════════════════════════════════════════════════════════════
-    // PASO 16: EXTRAER NOTIFICACIONES
+    // PASO 16: Extraer notificaciones
     // ═══════════════════════════════════════════════════════════════════
     
-    log('info', `SCRAPER:${requestId}`, 'Extrayendo notificaciones...');
     const notificaciones = await extraerNotificaciones(page, requestId);
     
     // ═══════════════════════════════════════════════════════════════════
@@ -1385,45 +1413,41 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     const duracionMs = Date.now() - inicioMs;
     metricas.scrapersExitosos++;
     
+    // Actualizar promedio
+    const totalExitosos = metricas.scrapersExitosos;
+    metricas.tiempoPromedioMs = Math.round(
+      ((metricas.tiempoPromedioMs * (totalExitosos - 1)) + duracionMs) / totalExitosos
+    );
+    
     await enviarWhatsAppTexto(whatsappNumero,
       `✅ ${nombreAbogado}, acceso exitoso a SINOE.\n\n📋 ${notificaciones.length} notificación(es) encontrada(s).\n\n⏱️ Tiempo: ${Math.round(duracionMs/1000)}s`
     );
     
-    log('success', `SCRAPER:${requestId}`, 'Scraper completado exitosamente', {
-      duracionMs,
-      notificaciones: notificaciones.length
-    });
+    log('success', `SCRAPER:${requestId}`, 'Scraper completado', { duracionMs, notificaciones: notificaciones.length });
     
-    return {
-      success: true,
-      notificaciones,
-      duracionMs,
-      requestId
-    };
+    return { success: true, notificaciones, duracionMs, requestId };
     
   } catch (error) {
     metricas.scrapersFallidos++;
     log('error', `SCRAPER:${requestId}`, error.message);
     
+    // v4.8.1: Limpiar timeout si existe
+    if (timeoutCaptchaId) {
+      clearTimeout(timeoutCaptchaId);
+    }
+    
     // Limpiar sesión
     if (sesionesActivas.has(whatsappNumero)) {
+      const s = sesionesActivas.get(whatsappNumero);
+      if (s.timeoutId) clearTimeout(s.timeoutId);
       sesionesActivas.delete(whatsappNumero);
     }
     
-    return {
-      success: false,
-      error: error.message,
-      requestId
-    };
+    return { success: false, error: error.message, requestId };
     
   } finally {
-    // Cerrar browser
     if (browser) {
-      try {
-        await browser.close();
-      } catch (e) {
-        // Ignorar errores al cerrar
-      }
+      try { await browser.close(); } catch (e) {}
     }
   }
 }
@@ -1470,7 +1494,7 @@ app.use((req, res, next) => {
   const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
   
   if (apiKey !== API_KEY) {
-    log('warn', 'AUTH', `Intento de acceso no autorizado a ${req.path}`);
+    log('warn', 'AUTH', `Acceso no autorizado a ${req.path}`);
     return res.status(401).json({ success: false, error: 'No autorizado' });
   }
   
@@ -1484,13 +1508,15 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.8.0',
+    version: '4.8.1',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
       scrapersExitosos: metricas.scrapersExitosos,
       scrapersFallidos: metricas.scrapersFallidos,
-      erroresFrameIgnorados: metricas.erroresFrameIgnorados
+      sesionesFinalizadas: metricas.sesionesFinalizadas,
+      erroresFrameIgnorados: metricas.erroresFrameIgnorados,
+      tiempoPromedioMs: metricas.tiempoPromedioMs
     }
   });
 });
@@ -1517,35 +1543,25 @@ app.post('/scraper', async (req, res) => {
   
   const { sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado } = req.body;
   
-  // Validaciones
   if (!sinoeUsuario || !sinoePassword) {
-    return res.status(400).json({ success: false, error: 'Credenciales de SINOE requeridas' });
+    return res.status(400).json({ success: false, error: 'Credenciales requeridas' });
   }
   
-  const validacionNumero = validarNumeroWhatsApp(whatsappNumero);
-  if (!validacionNumero.valido) {
-    return res.status(400).json({ success: false, error: validacionNumero.error });
+  const validacion = validarNumeroWhatsApp(whatsappNumero);
+  if (!validacion.valido) {
+    return res.status(400).json({ success: false, error: validacion.error });
   }
   
-  // Verificar si ya hay una sesión activa para este número
-  if (sesionesActivas.has(validacionNumero.numero)) {
-    return res.status(409).json({ 
-      success: false, 
-      error: 'Ya hay un proceso activo para este número. Espere a que termine.' 
-    });
+  if (sesionesActivas.has(validacion.numero)) {
+    return res.status(409).json({ success: false, error: 'Ya hay un proceso activo para este número' });
   }
   
-  // Responder inmediatamente y ejecutar en background
-  res.json({ 
-    success: true, 
-    message: 'Proceso iniciado. Recibirá el CAPTCHA por WhatsApp.' 
-  });
+  res.json({ success: true, message: 'Proceso iniciado' });
   
-  // Ejecutar scraper en background
   ejecutarScraper({
     sinoeUsuario,
     sinoePassword,
-    whatsappNumero: validacionNumero.numero,
+    whatsappNumero: validacion.numero,
     nombreAbogado: nombreAbogado || 'Dr(a).'
   }).catch(error => {
     log('error', 'SCRAPER', `Error no manejado: ${error.message}`);
@@ -1553,22 +1569,16 @@ app.post('/scraper', async (req, res) => {
 });
 
 app.post('/webhook/whatsapp', (req, res) => {
-  res.sendStatus(200); // Responder inmediatamente
+  res.sendStatus(200);
   
   try {
     const data = req.body;
-    
-    // Normalizar evento
     const evento = (data.event || '').toLowerCase().replace(/_/g, '.');
     
     log('info', 'WEBHOOK', 'Evento recibido', { event: evento, instance: data.instance });
     
-    // Solo procesar mensajes entrantes
-    if (!evento.includes('messages.upsert') && !evento.includes('message')) {
-      return;
-    }
+    if (!evento.includes('messages.upsert') && !evento.includes('message')) return;
     
-    // Extraer mensaje
     let mensaje = null;
     let remitente = null;
     
@@ -1587,14 +1597,11 @@ app.post('/webhook/whatsapp', (req, res) => {
     }
     
     if (!mensaje || !remitente) return;
-    
-    // Ignorar mensajes propios
     if (data.data?.key?.fromMe === true) return;
     
-    // Extraer número
     const numero = remitente.replace('@s.whatsapp.net', '').replace(/\D/g, '');
     
-    // Detectar duplicados (Evolution API a veces envía el mismo mensaje 2 veces)
+    // Detectar duplicados
     const webhookKey = `${numero}-${mensaje}-${Date.now().toString().substring(0, 10)}`;
     if (webhooksRecientes.has(webhookKey)) {
       log('debug', 'WEBHOOK', 'Mensaje duplicado ignorado');
@@ -1602,55 +1609,46 @@ app.post('/webhook/whatsapp', (req, res) => {
     }
     webhooksRecientes.set(webhookKey, Date.now());
     
-    log('info', 'WEBHOOK', 'Mensaje', { 
-      numero: enmascarar(numero), 
-      texto: mensaje.substring(0, 20),
-      tieneSession: sesionesActivas.has(numero)
-    });
+    log('info', 'WEBHOOK', 'Mensaje', { numero: enmascarar(numero), texto: mensaje.substring(0, 20) });
     
-    // Verificar si hay sesión activa esperando CAPTCHA
-    if (!sesionesActivas.has(numero)) return;
+    if (!sesionesActivas.has(numero)) {
+      log('debug', 'WEBHOOK', 'No hay sesión activa para este número');
+      return;
+    }
     
     const sesion = sesionesActivas.get(numero);
-    
-    // Validar CAPTCHA
     const validacion = validarCaptcha(mensaje);
     
     if (!validacion.valido) {
-      log('warn', 'WEBHOOK', `CAPTCHA inválido: ${validacion.error}`);
       enviarWhatsAppTexto(numero, `⚠️ ${validacion.error}\n${validacion.sugerencia || ''}`);
       return;
     }
     
-    // Resolver la Promise con el CAPTCHA
-    log('success', 'WEBHOOK', 'CAPTCHA procesado', { 
-      numero: enmascarar(numero), 
-      captcha: validacion.captcha 
-    });
+    log('success', 'WEBHOOK', 'CAPTCHA procesado', { numero: enmascarar(numero), captcha: validacion.captcha });
+    
+    // v4.8.1: Limpiar timeout antes de resolver
+    if (sesion.timeoutId) {
+      clearTimeout(sesion.timeoutId);
+    }
     
     sesionesActivas.delete(numero);
     sesion.resolve(validacion.captcha);
     
   } catch (error) {
-    log('error', 'WEBHOOK', `Error procesando webhook: ${error.message}`);
+    log('error', 'WEBHOOK', `Error: ${error.message}`);
   }
 });
 
-// Endpoints de prueba
+// v4.8.1: Endpoints de debug restaurados
 app.post('/test-whatsapp', async (req, res) => {
   const { numero, mensaje } = req.body;
   
-  if (!numero) {
-    return res.status(400).json({ success: false, error: 'Número requerido' });
-  }
+  if (!numero) return res.status(400).json({ success: false, error: 'Número requerido' });
   
   const validacion = validarNumeroWhatsApp(numero);
-  if (!validacion.valido) {
-    return res.status(400).json({ success: false, error: validacion.error });
-  }
+  if (!validacion.valido) return res.status(400).json({ success: false, error: validacion.error });
   
-  const enviado = await enviarWhatsAppTexto(validacion.numero, mensaje || '🧪 Test de conexión desde LEXA Scraper v4.8.0');
-  
+  const enviado = await enviarWhatsAppTexto(validacion.numero, mensaje || '🧪 Test LEXA Scraper v4.8.1');
   res.json({ success: enviado });
 });
 
@@ -1661,22 +1659,101 @@ app.post('/test-conexion', async (req, res) => {
       ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
       : CONFIG.browserless.url;
     
-    browser = await puppeteer.connect({ 
-      browserWSEndpoint: ws,
-      defaultViewport: DEFAULT_VIEWPORT
+    browser = await puppeteer.connect({ browserWSEndpoint: ws, defaultViewport: DEFAULT_VIEWPORT });
+    const page = await browser.newPage();
+    await page.goto('https://www.google.com', { waitUntil: 'networkidle2', timeout: 30000 });
+    const titulo = await page.title();
+    
+    res.json({ success: true, browserless: 'ok', titulo });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+// v4.8.1: Test de credenciales restaurado
+app.post('/test-credenciales', async (req, res) => {
+  const { usuario, password } = req.body;
+  let browser = null;
+  
+  try {
+    const ws = CONFIG.browserless.token 
+      ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
+      : CONFIG.browserless.url;
+    
+    browser = await puppeteer.connect({ browserWSEndpoint: ws, defaultViewport: DEFAULT_VIEWPORT });
+    const page = await browser.newPage();
+    
+    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+    await delay(3000);
+    await cerrarPopups(page, 'TEST');
+    await delay(1000);
+    
+    await llenarCredenciales(page, usuario || 'TEST_USER', password || 'TEST_PASS');
+    
+    const verificacion = await page.evaluate(() => {
+      const inputs = document.querySelectorAll('input');
+      let user = '', pass = '';
+      
+      for (const input of inputs) {
+        if (input.type === 'text' && !input.placeholder?.toLowerCase().includes('captcha')) {
+          user = input.value;
+        }
+        if (input.type === 'password') {
+          pass = input.value ? '***' : '(vacío)';
+        }
+      }
+      
+      return { usuario: user, password: pass };
     });
     
-    const page = await browser.newPage();
-    await page.goto('https://www.google.com', { waitUntil: 'networkidle2' });
-    
-    const titulo = await page.title();
+    const captcha = await verificarCaptchaValido(page);
     
     res.json({ 
       success: true, 
-      browserless: 'conectado',
-      titulo
+      credenciales: {
+        usuario: verificacion.usuario.substring(0, 5) + '...',
+        password: verificacion.password
+      },
+      captcha 
     });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+// v4.8.1: Test de CAPTCHA restaurado
+app.post('/test-captcha', async (req, res) => {
+  let browser = null;
+  
+  try {
+    const ws = CONFIG.browserless.token 
+      ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
+      : CONFIG.browserless.url;
     
+    browser = await puppeteer.connect({ browserWSEndpoint: ws, defaultViewport: DEFAULT_VIEWPORT });
+    const page = await browser.newPage();
+    
+    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+    await delay(3000);
+    await cerrarPopups(page, 'TEST-CAPTCHA');
+    await delay(1000);
+    
+    const estadoCaptcha = await verificarCaptchaValido(page);
+    
+    let screenshot = null;
+    if (estadoCaptcha.valido) {
+      screenshot = await capturarFormularioLogin(page);
+    }
+    
+    res.json({ 
+      success: true, 
+      captcha: estadoCaptcha,
+      screenshotSize: screenshot ? screenshot.length : 0
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   } finally {
@@ -1689,23 +1766,20 @@ app.post('/test-conexion', async (req, res) => {
 // ============================================================
 
 async function shutdown(signal) {
-  log('warn', 'SHUTDOWN', `Señal ${signal} recibida, cerrando...`);
+  log('warn', 'SHUTDOWN', `Señal ${signal} recibida`);
   
-  if (limpiezaInterval) {
-    clearInterval(limpiezaInterval);
-    log('info', 'SHUTDOWN', 'Intervalo de limpieza detenido');
-  }
+  if (limpiezaInterval) clearInterval(limpiezaInterval);
   
+  // Limpiar todas las sesiones
   for (const [numero, sesion] of sesionesActivas.entries()) {
-    if (sesion.reject) {
-      sesion.reject(new Error('Servidor reiniciándose'));
-    }
-    if (sesion.browser) {
-      await sesion.browser.close().catch(() => {});
-    }
+    if (sesion.timeoutId) clearTimeout(sesion.timeoutId);
+    if (sesion.reject) sesion.reject(new Error('Servidor reiniciándose'));
+    if (sesion.browser) await sesion.browser.close().catch(() => {});
   }
   
-  log('info', 'SHUTDOWN', 'Todas las sesiones cerradas');
+  sesionesActivas.clear();
+  
+  log('info', 'SHUTDOWN', 'Sesiones cerradas');
   process.exit(0);
 }
 
@@ -1721,33 +1795,41 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║            LEXA SCRAPER SERVICE v4.8.0 - SOLUCIÓN DEFINITIVA                  ║
+║               LEXA SCRAPER SERVICE v4.8.1 - AUDITADO Y CORREGIDO              ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  Puerto: ${PORT}                                                                   ║
-║  Auth: ${process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️'}                                                    ║
-║  WhatsApp: ${CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌'}                                                ║
-║  Browserless: ${CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️'}                                              ║
+║  Puerto: ${String(PORT).padEnd(70)}║
+║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
+║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
+║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  SOLUCIÓN v4.8.0 AL ERROR "Requesting main frame too early!":                 ║
+║  CORRECCIONES v4.8.1 (Auditoría Profesional):                                 ║
 ║                                                                               ║
-║    ✓ NO usar page.mainFrame() en listeners (causaba el error)                 ║
-║    ✓ NO usar waitForNavigation (no confiable con JSF)                         ║
-║    ✓ Esperar 15 segundos FIJOS sin tocar page después del clic               ║
-║    ✓ Luego leer con try-catch individual (URL y contenido)                   ║
-║    ✓ Si falla, esperar 3s más y reintentar (máx 30 intentos = 90s)           ║
-║    ✓ Detectar duplicados de webhook (Evolution API bug)                       ║
+║    ✓ BUG #1: Sesión activa → Ahora clic automático en FINALIZAR SESIONES      ║
+║    ✓ BUG #2: Memory leak → setTimeout cancelado con clearTimeout              ║
+║    ✓ BUG #3: Limpieza → Cancela timeoutId en limpieza automática              ║
+║    ✓ BUG #4: Detección → Ahora detecta "finalizar sesion" en contenido        ║
+║    ✓ BUG #5: UX → Mensaje descriptivo cuando página expira                    ║
+║    ✓ BUG #6: Debug → Restaurados /test-credenciales y /test-captcha           ║
 ║                                                                               ║
-║  FLUJO POST-LOGIN:                                                            ║
-║    1. Detectar página de bienvenida (SINOE, MPE, MPe ANC)                    ║
-║    2. Clic en "Casillas Electrónicas"                                        ║
-║    3. Extraer tabla de notificaciones                                         ║
-║    4. Abrir modal con botón rojo → Clic en "Consolidado"                     ║
+║  FLUJO SESIÓN ACTIVA (NUEVO):                                                 ║
+║    1. Detecta página "sso-session-activa"                                     ║
+║    2. Cierra popup COMUNICADO                                                 ║
+║    3. Clic automático en FINALIZAR SESIONES                                   ║
+║    4. Espera redirección al login                                             ║
+║    5. Reintenta proceso completo                                              ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                                   ║
-║    GET  /health             POST /webhook/whatsapp                            ║
-║    POST /scraper            GET  /sesiones                                    ║
-║    GET  /metricas           POST /test-whatsapp                               ║
-║    POST /test-conexion                                                        ║
+║    GET  /health              POST /webhook/whatsapp                           ║
+║    POST /scraper             GET  /sesiones                                   ║
+║    GET  /metricas            POST /test-whatsapp                              ║
+║    POST /test-conexion       POST /test-credenciales                          ║
+║    POST /test-captcha                                                         ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
   `);
+  
+  // Log API key si fue auto-generada
+  if (!process.env.API_KEY) {
+    console.log(`\n⚠️  API_KEY auto-generada: ${API_KEY}`);
+    console.log('   Configura API_KEY en variables de entorno para producción.\n');
+  }
 });
