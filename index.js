@@ -1,37 +1,21 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.6.4 - Sistema Screenshot CAPTCHA
+ * LEXA SCRAPER SERVICE v4.6.5 - Fix Frame Navigation
  * ============================================================
  * Versión: AAA (Producción - Auditada)
  * Fecha: Febrero 2026
  * 
- * CAMBIOS v4.6.4:
- * - FIX CRÍTICO: Webhook ahora acepta MESSAGES_UPSERT y messages.upsert
- * - FIX: Logging mejorado para debug de webhook
- * - FIX: Validación de mensaje más robusta
+ * CAMBIOS v4.6.5:
+ * - FIX CRÍTICO: "Requesting main frame too early!" después del CAPTCHA
+ * - NUEVO: esperarFrameListo() - espera robusta antes de acceder al contenido
+ * - NUEVO: Retry loop con backoff exponencial para acceso al frame
+ * - MEJORA: Manejo de navegación post-login más robusto
+ * - MEJORA: Logging detallado del estado del frame
  *
- * - FIX CRÍTICO: verificarCaptchaValido() ahora busca CAPTCHA por múltiples métodos
- * - FIX: Detecta CAPTCHA por: patrón en src/id, cercanía al input, dimensiones en form
- * - FIX: Soporta jcaptcha, imgCod, código y otros patrones de SINOE
- * - MEJORA: Debug info cuando no encuentra CAPTCHA (lista imágenes disponibles)
- * 
- * CAMBIOS v4.6.1 (CORRECCIONES DE AUDITORÍA):
- * - FIX: Eliminado código muerto (SELECTORES no usado)
- * - FIX: Agregado null check a viewport en captura fallback
- * - FIX: setInterval ahora se limpia en shutdown (memory leak fix)
- * - FIX: Validación de variables de entorno críticas al inicio
- * - FIX: Error en re-llenar credenciales ahora se propaga correctamente
- * - MEJORA: Logging de configuración al iniciar
- * 
- * CAMBIOS v4.6.0 (mantenidos):
- * - FIX CRÍTICO: No envía imagen si el CAPTCHA no cargó correctamente
- * - NUEVO: Función asegurarCaptchaValido() - validación estricta antes de enviar
- * - NUEVO: Recarga CAPTCHA automáticamente hasta que sea válido (max 5 intentos)
- * - NUEVO: Re-llena credenciales después de refresh de página
- * 
- * CAMBIOS v4.5.0 (mantenidos):
- * - FIX CRÍTICO: llenarCampo() ahora funciona con PrimeFaces
- * - FIX: Dispara eventos input/change/blur para PrimeFaces
+ * CAMBIOS v4.6.4 (mantenidos):
+ * - FIX: Webhook ahora acepta MESSAGES_UPSERT y messages.upsert
+ * - FIX: verificarCaptchaValido() busca CAPTCHA por múltiples métodos
+ * - FIX: Eliminado código muerto, null check viewport, cleanup interval
  * ============================================================
  */
 
@@ -63,7 +47,8 @@ const TIMEOUT = {
   api: 30000,             // 30 segundos para llamadas a APIs externas
   popup: 10000,           // 10 segundos para cerrar popups
   elemento: 15000,        // 15 segundos para esperar elementos en el DOM
-  imagenCarga: 5000       // 5 segundos para que cargue una imagen
+  imagenCarga: 5000,      // 5 segundos para que cargue una imagen
+  frameListo: 15000       // v4.6.5: 15 segundos para que el frame esté listo
 };
 
 // Configuración externa
@@ -81,35 +66,39 @@ const CONFIG = {
 
 // Rate limiting
 const RATE_LIMIT = {
-  windowMs: 60000,        // Ventana de 1 minuto
-  maxRequestsPerIp: 30    // Máximo 30 requests por IP por minuto
+  windowMs: 60000,
+  maxRequestsPerIp: 30
 };
 
-// Configuración de validación de CAPTCHA v4.6.0
+// Configuración de validación de CAPTCHA
 const CAPTCHA_CONFIG = {
-  maxIntentos: 5,           // Máximo intentos de recarga antes de fallar
-  minWidth: 80,             // Ancho mínimo en px para considerar CAPTCHA válido
-  maxWidth: 200,            // Ancho máximo en px
-  minHeight: 25,            // Alto mínimo en px
-  maxHeight: 60,            // Alto máximo en px
-  esperaEntreCarga: 2000,   // ms a esperar después de recargar CAPTCHA
-  esperaDespuesRefresh: 3000 // ms a esperar después de refresh de página
+  maxIntentos: 5,
+  minWidth: 80,
+  maxWidth: 200,
+  minHeight: 25,
+  maxHeight: 60,
+  esperaEntreCarga: 2000,
+  esperaDespuesRefresh: 3000
 };
 
-// Viewport por defecto (fallback si page.viewport() retorna null)
+// v4.6.5: Configuración de espera de frame
+const FRAME_CONFIG = {
+  maxIntentos: 5,           // Máximo intentos para acceder al frame
+  delayBase: 1000,          // Delay base entre intentos (ms)
+  delayMax: 5000,           // Delay máximo entre intentos (ms)
+  esperaPostNavegacion: 3000 // Espera después de detectar navegación completa
+};
+
+// Viewport por defecto
 const DEFAULT_VIEWPORT = {
   width: 1366,
   height: 768
 };
 
 // ============================================================
-// VALIDACIÓN DE CONFIGURACIÓN CRÍTICA (v4.6.4)
+// VALIDACIÓN DE CONFIGURACIÓN
 // ============================================================
 
-/**
- * Valida que las variables de entorno críticas estén configuradas
- * Loggea warnings si faltan, pero no detiene la ejecución
- */
 function validarConfiguracion() {
   const warnings = [];
   
@@ -140,6 +129,7 @@ const metricas = {
   captchasRecibidos: 0,
   captchasRecargados: 0,
   captchasFallidos: 0,
+  frameRetries: 0,          // v4.6.5: Contador de reintentos de frame
   tiempoPromedioMs: 0,
   ultimoReinicio: new Date().toISOString()
 };
@@ -150,18 +140,12 @@ const metricas = {
 
 const sesionesActivas = new Map();
 const rateLimitCache = new Map();
-
-// v4.6.4: Guardar referencia del intervalo para limpieza en shutdown
 let limpiezaInterval = null;
 
-/**
- * Inicia el intervalo de limpieza de sesiones expiradas
- */
 function iniciarLimpiezaAutomatica() {
   limpiezaInterval = setInterval(() => {
     const ahora = Date.now();
     
-    // Limpiar sesiones expiradas (más de 6 minutos)
     for (const [numero, sesion] of sesionesActivas.entries()) {
       if (ahora - sesion.timestamp > 360000) {
         log('warn', 'LIMPIEZA', `Sesión expirada: ${enmascarar(numero)}`);
@@ -171,7 +155,6 @@ function iniciarLimpiezaAutomatica() {
       }
     }
     
-    // Limpiar rate limit cache
     for (const [ip, data] of rateLimitCache.entries()) {
       if (ahora - data.timestamp > RATE_LIMIT.windowMs) {
         rateLimitCache.delete(ip);
@@ -179,7 +162,6 @@ function iniciarLimpiezaAutomatica() {
     }
   }, 60000);
   
-  // Permitir que el proceso termine aunque el interval esté activo
   limpiezaInterval.unref();
 }
 
@@ -187,32 +169,15 @@ function iniciarLimpiezaAutomatica() {
 // UTILIDADES
 // ============================================================
 
-/**
- * Enmascara texto sensible para logging seguro
- * @param {string} texto - Texto a enmascarar
- * @returns {string} Texto enmascarado (ej: "519***50")
- */
 function enmascarar(texto) {
   if (!texto || texto.length < 6) return '***';
   return texto.substring(0, 3) + '***' + texto.substring(texto.length - 2);
 }
 
-/**
- * Espera asíncrona
- * @param {number} ms - Milisegundos a esperar
- * @returns {Promise<void>}
- */
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * Logging estructurado con soporte para producción (JSON) y desarrollo (legible)
- * @param {string} nivel - Nivel del log: debug, info, warn, error, success
- * @param {string} contexto - Contexto/módulo del log
- * @param {string} mensaje - Mensaje del log
- * @param {object} datos - Datos adicionales opcionales
- */
 function log(nivel, contexto, mensaje, datos = {}) {
   const timestamp = new Date().toISOString();
   const iconos = { 
@@ -239,11 +204,6 @@ function log(nivel, contexto, mensaje, datos = {}) {
   }
 }
 
-/**
- * Valida formato de número de WhatsApp peruano
- * @param {string} numero - Número a validar
- * @returns {{valido: boolean, error?: string, numero?: string}}
- */
 function validarNumeroWhatsApp(numero) {
   if (!numero || typeof numero !== 'string') {
     return { valido: false, error: 'Número no proporcionado' };
@@ -261,11 +221,6 @@ function validarNumeroWhatsApp(numero) {
   return { valido: true, numero: limpio };
 }
 
-/**
- * Valida texto de CAPTCHA
- * @param {string} texto - Texto del CAPTCHA
- * @returns {{valido: boolean, error?: string, sugerencia?: string, captcha?: string}}
- */
 function validarCaptcha(texto) {
   if (!texto || typeof texto !== 'string') {
     return { valido: false, error: 'Texto vacío' };
@@ -285,12 +240,142 @@ function validarCaptcha(texto) {
 }
 
 // ============================================================
+// v4.6.5: FUNCIONES DE MANEJO DE FRAME
+// ============================================================
+
+/**
+ * Verifica si el frame principal está listo para ser accedido
+ * @param {Page} page - Instancia de Puppeteer Page
+ * @returns {Promise<{listo: boolean, razon: string}>}
+ */
+async function verificarFrameListo(page) {
+  try {
+    // Verificar que la página no esté en medio de una navegación
+    const estado = await page.evaluate(() => {
+      return {
+        readyState: document.readyState,
+        hasBody: !!document.body,
+        bodyHasContent: document.body ? document.body.innerHTML.length > 0 : false,
+        url: window.location.href
+      };
+    });
+    
+    if (estado.readyState === 'complete' && estado.hasBody && estado.bodyHasContent) {
+      return { listo: true, razon: 'OK', estado };
+    }
+    
+    return { 
+      listo: false, 
+      razon: `readyState=${estado.readyState}, hasBody=${estado.hasBody}`,
+      estado 
+    };
+  } catch (error) {
+    // Si hay error al evaluar, el frame no está listo
+    return { 
+      listo: false, 
+      razon: `Error: ${error.message}` 
+    };
+  }
+}
+
+/**
+ * v4.6.5 - Espera de forma robusta a que el frame esté listo después de navegación
+ * Usa retry con backoff exponencial
+ * @param {Page} page - Instancia de Puppeteer Page
+ * @param {string} contexto - Contexto para logging
+ * @returns {Promise<boolean>} true si el frame está listo
+ */
+async function esperarFrameListo(page, contexto = 'FRAME') {
+  const maxIntentos = FRAME_CONFIG.maxIntentos;
+  const delayBase = FRAME_CONFIG.delayBase;
+  const delayMax = FRAME_CONFIG.delayMax;
+  
+  log('info', contexto, 'Esperando a que el frame esté listo...');
+  
+  for (let intento = 1; intento <= maxIntentos; intento++) {
+    const verificacion = await verificarFrameListo(page);
+    
+    if (verificacion.listo) {
+      log('success', contexto, `Frame listo en intento ${intento}/${maxIntentos}`, {
+        url: verificacion.estado?.url?.substring(0, 50)
+      });
+      return true;
+    }
+    
+    log('info', contexto, `Intento ${intento}/${maxIntentos}: ${verificacion.razon}`);
+    metricas.frameRetries++;
+    
+    if (intento < maxIntentos) {
+      // Backoff exponencial: 1s, 2s, 3s, 4s, 5s (máximo)
+      const esperaMs = Math.min(delayBase * intento, delayMax);
+      log('debug', contexto, `Esperando ${esperaMs}ms antes del siguiente intento...`);
+      await delay(esperaMs);
+    }
+  }
+  
+  log('error', contexto, `Frame no listo después de ${maxIntentos} intentos`);
+  return false;
+}
+
+/**
+ * v4.6.5 - Obtiene el contenido de la página de forma segura
+ * Reintenta si hay error de frame
+ * @param {Page} page - Instancia de Puppeteer Page
+ * @param {string} requestId - ID de la request para logging
+ * @returns {Promise<{url: string, contenido: string}>}
+ */
+async function obtenerContenidoSeguro(page, requestId) {
+  const maxIntentos = 3;
+  
+  for (let intento = 1; intento <= maxIntentos; intento++) {
+    try {
+      // Primero verificar que el frame esté listo
+      const frameListo = await esperarFrameListo(page, `SCRAPER:${requestId}`);
+      
+      if (!frameListo) {
+        throw new Error('Frame no disponible después de espera');
+      }
+      
+      // Ahora sí acceder al contenido
+      const url = page.url();
+      const contenido = await page.content();
+      
+      log('success', `SCRAPER:${requestId}`, 'Contenido obtenido correctamente', {
+        urlLength: url.length,
+        contenidoLength: contenido.length
+      });
+      
+      return { url, contenido };
+      
+    } catch (error) {
+      log('warn', `SCRAPER:${requestId}`, `Error obteniendo contenido (intento ${intento}/${maxIntentos}): ${error.message}`);
+      
+      if (intento < maxIntentos) {
+        // Esperar antes de reintentar
+        await delay(2000 * intento);
+        
+        // Intentar esperar navegación si hay una en progreso
+        try {
+          await page.waitForNavigation({ 
+            waitUntil: 'domcontentloaded', 
+            timeout: 5000 
+          });
+        } catch (navError) {
+          // Ignorar error de timeout - puede que no haya navegación
+        }
+      }
+    }
+  }
+  
+  throw new Error('No se pudo obtener el contenido de la página después de múltiples intentos');
+}
+
+// ============================================================
 // MIDDLEWARES
 // ============================================================
 
 app.use(express.json({ limit: '1mb' }));
 
-// Rate limiting por IP
 app.use((req, res, next) => {
   if (req.path === '/health') return next();
   
@@ -322,7 +407,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Autenticación por API Key
 app.use((req, res, next) => {
   const publicPaths = ['/health', '/webhook/whatsapp'];
   if (publicPaths.includes(req.path)) return next();
@@ -341,7 +425,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Contador de requests
 app.use((req, res, next) => {
   metricas.requestsTotal++;
   next();
@@ -351,15 +434,7 @@ app.use((req, res, next) => {
 // FUNCIONES WHATSAPP
 // ============================================================
 
-/**
- * Envía mensaje de texto por WhatsApp con reintentos
- * @param {string} numero - Número de WhatsApp (formato: 51XXXXXXXXX)
- * @param {string} mensaje - Texto del mensaje
- * @param {number} intentos - Número máximo de intentos
- * @returns {Promise<boolean>} true si se envió correctamente
- */
 async function enviarWhatsAppTexto(numero, mensaje, intentos = 3) {
-  // v4.6.4: Validar que apiKey esté configurada
   if (!CONFIG.evolution.apiKey) {
     log('error', 'WHATSAPP', 'EVOLUTION_API_KEY no configurada');
     return false;
@@ -409,16 +484,7 @@ async function enviarWhatsAppTexto(numero, mensaje, intentos = 3) {
   return false;
 }
 
-/**
- * Envía imagen por WhatsApp con reintentos
- * @param {string} numero - Número de WhatsApp
- * @param {string} base64Image - Imagen en base64
- * @param {string} caption - Texto que acompaña la imagen
- * @param {number} intentos - Número máximo de intentos
- * @returns {Promise<boolean>} true si se envió correctamente
- */
 async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) {
-  // v4.6.4: Validar que apiKey esté configurada
   if (!CONFIG.evolution.apiKey) {
     log('error', 'WHATSAPP', 'EVOLUTION_API_KEY no configurada');
     return false;
@@ -483,11 +549,6 @@ async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) 
 // FUNCIONES DE SCRAPING
 // ============================================================
 
-/**
- * Verifica si hay un popup/modal visible en la página
- * @param {Page} page - Instancia de Puppeteer Page
- * @returns {Promise<boolean>} true si hay popup visible
- */
 async function hayPopupVisible(page) {
   return await page.evaluate(() => {
     const overlays = document.querySelectorAll('.ui-widget-overlay, .ui-dialog-mask, .modal-backdrop');
@@ -524,11 +585,6 @@ async function hayPopupVisible(page) {
   });
 }
 
-/**
- * Cierra popups de SINOE
- * @param {Page} page - Instancia de Puppeteer Page
- * @returns {Promise<boolean>} true si se cerró exitosamente o no había popup
- */
 async function cerrarPopups(page) {
   log('info', 'POPUP', 'Verificando si hay popups para cerrar...');
   
@@ -611,13 +667,6 @@ async function cerrarPopups(page) {
   return false;
 }
 
-/**
- * Llena credenciales de forma robusta para PrimeFaces
- * @param {Page} page - Instancia de Puppeteer Page
- * @param {string} usuario - Usuario de SINOE
- * @param {string} password - Contraseña de SINOE
- * @returns {Promise<boolean>} true si se llenaron correctamente
- */
 async function llenarCredenciales(page, usuario, password) {
   log('info', 'CREDENCIALES', 'Buscando y llenando campos de login...');
   
@@ -760,15 +809,8 @@ async function llenarCredenciales(page, usuario, password) {
   return true;
 }
 
-/**
- * Verifica si la imagen del CAPTCHA cargó correctamente
- * SINOE usa múltiples formatos: jcaptcha, imgCaptcha, o imagen cerca del input captcha
- * @param {Page} page - Instancia de Puppeteer Page
- * @returns {Promise<{valido: boolean, razon: string, width?: number, height?: number, metodo?: string}>}
- */
 async function verificarCaptchaValido(page) {
   return await page.evaluate((config) => {
-    // MÉTODO 1: Buscar por src o id que contenga "captcha" o "jcaptcha"
     const imagenes = document.querySelectorAll('img');
     
     for (const img of imagenes) {
@@ -776,7 +818,6 @@ async function verificarCaptchaValido(page) {
       const id = (img.id || '').toLowerCase();
       const alt = (img.alt || '').toLowerCase();
       
-      // Buscar múltiples patrones de CAPTCHA
       const esCaptcha = src.includes('captcha') || 
                         src.includes('jcaptcha') ||
                         src.includes('codigo') ||
@@ -795,7 +836,6 @@ async function verificarCaptchaValido(page) {
           return { valido: false, razon: 'Imagen CAPTCHA no cargó (dimensiones 0)', metodo: 'patron-directo' };
         }
         
-        // Validación de dimensiones (CAPTCHA típico: 80-200px ancho, 25-80px alto)
         if (img.naturalWidth >= 50 && img.naturalWidth <= 300 &&
             img.naturalHeight >= 20 && img.naturalHeight <= 100) {
           return { 
@@ -810,11 +850,9 @@ async function verificarCaptchaValido(page) {
       }
     }
     
-    // MÉTODO 2: Buscar imagen cerca del input de CAPTCHA
     const inputCaptcha = document.querySelector('input[id*="captcha"], input[placeholder*="Captcha"], input[placeholder*="captcha"]');
     
     if (inputCaptcha) {
-      // Buscar en el mismo contenedor padre
       let container = inputCaptcha.parentElement;
       let nivel = 0;
       
@@ -825,7 +863,6 @@ async function verificarCaptchaValido(page) {
           const w = imagenCercana.naturalWidth;
           const h = imagenCercana.naturalHeight;
           
-          // Verificar dimensiones típicas de CAPTCHA
           if (w >= 50 && w <= 300 && h >= 20 && h <= 100) {
             if (w === 0 || h === 0) {
               return { valido: false, razon: 'Imagen cercana al input no cargó', metodo: 'cercania-input' };
@@ -845,7 +882,6 @@ async function verificarCaptchaValido(page) {
         nivel++;
       }
       
-      // Buscar imagen hermana del input
       const padre = inputCaptcha.parentElement;
       if (padre) {
         const hermanos = padre.parentElement?.querySelectorAll('img');
@@ -866,8 +902,6 @@ async function verificarCaptchaValido(page) {
       }
     }
     
-    // MÉTODO 3: Buscar cualquier imagen con dimensiones típicas de CAPTCHA
-    // que esté dentro del formulario de login
     const form = document.querySelector('form[id*="Login"], form[id*="login"], form');
     if (form) {
       const imagenesForm = form.querySelectorAll('img');
@@ -876,7 +910,6 @@ async function verificarCaptchaValido(page) {
           const w = img.naturalWidth;
           const h = img.naturalHeight;
           
-          // Dimensiones típicas de CAPTCHA: no muy grande, no muy pequeño
           if (w >= 80 && w <= 200 && h >= 25 && h <= 60) {
             return { 
               valido: true, 
@@ -890,7 +923,6 @@ async function verificarCaptchaValido(page) {
       }
     }
     
-    // DEBUG: Listar todas las imágenes encontradas para diagnóstico
     const debugInfo = [];
     for (const img of imagenes) {
       if (img.naturalWidth > 0) {
@@ -905,16 +937,11 @@ async function verificarCaptchaValido(page) {
     return { 
       valido: false, 
       razon: 'No se encontró imagen de CAPTCHA válida',
-      imagenes: debugInfo.slice(0, 5) // Primeras 5 imágenes para debug
+      imagenes: debugInfo.slice(0, 5)
     };
   }, CAPTCHA_CONFIG);
 }
 
-/**
- * Recarga el CAPTCHA haciendo clic en el botón de refresh
- * @param {Page} page - Instancia de Puppeteer Page
- * @returns {Promise<boolean>} true si se encontró y clickeó el botón de recarga
- */
 async function recargarCaptcha(page) {
   log('info', 'CAPTCHA', 'Intentando recargar CAPTCHA...');
   
@@ -961,16 +988,6 @@ async function recargarCaptcha(page) {
   return false;
 }
 
-/**
- * v4.6.0 - Asegura que el CAPTCHA sea válido antes de continuar
- * v4.6.4 - Corregido: error en re-llenar credenciales ahora se propaga
- * 
- * @param {Page} page - Instancia de Puppeteer Page
- * @param {string} usuario - Usuario de SINOE
- * @param {string} password - Contraseña de SINOE
- * @returns {Promise<boolean>} true si el CAPTCHA es válido
- * @throws {Error} si no se pudo cargar el CAPTCHA después de todos los intentos
- */
 async function asegurarCaptchaValido(page, usuario, password) {
   const maxIntentos = CAPTCHA_CONFIG.maxIntentos;
   
@@ -1008,7 +1025,6 @@ async function asegurarCaptchaValido(page, usuario, password) {
       await cerrarPopups(page);
       await delay(500);
       
-      // v4.6.4: Error en re-llenar credenciales ahora se PROPAGA (no se silencia)
       log('info', 'CAPTCHA', 'Re-llenando credenciales después del refresh...');
       await llenarCredenciales(page, usuario, password);
       await delay(500);
@@ -1025,12 +1041,6 @@ async function asegurarCaptchaValido(page, usuario, password) {
   throw new Error(errorMsg);
 }
 
-/**
- * Captura screenshot del formulario completo de login
- * v4.6.4 - Agregado null check para viewport
- * @param {Page} page - Instancia de Puppeteer Page
- * @returns {Promise<string>} Screenshot en base64
- */
 async function capturarFormularioLogin(page) {
   log('info', 'CAPTURA', 'Capturando formulario de login...');
   
@@ -1127,10 +1137,8 @@ async function capturarFormularioLogin(page) {
     }
   }
   
-  // FALLBACK: capturar área central de la pantalla
   log('warn', 'CAPTURA', 'Usando fallback - área central de pantalla');
   
-  // v4.6.4: Null check para viewport - usar DEFAULT_VIEWPORT si es null
   const viewport = page.viewport() || DEFAULT_VIEWPORT;
   const centerX = (viewport.width - 500) / 2;
   const centerY = 100;
@@ -1156,11 +1164,6 @@ async function capturarFormularioLogin(page) {
   return await page.screenshot({ encoding: 'base64' });
 }
 
-/**
- * Busca el link correcto a Casillas/SINOE después del login
- * @param {Page} page - Instancia de Puppeteer Page
- * @returns {Promise<string|null>} URL del link o null si no se encuentra
- */
 async function buscarLinkCasillas(page) {
   return await page.evaluate(() => {
     const links = document.querySelectorAll('a');
@@ -1181,11 +1184,6 @@ async function buscarLinkCasillas(page) {
   });
 }
 
-/**
- * Extrae las notificaciones de la tabla de SINOE
- * @param {Page} page - Instancia de Puppeteer Page
- * @returns {Promise<Array>} Array de notificaciones
- */
 async function extraerNotificaciones(page) {
   try {
     await page.waitForSelector('table, .ui-datatable', { timeout: TIMEOUT.navegacion });
@@ -1224,15 +1222,6 @@ async function extraerNotificaciones(page) {
 // FUNCIÓN PRINCIPAL DEL SCRAPER
 // ============================================================
 
-/**
- * Ejecuta el flujo completo del scraper
- * @param {Object} params - Parámetros del scraper
- * @param {string} params.sinoeUsuario - Usuario de SINOE
- * @param {string} params.sinoePassword - Contraseña de SINOE
- * @param {string} params.whatsappNumero - Número de WhatsApp del abogado
- * @param {string} params.nombreAbogado - Nombre del abogado para personalizar mensajes
- * @returns {Promise<Object>} Resultado del scraping
- */
 async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado }) {
   let browser = null;
   let page = null;
@@ -1387,6 +1376,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     await campoCaptcha.type(captchaTexto.toUpperCase(), { delay: 50 });
     
     const urlAntes = page.url();
+    log('info', `SCRAPER:${requestId}`, 'Haciendo clic en botón de login...', { urlAntes });
     
     const btnIngresar = await page.$('button[type="submit"], input[type="submit"], .ui-button');
     if (btnIngresar) {
@@ -1395,44 +1385,83 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       await page.keyboard.press('Enter');
     }
     
-    // Esperar a que cambie la URL o timeout
+    // ============================================================
+    // v4.6.5: MANEJO ROBUSTO DE NAVEGACIÓN POST-LOGIN
+    // ============================================================
+    
+    log('info', `SCRAPER:${requestId}`, 'Esperando navegación post-login...');
+    
+    // Estrategia 1: Esperar cambio de URL con timeout generoso
+    let navegacionDetectada = false;
     try {
       await page.waitForFunction(
         url => window.location.href !== url,
-        { timeout: TIMEOUT.navegacion },
+        { timeout: 30000 },
         urlAntes
       );
+      navegacionDetectada = true;
+      log('info', `SCRAPER:${requestId}`, 'Cambio de URL detectado');
     } catch (e) {
-      log('warn', `SCRAPER:${requestId}`, 'Timeout esperando cambio de URL, continuando...');
-    }
-
-    // Esperar navegación con manejo de error robusto
-    try {
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
-    } catch (e) {
-      log('warn', `SCRAPER:${requestId}`, 'Timeout en waitForNavigation, continuando...');
-    }
-
-    // CRÍTICO: Esperar a que el frame esté listo
-    await delay(3000);
-
-    // PASO 13: Verificar resultado del login
-    log('info', `SCRAPER:${requestId}`, 'Verificando resultado del login...');
-
-    // Esperar a que la página tenga contenido antes de acceder
-    let urlActual, contenidoActual;
-    try {
-      await page.waitForSelector('body', { timeout: 10000 });
-      urlActual = page.url();
-      contenidoActual = await page.content();
-    } catch (frameError) {
-      log('error', `SCRAPER:${requestId}`, `Error accediendo al frame: ${frameError.message}`);
-      // Intentar reconectar o esperar más
-      await delay(2000);
-      urlActual = page.url();
-      contenidoActual = await page.content();
+      log('warn', `SCRAPER:${requestId}`, 'No se detectó cambio de URL, continuando...');
     }
     
+    // Estrategia 2: Si se detectó navegación, esperar a que termine
+    if (navegacionDetectada) {
+      try {
+        await page.waitForNavigation({ 
+          waitUntil: 'networkidle2', 
+          timeout: 20000 
+        });
+        log('info', `SCRAPER:${requestId}`, 'Navegación networkidle2 completada');
+      } catch (e) {
+        log('warn', `SCRAPER:${requestId}`, 'Timeout en networkidle2, esperando load...');
+        
+        // Fallback: esperar al menos domcontentloaded
+        try {
+          await page.waitForNavigation({ 
+            waitUntil: 'domcontentloaded', 
+            timeout: 10000 
+          });
+        } catch (e2) {
+          log('warn', `SCRAPER:${requestId}`, 'Timeout en domcontentloaded también');
+        }
+      }
+    }
+    
+    // v4.6.5: CRÍTICO - Esperar tiempo fijo después de cualquier navegación
+    log('info', `SCRAPER:${requestId}`, `Esperando ${FRAME_CONFIG.esperaPostNavegacion}ms para estabilización del frame...`);
+    await delay(FRAME_CONFIG.esperaPostNavegacion);
+    
+    // ============================================================
+    // PASO 13: VERIFICAR RESULTADO DEL LOGIN (v4.6.5 mejorado)
+    // ============================================================
+    
+    log('info', `SCRAPER:${requestId}`, 'Verificando resultado del login...');
+    
+    // v4.6.5: Usar la nueva función de obtención segura de contenido
+    let urlActual, contenidoActual;
+    
+    try {
+      const resultado = await obtenerContenidoSeguro(page, requestId);
+      urlActual = resultado.url;
+      contenidoActual = resultado.contenido;
+    } catch (frameError) {
+      log('error', `SCRAPER:${requestId}`, `Error crítico accediendo al frame: ${frameError.message}`);
+      
+      // Último intento: capturar screenshot para diagnóstico y fallar
+      try {
+        const screenshotError = await page.screenshot({ encoding: 'base64' });
+        log('info', `SCRAPER:${requestId}`, 'Screenshot de error capturado', { 
+          bytes: screenshotError.length 
+        });
+      } catch (ssError) {
+        log('warn', `SCRAPER:${requestId}`, 'No se pudo capturar screenshot de error');
+      }
+      
+      throw new Error(`No se pudo acceder al contenido de la página: ${frameError.message}`);
+    }
+    
+    // Verificar si el CAPTCHA fue incorrecto
     if (contenidoActual.toLowerCase().includes('captcha') && 
         (contenidoActual.toLowerCase().includes('incorrecto') || 
          contenidoActual.toLowerCase().includes('inválido') ||
@@ -1441,18 +1470,24 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       throw new Error('CAPTCHA incorrecto');
     }
     
+    // Verificar si hay sesión activa
     if (urlActual.includes(SINOE_URLS.sessionActiva) || contenidoActual.includes('sesión activa')) {
       await enviarWhatsAppTexto(whatsappNumero, `⚠️ Hay una sesión activa en SINOE. Por favor ciérrela e intente de nuevo.`);
       throw new Error('Sesión activa detectada');
     }
     
-    log('success', `SCRAPER:${requestId}`, 'Login exitoso en SINOE');
+    log('success', `SCRAPER:${requestId}`, 'Login exitoso en SINOE', {
+      urlActual: urlActual.substring(0, 60)
+    });
     
     // PASO 14: Navegar a Casillas
     const hrefCasillas = await buscarLinkCasillas(page);
     if (hrefCasillas) {
       log('info', `SCRAPER:${requestId}`, 'Navegando a Casillas...');
       await page.goto(hrefCasillas, { waitUntil: 'networkidle2' });
+      
+      // v4.6.5: Esperar a que el nuevo frame esté listo
+      await esperarFrameListo(page, `SCRAPER:${requestId}`);
     }
     
     // PASO 15: Extraer notificaciones
@@ -1520,7 +1555,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'lexa-scraper-service',
-    version: '4.6.1',
+    version: '4.6.5',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
@@ -1528,6 +1563,7 @@ app.get('/health', (req, res) => {
       fallidos: metricas.scrapersFallidos,
       captchasRecargados: metricas.captchasRecargados,
       captchasFallidos: metricas.captchasFallidos,
+      frameRetries: metricas.frameRetries,
       tasaExito: metricas.scrapersIniciados > 0 
         ? Math.round((metricas.scrapersExitosos / metricas.scrapersIniciados) * 100) + '%' 
         : 'N/A'
@@ -1575,13 +1611,11 @@ app.post('/webhook/whatsapp', async (req, res) => {
   try {
     const data = req.body;
     
-    // Log para debug
     log('info', 'WEBHOOK', 'Evento recibido', { 
       event: data.event,
       instance: data.instance
     });
     
-    // Evolution API envía "MESSAGES_UPSERT" o "messages.upsert" 
     const eventLower = (data.event || '').toLowerCase().replace('_', '.');
     if (eventLower !== 'messages.upsert') {
       return res.status(200).json({ ignored: true, reason: `event: ${data.event}` });
@@ -1597,7 +1631,6 @@ app.post('/webhook/whatsapp', async (req, res) => {
       .replace('@s.whatsapp.net', '')
       .replace('@c.us', '');
     
-    // Extraer texto - múltiples formatos
     let texto = message.message?.conversation || 
                 message.message?.extendedTextMessage?.text || 
                 message.message?.imageMessage?.caption || '';
@@ -1672,7 +1705,7 @@ app.post('/test-whatsapp', async (req, res) => {
   
   const resultado = await enviarWhatsAppTexto(
     validacion.numero, 
-    req.body.mensaje || '🧪 Test LEXA Scraper v4.6.4'
+    req.body.mensaje || '🧪 Test LEXA Scraper v4.6.5'
   );
   res.json({ success: resultado });
 });
@@ -1789,7 +1822,6 @@ app.post('/test-captcha', async (req, res) => {
     await cerrarPopups(page);
     await delay(1000);
     
-    // Diagnóstico completo del DOM
     const diagnostico = await page.evaluate(() => {
       const resultado = {
         imagenes: [],
@@ -1799,7 +1831,6 @@ app.post('/test-captcha', async (req, res) => {
         divsCercaCaptcha: []
       };
       
-      // Buscar todas las imágenes
       document.querySelectorAll('img').forEach(img => {
         resultado.imagenes.push({
           src: (img.src || '').substring(0, 80),
@@ -1809,7 +1840,6 @@ app.post('/test-captcha', async (req, res) => {
         });
       });
       
-      // Buscar canvas
       document.querySelectorAll('canvas').forEach(canvas => {
         resultado.canvas.push({
           id: canvas.id || 'sin-id',
@@ -1818,7 +1848,6 @@ app.post('/test-captcha', async (req, res) => {
         });
       });
       
-      // Buscar elementos con background-image
       const todosElementos = document.querySelectorAll('div, span, td, a');
       todosElementos.forEach(el => {
         const bg = window.getComputedStyle(el).backgroundImage;
@@ -1832,7 +1861,6 @@ app.post('/test-captcha', async (req, res) => {
         }
       });
       
-      // Buscar input de captcha
       const inputCaptcha = document.querySelector('input[id*="captcha"], input[placeholder*="Captcha"]');
       if (inputCaptcha) {
         resultado.inputCaptcha = {
@@ -1841,7 +1869,6 @@ app.post('/test-captcha', async (req, res) => {
           padreHTML: inputCaptcha.parentElement?.innerHTML?.substring(0, 500)
         };
         
-        // Buscar elementos hermanos y cercanos
         let padre = inputCaptcha.parentElement;
         for (let i = 0; i < 3 && padre; i++) {
           const hijos = padre.children;
@@ -1863,8 +1890,6 @@ app.post('/test-captcha', async (req, res) => {
     });
     
     const estado = await verificarCaptchaValido(page);
-    
-    // Capturar screenshot para diagnóstico visual
     const screenshot = await page.screenshot({ encoding: 'base64' });
     
     res.json({
@@ -1890,19 +1915,17 @@ app.post('/test-captcha', async (req, res) => {
 });
 
 // ============================================================
-// GRACEFUL SHUTDOWN (v4.6.4 mejorado)
+// GRACEFUL SHUTDOWN
 // ============================================================
 
 async function shutdown(signal) {
   log('warn', 'SHUTDOWN', `Señal ${signal} recibida, cerrando...`);
   
-  // v4.6.4: Limpiar el intervalo de limpieza
   if (limpiezaInterval) {
     clearInterval(limpiezaInterval);
     log('info', 'SHUTDOWN', 'Intervalo de limpieza detenido');
   }
   
-  // Rechazar todas las sesiones activas
   for (const [numero, sesion] of sesionesActivas.entries()) {
     if (sesion.reject) {
       sesion.reject(new Error('Servidor reiniciándose'));
@@ -1925,34 +1948,31 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 // ============================================================
 
 app.listen(PORT, () => {
-  // Iniciar limpieza automática
   iniciarLimpiezaAutomatica();
   
-  // Validar configuración y mostrar warnings
   const warnings = validarConfiguracion();
   
   if (!process.env.API_KEY) {
     log('warn', 'CONFIG', `API Key generada automáticamente: ${API_KEY}`);
   }
   
-  // Mostrar warnings de configuración
   warnings.forEach(w => log('warn', 'CONFIG', w));
   
   console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.6.4 (AAA - Auditado)           ║
+║           LEXA SCRAPER SERVICE v4.6.5 - Frame Navigation Fix     ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${PORT}                                                     ║
 ║  Auth: ${process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️'}                                      ║
 ║  WhatsApp: ${CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌'}                                  ║
 ║  Browserless: ${CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️'}                                ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  CORRECCIONES v4.6.4 (Auditoría):                                ║
-║    ✓ Eliminado código muerto (SELECTORES)                        ║
-║    ✓ Agregado null check a viewport                              ║
-║    ✓ setInterval ahora se limpia en shutdown                     ║
-║    ✓ Validación de variables de entorno                          ║
-║    ✓ Error en re-llenar credenciales se propaga                  ║
+║  FIX CRÍTICO v4.6.5:                                             ║
+║    ✓ "Requesting main frame too early!" SOLUCIONADO              ║
+║    ✓ esperarFrameListo() - espera robusta post-navegación        ║
+║    ✓ obtenerContenidoSeguro() - retry con backoff exponencial    ║
+║    ✓ Espera fija de 3s después de navegación detectada           ║
+║    ✓ Métricas de frameRetries añadidas                           ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                      ║
 ║    GET  /health             POST /webhook/whatsapp               ║
