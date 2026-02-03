@@ -1,11 +1,15 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.6.2 - Sistema Screenshot CAPTCHA
+ * LEXA SCRAPER SERVICE v4.6.4 - Sistema Screenshot CAPTCHA
  * ============================================================
  * Versión: AAA (Producción - Auditada)
  * Fecha: Febrero 2026
  * 
- * CAMBIOS v4.6.2:
+ * CAMBIOS v4.6.4:
+ * - FIX CRÍTICO: Webhook ahora acepta MESSAGES_UPSERT y messages.upsert
+ * - FIX: Logging mejorado para debug de webhook
+ * - FIX: Validación de mensaje más robusta
+ *
  * - FIX CRÍTICO: verificarCaptchaValido() ahora busca CAPTCHA por múltiples métodos
  * - FIX: Detecta CAPTCHA por: patrón en src/id, cercanía al input, dimensiones en form
  * - FIX: Soporta jcaptcha, imgCod, código y otros patrones de SINOE
@@ -99,7 +103,7 @@ const DEFAULT_VIEWPORT = {
 };
 
 // ============================================================
-// VALIDACIÓN DE CONFIGURACIÓN CRÍTICA (v4.6.2)
+// VALIDACIÓN DE CONFIGURACIÓN CRÍTICA (v4.6.4)
 // ============================================================
 
 /**
@@ -147,7 +151,7 @@ const metricas = {
 const sesionesActivas = new Map();
 const rateLimitCache = new Map();
 
-// v4.6.2: Guardar referencia del intervalo para limpieza en shutdown
+// v4.6.4: Guardar referencia del intervalo para limpieza en shutdown
 let limpiezaInterval = null;
 
 /**
@@ -355,7 +359,7 @@ app.use((req, res, next) => {
  * @returns {Promise<boolean>} true si se envió correctamente
  */
 async function enviarWhatsAppTexto(numero, mensaje, intentos = 3) {
-  // v4.6.2: Validar que apiKey esté configurada
+  // v4.6.4: Validar que apiKey esté configurada
   if (!CONFIG.evolution.apiKey) {
     log('error', 'WHATSAPP', 'EVOLUTION_API_KEY no configurada');
     return false;
@@ -414,7 +418,7 @@ async function enviarWhatsAppTexto(numero, mensaje, intentos = 3) {
  * @returns {Promise<boolean>} true si se envió correctamente
  */
 async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) {
-  // v4.6.2: Validar que apiKey esté configurada
+  // v4.6.4: Validar que apiKey esté configurada
   if (!CONFIG.evolution.apiKey) {
     log('error', 'WHATSAPP', 'EVOLUTION_API_KEY no configurada');
     return false;
@@ -959,7 +963,7 @@ async function recargarCaptcha(page) {
 
 /**
  * v4.6.0 - Asegura que el CAPTCHA sea válido antes de continuar
- * v4.6.2 - Corregido: error en re-llenar credenciales ahora se propaga
+ * v4.6.4 - Corregido: error en re-llenar credenciales ahora se propaga
  * 
  * @param {Page} page - Instancia de Puppeteer Page
  * @param {string} usuario - Usuario de SINOE
@@ -1004,7 +1008,7 @@ async function asegurarCaptchaValido(page, usuario, password) {
       await cerrarPopups(page);
       await delay(500);
       
-      // v4.6.2: Error en re-llenar credenciales ahora se PROPAGA (no se silencia)
+      // v4.6.4: Error en re-llenar credenciales ahora se PROPAGA (no se silencia)
       log('info', 'CAPTCHA', 'Re-llenando credenciales después del refresh...');
       await llenarCredenciales(page, usuario, password);
       await delay(500);
@@ -1023,7 +1027,7 @@ async function asegurarCaptchaValido(page, usuario, password) {
 
 /**
  * Captura screenshot del formulario completo de login
- * v4.6.2 - Agregado null check para viewport
+ * v4.6.4 - Agregado null check para viewport
  * @param {Page} page - Instancia de Puppeteer Page
  * @returns {Promise<string>} Screenshot en base64
  */
@@ -1126,7 +1130,7 @@ async function capturarFormularioLogin(page) {
   // FALLBACK: capturar área central de la pantalla
   log('warn', 'CAPTURA', 'Usando fallback - área central de pantalla');
   
-  // v4.6.2: Null check para viewport - usar DEFAULT_VIEWPORT si es null
+  // v4.6.4: Null check para viewport - usar DEFAULT_VIEWPORT si es null
   const viewport = page.viewport() || DEFAULT_VIEWPORT;
   const centerX = (viewport.width - 500) / 2;
   const centerY = 100;
@@ -1548,45 +1552,60 @@ app.post('/webhook/whatsapp', async (req, res) => {
   try {
     const data = req.body;
     
-    if (data.event !== 'messages.upsert') {
-      return res.status(200).json({ ignored: true, reason: 'not messages.upsert' });
+    // Log para debug
+    log('info', 'WEBHOOK', 'Evento recibido', { 
+      event: data.event,
+      instance: data.instance
+    });
+    
+    // Evolution API envía "MESSAGES_UPSERT" o "messages.upsert" 
+    const eventLower = (data.event || '').toLowerCase().replace('_', '.');
+    if (eventLower !== 'messages.upsert') {
+      return res.status(200).json({ ignored: true, reason: `event: ${data.event}` });
     }
     
     const message = data.data;
     
-    if (!message?.key?.remoteJid || !message?.message || message.key.fromMe) {
-      return res.status(200).json({ ignored: true, reason: 'invalid message structure' });
+    if (!message?.key?.remoteJid || message.key.fromMe) {
+      return res.status(200).json({ ignored: true, reason: 'invalid structure or fromMe' });
     }
     
     const numero = message.key.remoteJid
       .replace('@s.whatsapp.net', '')
       .replace('@c.us', '');
     
-    let texto = message.message.conversation || 
-                message.message.extendedTextMessage?.text || 
-                message.message.imageMessage?.caption || '';
+    // Extraer texto - múltiples formatos
+    let texto = message.message?.conversation || 
+                message.message?.extendedTextMessage?.text || 
+                message.message?.imageMessage?.caption || '';
+    
+    log('info', 'WEBHOOK', 'Mensaje', {
+      numero: enmascarar(numero),
+      texto: texto.substring(0, 20),
+      tieneSession: sesionesActivas.has(numero)
+    });
     
     if (!texto) {
-      return res.status(200).json({ ignored: true, reason: 'no text content' });
+      return res.status(200).json({ ignored: true, reason: 'no text' });
     }
     
     if (!sesionesActivas.has(numero)) {
-      return res.status(200).json({ ignored: true, reason: 'no active session' });
+      return res.status(200).json({ ignored: true, reason: 'no session' });
     }
     
     const validacion = validarCaptcha(texto);
     
     if (!validacion.valido) {
       await enviarWhatsAppTexto(numero, `⚠️ ${validacion.error}\n\n${validacion.sugerencia || ''}`);
-      return res.status(200).json({ ignored: true, reason: 'invalid captcha format' });
+      return res.status(200).json({ ignored: true, reason: 'invalid captcha' });
     }
     
     const sesion = sesionesActivas.get(numero);
     sesion.resolve(validacion.captcha);
     
-    log('success', 'WEBHOOK', 'CAPTCHA recibido y procesado', { 
+    log('success', 'WEBHOOK', 'CAPTCHA procesado', { 
       numero: enmascarar(numero),
-      captchaLength: validacion.captcha.length
+      captcha: validacion.captcha
     });
     
     return res.status(200).json({ success: true });
@@ -1630,7 +1649,7 @@ app.post('/test-whatsapp', async (req, res) => {
   
   const resultado = await enviarWhatsAppTexto(
     validacion.numero, 
-    req.body.mensaje || '🧪 Test LEXA Scraper v4.6.2'
+    req.body.mensaje || '🧪 Test LEXA Scraper v4.6.4'
   );
   res.json({ success: resultado });
 });
@@ -1747,22 +1766,97 @@ app.post('/test-captcha', async (req, res) => {
     await cerrarPopups(page);
     await delay(1000);
     
+    // Diagnóstico completo del DOM
+    const diagnostico = await page.evaluate(() => {
+      const resultado = {
+        imagenes: [],
+        canvas: [],
+        elementosConBackground: [],
+        inputCaptcha: null,
+        divsCercaCaptcha: []
+      };
+      
+      // Buscar todas las imágenes
+      document.querySelectorAll('img').forEach(img => {
+        resultado.imagenes.push({
+          src: (img.src || '').substring(0, 80),
+          id: img.id || 'sin-id',
+          clase: img.className || 'sin-clase',
+          size: `${img.naturalWidth}x${img.naturalHeight}`
+        });
+      });
+      
+      // Buscar canvas
+      document.querySelectorAll('canvas').forEach(canvas => {
+        resultado.canvas.push({
+          id: canvas.id || 'sin-id',
+          clase: canvas.className || 'sin-clase',
+          size: `${canvas.width}x${canvas.height}`
+        });
+      });
+      
+      // Buscar elementos con background-image
+      const todosElementos = document.querySelectorAll('div, span, td, a');
+      todosElementos.forEach(el => {
+        const bg = window.getComputedStyle(el).backgroundImage;
+        if (bg && bg !== 'none' && !bg.includes('gradient')) {
+          resultado.elementosConBackground.push({
+            tag: el.tagName,
+            id: el.id || 'sin-id',
+            clase: (el.className || '').substring(0, 50),
+            background: bg.substring(0, 100)
+          });
+        }
+      });
+      
+      // Buscar input de captcha
+      const inputCaptcha = document.querySelector('input[id*="captcha"], input[placeholder*="Captcha"]');
+      if (inputCaptcha) {
+        resultado.inputCaptcha = {
+          id: inputCaptcha.id,
+          placeholder: inputCaptcha.placeholder,
+          padreHTML: inputCaptcha.parentElement?.innerHTML?.substring(0, 500)
+        };
+        
+        // Buscar elementos hermanos y cercanos
+        let padre = inputCaptcha.parentElement;
+        for (let i = 0; i < 3 && padre; i++) {
+          const hijos = padre.children;
+          for (const hijo of hijos) {
+            if (hijo !== inputCaptcha && hijo.tagName !== 'INPUT') {
+              resultado.divsCercaCaptcha.push({
+                tag: hijo.tagName,
+                id: hijo.id || 'sin-id',
+                clase: (hijo.className || '').substring(0, 30),
+                innerHTML: hijo.innerHTML?.substring(0, 200)
+              });
+            }
+          }
+          padre = padre.parentElement;
+        }
+      }
+      
+      return resultado;
+    });
+    
     const estado = await verificarCaptchaValido(page);
     
-    let recargado = false;
-    if (!estado.valido) {
-      recargado = await recargarCaptcha(page);
-      await delay(2000);
-    }
-    
-    const estadoDespues = await verificarCaptchaValido(page);
+    // Capturar screenshot para diagnóstico visual
+    const screenshot = await page.screenshot({ encoding: 'base64' });
     
     res.json({
       success: true,
-      captchaAntes: estado,
-      seIntentóRecargar: !estado.valido,
-      recargaExitosa: recargado,
-      captchaDespues: estadoDespues
+      captchaEstado: estado,
+      diagnostico: {
+        totalImagenes: diagnostico.imagenes.length,
+        imagenes: diagnostico.imagenes,
+        totalCanvas: diagnostico.canvas.length,
+        canvas: diagnostico.canvas,
+        elementosConBackground: diagnostico.elementosConBackground.slice(0, 10),
+        inputCaptcha: diagnostico.inputCaptcha,
+        divsCercaCaptcha: diagnostico.divsCercaCaptcha.slice(0, 5)
+      },
+      screenshotBase64Length: screenshot.length
     });
     
   } catch (error) {
@@ -1773,13 +1867,13 @@ app.post('/test-captcha', async (req, res) => {
 });
 
 // ============================================================
-// GRACEFUL SHUTDOWN (v4.6.2 mejorado)
+// GRACEFUL SHUTDOWN (v4.6.4 mejorado)
 // ============================================================
 
 async function shutdown(signal) {
   log('warn', 'SHUTDOWN', `Señal ${signal} recibida, cerrando...`);
   
-  // v4.6.2: Limpiar el intervalo de limpieza
+  // v4.6.4: Limpiar el intervalo de limpieza
   if (limpiezaInterval) {
     clearInterval(limpiezaInterval);
     log('info', 'SHUTDOWN', 'Intervalo de limpieza detenido');
@@ -1823,14 +1917,14 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.6.2 (AAA - Auditado)           ║
+║           LEXA SCRAPER SERVICE v4.6.4 (AAA - Auditado)           ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${PORT}                                                     ║
 ║  Auth: ${process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️'}                                      ║
 ║  WhatsApp: ${CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌'}                                  ║
 ║  Browserless: ${CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️'}                                ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  CORRECCIONES v4.6.2 (Auditoría):                                ║
+║  CORRECCIONES v4.6.4 (Auditoría):                                ║
 ║    ✓ Eliminado código muerto (SELECTORES)                        ║
 ║    ✓ Agregado null check a viewport                              ║
 ║    ✓ setInterval ahora se limpia en shutdown                     ║
