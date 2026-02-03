@@ -1,54 +1,37 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.8.2 - HOTFIX NAVEGACIÓN CASILLAS
+ * LEXA SCRAPER SERVICE v4.8.5 - AUDITORÍA COMPLETA
  * ============================================================
  * Versión: PRODUCCIÓN
  * Fecha: Febrero 2026
  * Autor: CTO SINOE Assistant
  * 
- * CORRECCIONES v4.8.1 vs v4.8.0 (Auditoría Profesional):
- * ======================================================
+ * CAMBIOS v4.8.5 (Auditoría Senior - Reescritura completa):
+ * =========================================================
  * 
- * BUG #1 CRÍTICO - SESIÓN ACTIVA:
- *   ANTES: Fallaba y pedía al usuario cerrar manualmente
- *   AHORA: Hace clic automático en "FINALIZAR SESIONES" y reintenta login
+ * PROBLEMA IDENTIFICADO:
+ *   En el HTML de SINOE, el <a> y el texto "Casillas Electrónicas"
+ *   son elementos HERMANOS, no padre-hijo:
+ *   
+ *   <div class="col-xs-4">
+ *     <a id="frmNuevo:j_idt38" class="ui-commandlink"></a>  ← Vacío
+ *     <div class="bggradient btnservicios">                  ← Texto aquí
+ *       Casillas Electrónicas
+ *     </div>
+ *   </div>
  * 
- * BUG #2 CRÍTICO - MEMORY LEAK SETTIMEOUT:
- *   ANTES: setTimeout del CAPTCHA seguía activo después de resolver
- *   AHORA: Se guarda timeoutId y se cancela con clearTimeout
+ * SOLUCIÓN:
+ *   Reescrita función navegarACasillas con 5 estrategias:
+ *   1. Buscar por ID exacto (#frmNuevo:j_idt38)
+ *   2. Buscar por clase ui-commandlink + verificar contexto del padre
+ *   3. Buscar por onclick*="submit" + verificar contexto
+ *   4. Buscar div .btnservicios con texto y luego hermano <a>
+ *   5. Usar primer enlace frmNuevo (último recurso)
  * 
- * BUG #3 - LIMPIEZA AUTOMÁTICA:
- *   ANTES: No cancelaba timeoutId en limpieza
- *   AHORA: Cancela timeoutId antes de eliminar sesión
- * 
- * BUG #4 - DETECCIÓN SESIÓN ACTIVA:
- *   ANTES: Solo detectaba por URL y "sesión activa"
- *   AHORA: También detecta "finalizar sesion" en contenido
- * 
- * BUG #5 - CAMPO CAPTCHA EXPIRADO:
- *   ANTES: Error genérico si el campo desapareció
- *   AHORA: Mensaje descriptivo "página expiró"
- * 
- * BUG #6 - ENDPOINTS DE DEBUG:
- *   ANTES: Eliminados
- *   AHORA: Restaurados /test-credenciales y /test-captcha
- * 
- * HOTFIX v4.8.2 - NAVEGACIÓN A CASILLAS:
- * ======================================
- * PROBLEMA: Hacía clic en "instructivo" en lugar de "Casillas Electrónicas"
- * SOLUCIÓN: 
- *   - Excluir explícitamente enlaces con "instructivo", "manual", "guía"
- *   - Prioridad 1: Buscar "casillas electr" exacto
- *   - Prioridad 2: Buscar panel con imagen de SINOE
- *   - Prioridad 3: Buscar imagen con alt/src "casilla"
- *   - Prioridad 4: Último recurso - enlace grande que no sea instructivo
- * 
- * FLUJO DE SESIÓN ACTIVA (NUEVO):
- * 1. Detectar página "sso-session-activa.xhtml"
- * 2. Cerrar popup de COMUNICADO si existe
- * 3. Hacer clic en botón "FINALIZAR SESIONES"
- * 4. Esperar redirección al login
- * 5. Reintentar proceso completo de login
+ * MEJORAS DE LOGGING:
+ *   - Diagnóstico completo antes de buscar
+ *   - Logs descriptivos en cada paso
+ *   - Información de debug cuando falla
  * ============================================================
  */
 
@@ -972,171 +955,187 @@ async function capturarFormularioLogin(page) {
 // FUNCIONES DE SINOE - POST-LOGIN
 // ============================================================
 
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * NAVEGACIÓN A CASILLAS ELECTRÓNICAS - v4.8.5
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 
+ * ESTRUCTURA HTML DE SINOE (verificada en captura del 03/02/2026):
+ * 
+ *   <div class="col-xs-4 col-md-4 col-lg-4 form-group">    ← Contenedor
+ *     <a id="frmNuevo:j_idt38"                              ← Enlace clickeable (VACÍO)
+ *        class="ui-commandlink ui-widget"
+ *        onclick="PF('dlgVarBlock').show();PrimeFaces.addSubmitParam(...).submit('frmNuevo');">
+ *     </a>
+ *     <div class="bggradient btnservicios">                 ← Div con texto (HERMANO)
+ *       Casillas Electrónicas
+ *     </div>
+ *   </div>
+ * 
+ * IMPORTANTE: El <a> y el <div> con texto son HERMANOS, no padre-hijo.
+ * El <a> está VACÍO (sin texto interior).
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 async function navegarACasillas(page, requestId) {
-  log('info', `CASILLAS:${requestId}`, 'Buscando botón "Casillas Electrónicas"...');
+  log('info', `CASILLAS:${requestId}`, 'Iniciando navegación a Casillas Electrónicas...');
   
-  // PRIMERO: Diagnóstico - ver qué hay en la página
+  // ═══════════════════════════════════════════════════════════════════════
+  // PASO 1: DIAGNÓSTICO - Ver qué hay en la página
+  // ═══════════════════════════════════════════════════════════════════════
+  
   const diagnostico = await evaluarSeguro(page, () => {
-    const resultado = {
+    return {
       url: window.location.href,
       titulo: document.title,
-      bodyLength: document.body.innerText.length,
-      // Buscar elementos clave
-      btnservicios: document.querySelectorAll('.btnservicios, .bggradient, [class*="btnservicio"]').length,
-      enlaces: document.querySelectorAll('a').length,
-      enlacesOnclick: document.querySelectorAll('a[onclick]').length,
-      imagenes: document.querySelectorAll('img').length,
-      // Texto que contiene "casillas"
-      textoCasillas: document.body.innerText.toLowerCase().includes('casillas'),
-      textoElectronicas: document.body.innerText.toLowerCase().includes('electr'),
-      // Primeros 500 chars del body
-      extractoTexto: document.body.innerText.substring(0, 500).replace(/\s+/g, ' '),
-      // Todas las clases de divs principales
-      clasesDiv: [...new Set([...document.querySelectorAll('div[class]')].map(d => d.className).filter(c => c.length < 50))].slice(0, 20)
+      
+      // Contar elementos relevantes
+      enlacesCommandlink: document.querySelectorAll('a.ui-commandlink').length,
+      enlacesConOnclick: document.querySelectorAll('a[onclick]').length,
+      enlacesFrmNuevo: document.querySelectorAll('a[id*="frmNuevo"]').length,
+      divsBtnservicios: document.querySelectorAll('.btnservicios').length,
+      
+      // ¿Existe el texto "Casillas Electrónicas"?
+      textoExiste: document.body.innerText.toLowerCase().includes('casillas electr'),
+      
+      // Primeros 200 caracteres del body (para debug)
+      extractoBody: (document.body.innerText || '').substring(0, 200).replace(/\s+/g, ' ')
     };
-    return resultado;
   });
   
-  log('info', `CASILLAS:${requestId}`, 'Diagnóstico de página:', diagnostico);
+  log('info', `CASILLAS:${requestId}`, 'Diagnóstico:', diagnostico);
   
-  // Si no hay texto "casillas", probablemente no estamos en la página correcta
-  if (!diagnostico?.textoCasillas) {
-    log('warn', `CASILLAS:${requestId}`, 'La página NO contiene texto "casillas" - puede que no sea la página de bienvenida');
-    
-    // Capturar screenshot para debug
-    try {
-      const screenshot = await page.screenshot({ encoding: 'base64', fullPage: false });
-      log('info', `CASILLAS:${requestId}`, `Screenshot capturado (${screenshot.length} bytes) - revisa logs para debug`);
-    } catch (e) {
-      log('warn', `CASILLAS:${requestId}`, 'No se pudo capturar screenshot');
-    }
-  }
-  
-  const clickeado = await evaluarSeguro(page, () => {
-    // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 1: Buscar por clase exacta del HTML de SINOE
-    // ═══════════════════════════════════════════════════════════════════
-    
-    // El botón está en div.bggradient.btnservicios (visto en tu screenshot)
-    const contenedores = document.querySelectorAll('.btnservicios, .bggradient.btnservicios, div[class*="btnservicio"]');
-    
-    console.log('Contenedores btnservicios encontrados:', contenedores.length);
-    
-    for (const contenedor of contenedores) {
-      const texto = (contenedor.innerText || '').toLowerCase();
-      console.log('Contenedor texto:', texto.substring(0, 50));
-      
-      // Debe contener "casillas" pero NO "mesa de partes"
-      if (texto.includes('casillas') && !texto.includes('mesa de partes')) {
-        const enlace = contenedor.querySelector('a');
-        if (enlace) {
-          console.log('Encontrado enlace en btnservicios');
-          enlace.click();
-          return { clickeado: true, texto: 'btnservicios', metodo: 'clase_exacta' };
-        }
-      }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 2: Buscar TODOS los enlaces con onclick que contengan submit
-    // ═══════════════════════════════════════════════════════════════════
-    
-    const enlacesSubmit = document.querySelectorAll('a[onclick*="submit"]');
-    console.log('Enlaces con submit:', enlacesSubmit.length);
-    
-    for (const enlace of enlacesSubmit) {
-      // Subir 3 niveles para ver el contexto
-      let contexto = enlace;
-      for (let i = 0; i < 3; i++) {
-        if (contexto.parentElement) contexto = contexto.parentElement;
-      }
-      
-      const textoContexto = (contexto.innerText || '').toLowerCase();
-      console.log('Enlace submit contexto:', textoContexto.substring(0, 50));
-      
-      if (textoContexto.includes('casillas') && !textoContexto.includes('mesa')) {
-        console.log('Match encontrado!');
-        enlace.click();
-        return { clickeado: true, texto: 'enlace_submit', metodo: 'onclick_submit' };
-      }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 3: Buscar el PRIMER panel/card que tenga imagen
-    // La página tiene 3 opciones, la primera es Casillas
-    // ═══════════════════════════════════════════════════════════════════
-    
-    const contenedoresConImagen = document.querySelectorAll('div');
-    
-    for (const div of contenedoresConImagen) {
-      const tieneImagen = div.querySelector('img');
-      const tieneEnlace = div.querySelector('a[onclick]');
-      const texto = (div.innerText || '').toLowerCase();
-      
-      if (tieneImagen && tieneEnlace && texto.includes('casillas')) {
-        console.log('Panel con imagen encontrado');
-        tieneEnlace.click();
-        return { clickeado: true, texto: 'panel_imagen', metodo: 'div_con_imagen' };
-      }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 4: Buscar cualquier elemento clickeable con "casillas"
-    // ═══════════════════════════════════════════════════════════════════
-    
-    const todosElementos = document.querySelectorAll('a, button, [onclick]');
-    
-    for (const el of todosElementos) {
-      const texto = (el.innerText || el.textContent || '').toLowerCase();
-      
-      if (texto.includes('casillas') && texto.includes('electr')) {
-        console.log('Elemento con casillas electronicas:', texto.substring(0, 30));
-        el.click();
-        return { clickeado: true, texto: texto.substring(0, 30), metodo: 'texto_directo' };
-      }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 5 (ÚLTIMA): Primer enlace grande que NO sea instructivo
-    // ═══════════════════════════════════════════════════════════════════
-    
-    const todosEnlaces = document.querySelectorAll('a[onclick]');
-    
-    for (const enlace of todosEnlaces) {
-      const rect = enlace.getBoundingClientRect();
-      const texto = (enlace.innerText || '').toLowerCase();
-      
-      // Debe ser visible y no ser instructivo/manual
-      if (rect.width > 50 && rect.height > 20 && 
-          !texto.includes('instructivo') && 
-          !texto.includes('manual') &&
-          !texto.includes('cerrar')) {
-        
-        // Verificar que el padre contenga algo relacionado con SINOE
-        let padre = enlace.parentElement;
-        for (let i = 0; i < 5 && padre; i++) {
-          const textoPadre = (padre.innerText || '').toLowerCase();
-          if (textoPadre.includes('sinoe') || textoPadre.includes('casilla')) {
-            console.log('Enlace en contexto SINOE encontrado');
-            enlace.click();
-            return { clickeado: true, texto: 'primer_enlace_sinoe', metodo: 'fallback' };
-          }
-          padre = padre.parentElement;
-        }
-      }
-    }
-    
-    return { clickeado: false, metodo: 'ninguno', debug: 'Ninguna estrategia funcionó' };
-  });
-  
-  if (!clickeado || !clickeado.clickeado) {
-    log('error', `CASILLAS:${requestId}`, '❌ No se encontró botón "Casillas Electrónicas"', { diagnostico, clickeado });
+  // Verificar que estamos en la página correcta
+  if (!diagnostico) {
+    log('error', `CASILLAS:${requestId}`, 'Error: No se pudo leer la página (evaluarSeguro retornó null)');
     return false;
   }
   
-  log('success', `CASILLAS:${requestId}`, `✓ Clic en "${clickeado.texto}" (método: ${clickeado.metodo})`);
+  if (!diagnostico.textoExiste) {
+    log('error', `CASILLAS:${requestId}`, 'Error: El texto "Casillas Electrónicas" no existe en la página');
+    log('info', `CASILLAS:${requestId}`, 'Extracto de la página:', diagnostico.extractoBody);
+    return false;
+  }
   
-  // Esperar navegación
+  // ═══════════════════════════════════════════════════════════════════════
+  // PASO 2: HACER CLIC EN EL ENLACE CORRECTO
+  // ═══════════════════════════════════════════════════════════════════════
+  
+  const resultado = await evaluarSeguro(page, () => {
+    // ─────────────────────────────────────────────────────────────────────
+    // ESTRATEGIA 1: Buscar el enlace por ID exacto (frmNuevo:j_idt38)
+    // Este es el ID que vimos en el DevTools
+    // ─────────────────────────────────────────────────────────────────────
+    const enlaceDirecto = document.querySelector('#frmNuevo\\:j_idt38');
+    if (enlaceDirecto) {
+      enlaceDirecto.click();
+      return { exito: true, metodo: 'id_exacto', id: 'frmNuevo:j_idt38' };
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────
+    // ESTRATEGIA 2: Buscar enlaces con clase ui-commandlink y verificar contexto
+    // ─────────────────────────────────────────────────────────────────────
+    const enlacesCommandlink = document.querySelectorAll('a.ui-commandlink');
+    
+    for (const enlace of enlacesCommandlink) {
+      // Subir al contenedor padre
+      const padre = enlace.parentElement;
+      if (!padre) continue;
+      
+      // Obtener todo el texto del contenedor (incluye hijos)
+      const textoPadre = (padre.innerText || '').toLowerCase();
+      
+      // Verificar que sea el de Casillas (no Mesa de Partes)
+      if (textoPadre.includes('casillas') && 
+          textoPadre.includes('electr') && 
+          !textoPadre.includes('mesa de partes')) {
+        enlace.click();
+        return { exito: true, metodo: 'commandlink_contexto', id: enlace.id || 'sin_id' };
+      }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────
+    // ESTRATEGIA 3: Buscar cualquier enlace con onclick que haga submit
+    // ─────────────────────────────────────────────────────────────────────
+    const enlacesSubmit = document.querySelectorAll('a[onclick*="submit"]');
+    
+    for (const enlace of enlacesSubmit) {
+      const padre = enlace.parentElement;
+      if (!padre) continue;
+      
+      const textoPadre = (padre.innerText || '').toLowerCase();
+      
+      if (textoPadre.includes('casillas')) {
+        enlace.click();
+        return { exito: true, metodo: 'submit_contexto', id: enlace.id || 'sin_id' };
+      }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────
+    // ESTRATEGIA 4: Buscar el div con texto "Casillas" y luego su hermano <a>
+    // ─────────────────────────────────────────────────────────────────────
+    const divsBtnservicios = document.querySelectorAll('.btnservicios, .bggradient');
+    
+    for (const div of divsBtnservicios) {
+      const textoDiv = (div.innerText || '').toLowerCase();
+      
+      if (textoDiv.includes('casillas') && textoDiv.includes('electr')) {
+        // Buscar enlace hermano anterior
+        const hermanoAnterior = div.previousElementSibling;
+        if (hermanoAnterior && hermanoAnterior.tagName === 'A') {
+          hermanoAnterior.click();
+          return { exito: true, metodo: 'hermano_anterior', id: hermanoAnterior.id || 'sin_id' };
+        }
+        
+        // Buscar enlace en el padre
+        const padre = div.parentElement;
+        if (padre) {
+          const enlacePadre = padre.querySelector('a[onclick]');
+          if (enlacePadre) {
+            enlacePadre.click();
+            return { exito: true, metodo: 'enlace_en_padre', id: enlacePadre.id || 'sin_id' };
+          }
+        }
+      }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────
+    // ESTRATEGIA 5 (ÚLTIMO RECURSO): Primer enlace de frmNuevo
+    // ─────────────────────────────────────────────────────────────────────
+    const primerEnlace = document.querySelector('a[id*="frmNuevo"][onclick]');
+    if (primerEnlace) {
+      primerEnlace.click();
+      return { exito: true, metodo: 'primer_frmnuevo', id: primerEnlace.id };
+    }
+    
+    // No se encontró ningún enlace válido
+    return { 
+      exito: false, 
+      metodo: 'ninguno',
+      debug: {
+        commandlink: document.querySelectorAll('a.ui-commandlink').length,
+        submit: document.querySelectorAll('a[onclick*="submit"]').length,
+        btnservicios: document.querySelectorAll('.btnservicios').length
+      }
+    };
+  });
+  
+  // ═══════════════════════════════════════════════════════════════════════
+  // PASO 3: VERIFICAR RESULTADO
+  // ═══════════════════════════════════════════════════════════════════════
+  
+  if (!resultado) {
+    log('error', `CASILLAS:${requestId}`, 'Error: evaluarSeguro retornó null (posible error de frame)');
+    return false;
+  }
+  
+  if (!resultado.exito) {
+    log('error', `CASILLAS:${requestId}`, 'No se encontró el botón de Casillas Electrónicas', resultado.debug);
+    return false;
+  }
+  
+  log('success', `CASILLAS:${requestId}`, `✓ Clic realizado (método: ${resultado.metodo}, id: ${resultado.id})`);
+  
+  // Esperar a que la navegación se complete
   await delay(TIMEOUT.esperaClicCasillas);
   
   return true;
@@ -1945,7 +1944,7 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.8.3-debug',
+    version: '4.8.5',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
@@ -2352,35 +2351,31 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║          LEXA SCRAPER SERVICE v4.8.2 - DESCARGA DE CONSOLIDADOS               ║
+║              LEXA SCRAPER SERVICE v4.8.5 - AUDITORÍA COMPLETA                 ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${String(PORT).padEnd(70)}║
 ║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
 ║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
 ║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  FLUJO COMPLETO v4.8.2:                                                       ║
+║  CAMBIOS v4.8.5 (Auditoría Senior):                                           ║
 ║                                                                               ║
-║    1. Login con CAPTCHA manual (5 min timeout)                                ║
-║    2. Manejo automático de sesión activa                                      ║
-║    3. Navegación a "Casillas Electrónicas" (4 estrategias)                    ║
-║    4. Extracción de lista de notificaciones                                   ║
-║    5. Clic en botón rojo → Abre modal de anexos                               ║
-║    6. Clic en "Consolidado" → Descarga PDF                                    ║
-║    7. Procesa las primeras 3 notificaciones automáticamente                   ║
+║    ✓ Reescrita función navegarACasillas desde cero                            ║
+║    ✓ 5 estrategias de búsqueda con fallbacks                                  ║
+║    ✓ Diagnóstico detallado antes de buscar                                    ║
+║    ✓ Logs descriptivos en cada paso                                           ║
+║    ✓ Manejo robusto de errores                                                ║
 ║                                                                               ║
-║  CORRECCIONES INCLUIDAS:                                                      ║
-║    ✓ Sesión activa → clic automático en FINALIZAR SESIONES                    ║
-║    ✓ Memory leak setTimeout corregido                                         ║
-║    ✓ No hace clic en "instructivo" (lista negra)                              ║
-║    ✓ Selectores exactos del HTML de SINOE                                     ║
+║  ESTRATEGIAS DE BÚSQUEDA (en orden):                                          ║
+║    1. ID exacto: #frmNuevo:j_idt38                                            ║
+║    2. Clase ui-commandlink + contexto padre                                   ║
+║    3. Atributo onclick*="submit" + contexto                                   ║
+║    4. Div .btnservicios + hermano <a> anterior                                ║
+║    5. Primer enlace frmNuevo (último recurso)                                 ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                                   ║
-║    GET  /health              POST /webhook/whatsapp                           ║
-║    POST /scraper             GET  /sesiones                                   ║
-║    GET  /metricas            POST /test-whatsapp                              ║
-║    POST /test-conexion       POST /test-credenciales                          ║
-║    POST /test-captcha                                                         ║
+║    GET  /health    POST /scraper    GET  /metricas    GET /sesiones           ║
+║    POST /webhook/whatsapp    POST /test-whatsapp    POST /test-conexion       ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
   `);
   
