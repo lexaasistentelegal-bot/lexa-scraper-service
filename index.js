@@ -1,11 +1,11 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.9.1 - FIX CASILLAS
+ * LEXA SCRAPER SERVICE v4.9.2 - FIX FRAME TIMING
  * ============================================================
  * 
  * ARCHIVO MODIFICABLE - Contiene:
  *   - analizarResultadoLogin (FIX v4.9.0)
- *   - navegarACasillas (FIX v4.9.1)
+ *   - navegarACasillas (FIX v4.9.2)
  *   - Navegación SINOE post-login
  *   - Endpoints HTTP
  *   - Servidor Express
@@ -13,10 +13,14 @@
  * Las funciones base están en core.js (NO TOCAR)
  * ============================================================
  * 
+ * CAMBIOS v4.9.2:
+ *   ✓ FIX: Espera 3s para que página se estabilice post-login
+ *   ✓ FIX: Reintentos (3x) si evaluarSeguro retorna null
+ *   ✓ Más robusto ante frames en transición
+ *
  * CAMBIOS v4.9.1:
  *   ✓ FIX: navegarACasillas ya no aborta si textoExiste=false
  *   ✓ NUEVA estrategia: busca span.txtredbtn con "Casillas"
- *   ✓ Mejor detección del enlace padre desde el span
  * 
  * CAMBIOS v4.9.0:
  *   ✓ FIX: analizarResultadoLogin ya no confunde login.xhtml
@@ -171,126 +175,150 @@ function analizarResultadoLogin(url, contenido, urlAntes) {
 async function navegarACasillas(page, requestId) {
   log('info', `CASILLAS:${requestId}`, 'Iniciando navegación a Casillas Electrónicas...');
   
-  // PASO 1: DIAGNÓSTICO (solo informativo, NO aborta)
+  // FIX v4.9.2: Esperar a que la página se estabilice después del login
+  log('info', `CASILLAS:${requestId}`, 'Esperando 3s para que la página se estabilice...');
+  await delay(3000);
+  
+  // PASO 1: DIAGNÓSTICO con reintentos
   let diagnostico = null;
   
-  try {
-    diagnostico = await evaluarSeguro(page, () => {
-      return {
-        url: window.location.href,
-        titulo: document.title,
-        enlacesCommandlink: document.querySelectorAll('a.ui-commandlink').length,
-        enlacesConOnclick: document.querySelectorAll('a[onclick]').length,
-        enlacesFrmNuevo: document.querySelectorAll('a[id*="frmNuevo"]').length,
-        divsBtnservicios: document.querySelectorAll('.btnservicios, .bggradient').length,
-        spansTxtredbtn: document.querySelectorAll('span.txtredbtn').length,
-        textoExiste: document.body.innerText.toLowerCase().includes('casillas electr'),
-        extractoBody: (document.body.innerText || '').substring(0, 200).replace(/\s+/g, ' ')
+  for (let intento = 1; intento <= 3; intento++) {
+    try {
+      diagnostico = await evaluarSeguro(page, () => {
+        return {
+          url: window.location.href,
+          titulo: document.title,
+          enlacesCommandlink: document.querySelectorAll('a.ui-commandlink').length,
+          enlacesConOnclick: document.querySelectorAll('a[onclick]').length,
+          enlacesFrmNuevo: document.querySelectorAll('a[id*="frmNuevo"]').length,
+          divsBtnservicios: document.querySelectorAll('.btnservicios, .bggradient').length,
+          spansTxtredbtn: document.querySelectorAll('span.txtredbtn').length,
+          textoExiste: document.body.innerText.toLowerCase().includes('casillas electr'),
+          extractoBody: (document.body.innerText || '').substring(0, 200).replace(/\s+/g, ' ')
+        };
+      });
+      
+      if (diagnostico) {
+        log('info', `CASILLAS:${requestId}`, 'Diagnóstico:', diagnostico);
+        break;
+      }
+    } catch (error) {
+      log('warn', `CASILLAS:${requestId}`, `Intento ${intento}/3 diagnóstico falló: ${error.message}`);
+    }
+    
+    if (intento < 3) {
+      log('info', `CASILLAS:${requestId}`, `Reintentando diagnóstico en 2s...`);
+      await delay(2000);
+    }
+  }
+  
+  // Si no hay diagnóstico, continuar de todas formas
+  if (!diagnostico) {
+    log('warn', `CASILLAS:${requestId}`, 'No se pudo obtener diagnóstico, intentando clic directo...');
+  }
+  
+  // PASO 2: HACER CLIC EN EL ENLACE CORRECTO (6 estrategias) - con reintentos
+  let resultado = null;
+  
+  for (let intento = 1; intento <= 3; intento++) {
+    resultado = await evaluarSeguro(page, () => {
+      // ESTRATEGIA 1: ID exacto (el más confiable)
+      const enlaceDirecto = document.querySelector('#frmNuevo\\:j_idt38');
+      if (enlaceDirecto) {
+        enlaceDirecto.click();
+        return { exito: true, metodo: 'id_exacto', id: 'frmNuevo:j_idt38' };
+      }
+      
+      // ESTRATEGIA 2: Buscar span.txtredbtn con texto "Casillas" y subir al enlace padre
+      const spansTxtredbtn = document.querySelectorAll('span.txtredbtn');
+      for (const span of spansTxtredbtn) {
+        const textoSpan = (span.innerText || '').toLowerCase();
+        if (textoSpan.includes('casillas')) {
+          // Subir hasta encontrar el enlace <a>
+          let elemento = span.parentElement;
+          let niveles = 0;
+          while (elemento && niveles < 5) {
+            if (elemento.tagName === 'A') {
+              elemento.click();
+              return { exito: true, metodo: 'span_txtredbtn', id: elemento.id || 'sin_id' };
+            }
+            elemento = elemento.parentElement;
+            niveles++;
+          }
+        }
+      }
+      
+      // ESTRATEGIA 3: Enlaces commandlink con contexto
+      const enlacesCommandlink = document.querySelectorAll('a.ui-commandlink');
+      for (const enlace of enlacesCommandlink) {
+        const textoEnlace = (enlace.innerText || '').toLowerCase();
+        if (textoEnlace.includes('casillas') && !textoEnlace.includes('mesa de partes')) {
+          enlace.click();
+          return { exito: true, metodo: 'commandlink_texto', id: enlace.id || 'sin_id' };
+        }
+      }
+      
+      // ESTRATEGIA 4: Enlaces con onclick submit
+      const enlacesSubmit = document.querySelectorAll('a[onclick*="submit"]');
+      for (const enlace of enlacesSubmit) {
+        const textoEnlace = (enlace.innerText || '').toLowerCase();
+        if (textoEnlace.includes('casillas')) {
+          enlace.click();
+          return { exito: true, metodo: 'submit_texto', id: enlace.id || 'sin_id' };
+        }
+      }
+      
+      // ESTRATEGIA 5: Div btnservicios/bggradient que contenga "casillas"
+      const divsBtnservicios = document.querySelectorAll('.btnservicios, .bggradient');
+      for (const div of divsBtnservicios) {
+        const textoDiv = (div.innerText || '').toLowerCase();
+        if (textoDiv.includes('casillas')) {
+          // El div está DENTRO del enlace, buscar el enlace padre
+          let elemento = div.parentElement;
+          let niveles = 0;
+          while (elemento && niveles < 3) {
+            if (elemento.tagName === 'A') {
+              elemento.click();
+              return { exito: true, metodo: 'div_btnservicios', id: elemento.id || 'sin_id' };
+            }
+            elemento = elemento.parentElement;
+            niveles++;
+          }
+        }
+      }
+      
+      // ESTRATEGIA 6: Primer enlace frmNuevo con onclick (último recurso)
+      const primerEnlace = document.querySelector('a[id*="frmNuevo"][onclick]');
+      if (primerEnlace) {
+        primerEnlace.click();
+        return { exito: true, metodo: 'primer_frmnuevo', id: primerEnlace.id };
+      }
+      
+      return { 
+        exito: false, 
+        metodo: 'ninguno',
+        debug: {
+          commandlink: document.querySelectorAll('a.ui-commandlink').length,
+          submit: document.querySelectorAll('a[onclick*="submit"]').length,
+          btnservicios: document.querySelectorAll('.btnservicios, .bggradient').length,
+          txtredbtn: document.querySelectorAll('span.txtredbtn').length,
+          frmNuevo: document.querySelectorAll('a[id*="frmNuevo"]').length
+        }
       };
     });
-  } catch (error) {
-    log('error', `CASILLAS:${requestId}`, `Error en diagnóstico: ${error.message}`);
+    
+    if (resultado) {
+      break; // Salir del loop si obtuvimos resultado
+    }
+    
+    if (intento < 3) {
+      log('warn', `CASILLAS:${requestId}`, `Intento ${intento}/3: evaluarSeguro retornó null, reintentando en 2s...`);
+      await delay(2000);
+    }
   }
-  
-  if (diagnostico) {
-    log('info', `CASILLAS:${requestId}`, 'Diagnóstico:', diagnostico);
-  }
-  
-  // FIX v4.9.1: NO abortar si textoExiste es false
-  // Intentar hacer clic de todas formas - el DOM puede tener el elemento
-  if (diagnostico && !diagnostico.textoExiste) {
-    log('warn', `CASILLAS:${requestId}`, 'Texto "Casillas Electrónicas" no detectado, intentando de todas formas...');
-  }
-  
-  // PASO 2: HACER CLIC EN EL ENLACE CORRECTO (6 estrategias)
-  const resultado = await evaluarSeguro(page, () => {
-    // ESTRATEGIA 1: ID exacto (el más confiable)
-    const enlaceDirecto = document.querySelector('#frmNuevo\\:j_idt38');
-    if (enlaceDirecto) {
-      enlaceDirecto.click();
-      return { exito: true, metodo: 'id_exacto', id: 'frmNuevo:j_idt38' };
-    }
-    
-    // ESTRATEGIA 2: Buscar span.txtredbtn con texto "Casillas" y subir al enlace padre
-    const spansTxtredbtn = document.querySelectorAll('span.txtredbtn');
-    for (const span of spansTxtredbtn) {
-      const textoSpan = (span.innerText || '').toLowerCase();
-      if (textoSpan.includes('casillas')) {
-        // Subir hasta encontrar el enlace <a>
-        let elemento = span.parentElement;
-        let niveles = 0;
-        while (elemento && niveles < 5) {
-          if (elemento.tagName === 'A') {
-            elemento.click();
-            return { exito: true, metodo: 'span_txtredbtn', id: elemento.id || 'sin_id' };
-          }
-          elemento = elemento.parentElement;
-          niveles++;
-        }
-      }
-    }
-    
-    // ESTRATEGIA 3: Enlaces commandlink con contexto
-    const enlacesCommandlink = document.querySelectorAll('a.ui-commandlink');
-    for (const enlace of enlacesCommandlink) {
-      const textoEnlace = (enlace.innerText || '').toLowerCase();
-      if (textoEnlace.includes('casillas') && !textoEnlace.includes('mesa de partes')) {
-        enlace.click();
-        return { exito: true, metodo: 'commandlink_texto', id: enlace.id || 'sin_id' };
-      }
-    }
-    
-    // ESTRATEGIA 4: Enlaces con onclick submit
-    const enlacesSubmit = document.querySelectorAll('a[onclick*="submit"]');
-    for (const enlace of enlacesSubmit) {
-      const textoEnlace = (enlace.innerText || '').toLowerCase();
-      if (textoEnlace.includes('casillas')) {
-        enlace.click();
-        return { exito: true, metodo: 'submit_texto', id: enlace.id || 'sin_id' };
-      }
-    }
-    
-    // ESTRATEGIA 5: Div btnservicios/bggradient que contenga "casillas"
-    const divsBtnservicios = document.querySelectorAll('.btnservicios, .bggradient');
-    for (const div of divsBtnservicios) {
-      const textoDiv = (div.innerText || '').toLowerCase();
-      if (textoDiv.includes('casillas')) {
-        // El div está DENTRO del enlace, buscar el enlace padre
-        let elemento = div.parentElement;
-        let niveles = 0;
-        while (elemento && niveles < 3) {
-          if (elemento.tagName === 'A') {
-            elemento.click();
-            return { exito: true, metodo: 'div_btnservicios', id: elemento.id || 'sin_id' };
-          }
-          elemento = elemento.parentElement;
-          niveles++;
-        }
-      }
-    }
-    
-    // ESTRATEGIA 6: Primer enlace frmNuevo con onclick (último recurso)
-    const primerEnlace = document.querySelector('a[id*="frmNuevo"][onclick]');
-    if (primerEnlace) {
-      primerEnlace.click();
-      return { exito: true, metodo: 'primer_frmnuevo', id: primerEnlace.id };
-    }
-    
-    return { 
-      exito: false, 
-      metodo: 'ninguno',
-      debug: {
-        commandlink: document.querySelectorAll('a.ui-commandlink').length,
-        submit: document.querySelectorAll('a[onclick*="submit"]').length,
-        btnservicios: document.querySelectorAll('.btnservicios, .bggradient').length,
-        txtredbtn: document.querySelectorAll('span.txtredbtn').length,
-        frmNuevo: document.querySelectorAll('a[id*="frmNuevo"]').length
-      }
-    };
-  });
   
   if (!resultado) {
-    log('error', `CASILLAS:${requestId}`, 'Error: evaluarSeguro retornó null');
+    log('error', `CASILLAS:${requestId}`, 'Error: No se pudo evaluar la página después de 3 intentos');
     return false;
   }
   
@@ -1027,7 +1055,7 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.9.1',
+    version: '4.9.2',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
@@ -1313,22 +1341,22 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║              LEXA SCRAPER SERVICE v4.9.1 - FIX CASILLAS                       ║
+║              LEXA SCRAPER SERVICE v4.9.2 - FIX FRAME TIMING                   ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${String(PORT).padEnd(70)}║
 ║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
 ║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
 ║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  CAMBIOS v4.9.1:                                                              ║
+║  CAMBIOS v4.9.2:                                                              ║
 ║                                                                               ║
-║    ✓ FIX: navegarACasillas ya no aborta si textoExiste=false                  ║
-║    ✓ NUEVA estrategia: busca span.txtredbtn con "Casillas"                    ║
-║    ✓ Mejor detección del enlace padre desde el span                           ║
+║    ✓ FIX: Espera 3s para que página se estabilice post-login                  ║
+║    ✓ FIX: Reintentos (3x) si evaluarSeguro retorna null                       ║
+║    ✓ Más robusto ante frames en transición                                    ║
 ║                                                                               ║
 ║  ESTRATEGIAS DE BÚSQUEDA (6):                                                 ║
 ║    1. ID exacto: #frmNuevo:j_idt38                                            ║
-║    2. span.txtredbtn → enlace padre (NUEVO)                                   ║
+║    2. span.txtredbtn → enlace padre                                           ║
 ║    3. a.ui-commandlink con texto "casillas"                                   ║
 ║    4. a[onclick*="submit"] con texto "casillas"                               ║
 ║    5. div.btnservicios → enlace padre                                         ║
