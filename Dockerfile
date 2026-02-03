@@ -1,21 +1,31 @@
 # ============================================================
-# LEXA SCRAPER SERVICE v4.1.0 (AAA) - Dockerfile
+# LEXA SCRAPER SERVICE v4.9.0 - Dockerfile
+# ============================================================
+# 
+# ESTRUCTURA:
+#   - core.js   → Funciones base (NO MODIFICAR)
+#   - index.js  → Lógica de negocio (MODIFICABLE)
+#
 # ============================================================
 
 FROM node:20-alpine
 
 WORKDIR /app
 
+# Copiar archivos de dependencias
 COPY package*.json ./
 
-# Usar npm install en lugar de npm ci (no requiere package-lock.json)
-RUN npm install --only=production
+# Instalar dependencias
+RUN npm ci --only=production
 
+# Copiar código fuente (core.js + index.js)
+COPY core.js ./
 COPY index.js ./
+
+# Puerto por defecto
+ENV PORT=3001
 
 EXPOSE 3001
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3001/health || exit 1
-
+# Ejecutar
 CMD ["node", "index.js"]
