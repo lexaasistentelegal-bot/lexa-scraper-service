@@ -1,10 +1,10 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.9.5 - FIX CLIC LOGIN PRIMEFACES
+ * LEXA SCRAPER SERVICE v4.9.6 - FIX PRIMEFACES SINTAXIS
  * ============================================================
  * 
  * ARCHIVO MODIFICABLE - Contiene:
- *   - FIX v4.9.5: Clic en botón login compatible con PrimeFaces
+ *   - FIX v4.9.6: PrimeFaces.ab() con sintaxis EXACTA del onclick
  *   - analizarResultadoLogin (FIX v4.9.3)
  *   - verificarEstadoPagina (v4.9.3)
  *   - Timing post-login con reintentos (FIX v4.9.4)
@@ -16,42 +16,26 @@
  * Las funciones base están en core.js (NO TOCAR)
  * ============================================================
  * 
+ * CAMBIOS v4.9.6:
+ *   ✓ FIX CRÍTICO: PrimeFaces.ab({s:'frmLogin:btnIngresar'}) - SIN parámetros extras
+ *   ✓ v4.9.5 falló porque usó parámetros incorrectos (f, u, onco)
+ *   ✓ Diagnóstico inicial muestra estado de PrimeFaces y botón
+ *   ✓ 6 estrategias ordenadas de más probable a menos probable
+ *   ✓ Ya NO usa form.submit() (no funciona con PrimeFaces)
+ *
  * CAMBIOS v4.9.5:
- *   ✓ FIX CRÍTICO: Clic en botón "Ingresar" ahora usa:
- *     1. Selector exacto #frmLogin:btnIngresar
- *     2. Ejecución directa de PrimeFaces.ab() vía page.evaluate()
- *     3. Fallback con submit del formulario
- *   ✓ El botón tiene onclick="PrimeFaces.ab({...});return false;"
- *     que bloqueaba el clic normal de Puppeteer
  *   ✓ Nueva función hacerClicLoginPrimeFaces() dedicada
- *   ✓ Mejor logging del proceso de clic
+ *   ✓ (FALLÓ: parámetros incorrectos en PrimeFaces.ab)
  *
  * CAMBIOS v4.9.4:
  *   ✓ FIX: Espera waitForNavigation después de clic en login
  *   ✓ FIX: Reintentos de verificación (5x, 3s entre cada uno)
  *   ✓ Solo declara login_fallido después de agotar reintentos
- *   ✓ Logs detallados de cada intento de verificación
  *
  * CAMBIOS v4.9.3:
  *   ✓ FIX CRÍTICO: analizarResultadoLogin ya no usa page.content()
- *   ✓ NUEVA ESTRATEGIA: Verifica elementos DOM específicos del dashboard
  *   ✓ Verifica PRESENCIA de: form#frmNuevo, barra "Bienvenido(a):", botones
  *   ✓ Verifica AUSENCIA de: input[type="password"], campo CAPTCHA
- *   ✓ Consistente con navegarACasillas() (usa evaluarSeguro)
- *   ✓ Logging detallado para diagnóstico
- *
- * CAMBIOS v4.9.2:
- *   ✓ FIX: Espera 3s para que página se estabilice post-login
- *   ✓ FIX: Reintentos (3x) si evaluarSeguro retorna null
- *   ✓ Más robusto ante frames en transición
- *
- * CAMBIOS v4.9.1:
- *   ✓ FIX: navegarACasillas ya no aborta si textoExiste=false
- *   ✓ NUEVA estrategia: busca span.txtredbtn con "Casillas"
- * 
- * CAMBIOS v4.9.0:
- *   ✓ FIX: analizarResultadoLogin ya no confunde login.xhtml
- *   ✓ Código dividido en módulos para fácil mantenimiento
  * ============================================================
  */
 
@@ -455,23 +439,17 @@ async function analizarResultadoLogin(page, urlAntes, requestId) {
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * FIX v4.9.5: Hace clic en el botón "Ingresar" de SINOE
+ * FIX v4.9.6: Hace clic en el botón "Ingresar" de SINOE
  * ═══════════════════════════════════════════════════════════════════════════
  * 
- * PROBLEMA:
- *   El botón de SINOE tiene este HTML:
- *   <button id="frmLogin:btnIngresar" 
- *           onclick="PrimeFaces.ab({s:'frmLogin:btnIngresar'});return false;" 
- *           type="submit">
- *   
- *   El "return false;" bloquea el comportamiento normal del submit.
- *   Puppeteer hace clic pero el navegador cancela la acción.
+ * PROBLEMA v4.9.5:
+ *   - Usé parámetros incorrectos en PrimeFaces.ab()
+ *   - El form.submit() NO funciona con PrimeFaces (necesita AJAX)
  * 
- * SOLUCIÓN:
- *   1. Buscar el botón por su ID exacto
- *   2. Ejecutar directamente PrimeFaces.ab() que es lo que hace el onclick
- *   3. Si falla, intentar submit directo del formulario
- *   4. Como último recurso, hacer clic normal + Enter
+ * SOLUCIÓN v4.9.6:
+ *   - Usar EXACTAMENTE la misma sintaxis del onclick: PrimeFaces.ab({s:'frmLogin:btnIngresar'})
+ *   - Si falla, simular clic nativo de JavaScript (no Puppeteer)
+ *   - Agregar logs detallados para diagnóstico
  * 
  * @param {Page} page - Instancia de Puppeteer page
  * @param {string} requestId - ID para logging
@@ -479,208 +457,195 @@ async function analizarResultadoLogin(page, urlAntes, requestId) {
  * ═══════════════════════════════════════════════════════════════════════════
  */
 async function hacerClicLoginPrimeFaces(page, requestId) {
-  log('info', `LOGIN:${requestId}`, 'Ejecutando clic en botón login (PrimeFaces)...');
+  log('info', `LOGIN:${requestId}`, 'Ejecutando clic en botón login (PrimeFaces v4.9.6)...');
   
   // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 1: Ejecutar PrimeFaces.ab() directamente
-  // Esta es la manera correcta de interactuar con PrimeFaces
+  // DIAGNÓSTICO INICIAL: Ver qué hay en la página
+  // ═══════════════════════════════════════════════════════════════════
+  
+  const diagnostico = await page.evaluate(() => {
+    const boton = document.getElementById('frmLogin:btnIngresar');
+    return {
+      botonExiste: !!boton,
+      botonId: boton?.id || null,
+      botonOnclick: boton?.getAttribute('onclick') || null,
+      primeFacesExiste: typeof PrimeFaces !== 'undefined',
+      primeFacesAbExiste: typeof PrimeFaces !== 'undefined' && typeof PrimeFaces.ab === 'function',
+      formExiste: !!document.getElementById('frmLogin')
+    };
+  });
+  
+  log('info', `LOGIN:${requestId}`, 'Diagnóstico inicial:', diagnostico);
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 1: Ejecutar EXACTAMENTE lo que está en el onclick
+  // onclick="PrimeFaces.ab({s:'frmLogin:btnIngresar'});return false;"
   // ═══════════════════════════════════════════════════════════════════
   
   try {
-    const resultadoPF = await page.evaluate(() => {
-      // Verificar que PrimeFaces existe
-      if (typeof PrimeFaces === 'undefined') {
-        return { exito: false, error: 'PrimeFaces no está definido' };
-      }
-      
-      // Verificar que el botón existe
-      const boton = document.getElementById('frmLogin:btnIngresar');
-      if (!boton) {
-        return { exito: false, error: 'Botón frmLogin:btnIngresar no encontrado' };
-      }
-      
-      // Ejecutar la función de PrimeFaces directamente
-      // Esto es exactamente lo que hace el onclick del botón
+    const resultado1 = await page.evaluate(() => {
       try {
-        PrimeFaces.ab({
-          s: 'frmLogin:btnIngresar',
-          f: 'frmLogin',           // Formulario
-          u: 'frmLogin',           // Update
-          onco: function(xhr, status, args) {} // Callback vacío
-        });
-        return { exito: true, metodo: 'primefaces_ab_directo' };
-      } catch (pfError) {
-        return { exito: false, error: `PrimeFaces.ab() falló: ${pfError.message}` };
-      }
-    });
-    
-    if (resultadoPF.exito) {
-      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado con método: ${resultadoPF.metodo}`);
-      return resultadoPF;
-    }
-    
-    log('warn', `LOGIN:${requestId}`, `Estrategia 1 falló: ${resultadoPF.error}`);
-  } catch (error) {
-    log('warn', `LOGIN:${requestId}`, `Error en estrategia 1: ${error.message}`);
-  }
-  
-  // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 2: Ejecutar el onclick del botón manualmente
-  // ═══════════════════════════════════════════════════════════════════
-  
-  try {
-    const resultadoOnclick = await page.evaluate(() => {
-      const boton = document.getElementById('frmLogin:btnIngresar');
-      if (!boton) {
-        return { exito: false, error: 'Botón no encontrado' };
-      }
-      
-      // Obtener y ejecutar el onclick como string
-      const onclickAttr = boton.getAttribute('onclick');
-      if (onclickAttr && onclickAttr.includes('PrimeFaces.ab')) {
-        // Extraer solo la parte de PrimeFaces.ab(...) sin el return false
-        const match = onclickAttr.match(/PrimeFaces\.ab\(\{[^}]+\}\)/);
-        if (match) {
-          try {
-            eval(match[0]);
-            return { exito: true, metodo: 'onclick_eval' };
-          } catch (evalError) {
-            return { exito: false, error: `eval falló: ${evalError.message}` };
-          }
+        // Verificar que todo existe
+        if (typeof PrimeFaces === 'undefined') {
+          return { exito: false, error: 'PrimeFaces no existe' };
         }
-      }
-      
-      return { exito: false, error: 'onclick no contiene PrimeFaces.ab válido' };
-    });
-    
-    if (resultadoOnclick.exito) {
-      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado con método: ${resultadoOnclick.metodo}`);
-      return resultadoOnclick;
-    }
-    
-    log('warn', `LOGIN:${requestId}`, `Estrategia 2 falló: ${resultadoOnclick.error}`);
-  } catch (error) {
-    log('warn', `LOGIN:${requestId}`, `Error en estrategia 2: ${error.message}`);
-  }
-  
-  // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 3: Submit directo del formulario con AJAX de PrimeFaces
-  // ═══════════════════════════════════════════════════════════════════
-  
-  try {
-    const resultadoSubmit = await page.evaluate(() => {
-      const form = document.getElementById('frmLogin');
-      if (!form) {
-        return { exito: false, error: 'Formulario frmLogin no encontrado' };
-      }
-      
-      // Intentar enviar vía PrimeFaces si está disponible
-      if (typeof PrimeFaces !== 'undefined' && PrimeFaces.ajax) {
-        try {
-          PrimeFaces.ajax.Request.handle({
-            formId: 'frmLogin',
-            source: 'frmLogin:btnIngresar',
-            process: '@form',
-            update: '@form'
-          });
-          return { exito: true, metodo: 'primefaces_ajax_request' };
-        } catch (ajaxError) {
-          // Continuar con siguiente intento
+        if (typeof PrimeFaces.ab !== 'function') {
+          return { exito: false, error: 'PrimeFaces.ab no es función' };
         }
-      }
-      
-      // Submit directo (menos probable que funcione con PrimeFaces)
-      try {
-        form.submit();
-        return { exito: true, metodo: 'form_submit_directo' };
-      } catch (submitError) {
-        return { exito: false, error: `submit falló: ${submitError.message}` };
-      }
-    });
-    
-    if (resultadoSubmit.exito) {
-      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado con método: ${resultadoSubmit.metodo}`);
-      return resultadoSubmit;
-    }
-    
-    log('warn', `LOGIN:${requestId}`, `Estrategia 3 falló: ${resultadoSubmit.error}`);
-  } catch (error) {
-    log('warn', `LOGIN:${requestId}`, `Error en estrategia 3: ${error.message}`);
-  }
-  
-  // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 4: Clic con Puppeteer + trigger de eventos
-  // ═══════════════════════════════════════════════════════════════════
-  
-  try {
-    // Buscar el botón por varios selectores
-    const selectores = [
-      '#frmLogin\\:btnIngresar',              // ID exacto (escapado)
-      'button[id="frmLogin:btnIngresar"]',    // ID como atributo
-      '#frmLogin button[type="submit"]',      // Submit dentro del form
-      'button.ui-button[type="submit"]',      // Clase UI + submit
-      'button:has-text("Ingresar")'           // Por texto (solo Playwright)
-    ];
-    
-    let botonEncontrado = null;
-    for (const selector of selectores) {
-      try {
-        botonEncontrado = await page.$(selector);
-        if (botonEncontrado) {
-          log('info', `LOGIN:${requestId}`, `Botón encontrado con selector: ${selector}`);
-          break;
-        }
+        
+        // EJECUTAR EXACTAMENTE lo que hace el onclick del botón
+        // Sin parámetros extras, sin modificaciones
+        PrimeFaces.ab({s:'frmLogin:btnIngresar'});
+        
+        return { exito: true, metodo: 'primefaces_ab_exacto' };
       } catch (e) {
-        // Selector puede no ser válido, continuar
+        return { exito: false, error: e.message };
       }
-    }
+    });
     
-    if (botonEncontrado) {
-      // Hacer clic y disparar eventos manualmente
-      await botonEncontrado.click();
-      
-      // Esperar un poco y verificar si funcionó
-      await delay(500);
-      
-      // Disparar eventos adicionales por si acaso
-      await page.evaluate(() => {
-        const boton = document.getElementById('frmLogin:btnIngresar');
-        if (boton) {
-          boton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-          boton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-          boton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-        }
-      });
-      
-      log('success', `LOGIN:${requestId}`, '✓ Login ejecutado con método: puppeteer_click_eventos');
-      return { exito: true, metodo: 'puppeteer_click_eventos' };
+    if (resultado1.exito) {
+      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado1.metodo}`);
+      return resultado1;
     }
-    
-    log('warn', `LOGIN:${requestId}`, 'No se encontró el botón con ningún selector');
-  } catch (error) {
-    log('warn', `LOGIN:${requestId}`, `Error en estrategia 4: ${error.message}`);
+    log('warn', `LOGIN:${requestId}`, `Estrategia 1 falló: ${resultado1.error}`);
+  } catch (e) {
+    log('warn', `LOGIN:${requestId}`, `Estrategia 1 excepción: ${e.message}`);
   }
   
   // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 5: Enter en el campo CAPTCHA (último recurso)
+  // ESTRATEGIA 2: Simular clic nativo de JavaScript en el botón
+  // Esto dispara el onclick que contiene PrimeFaces.ab()
   // ═══════════════════════════════════════════════════════════════════
   
   try {
-    log('info', `LOGIN:${requestId}`, 'Intentando Enter como último recurso...');
-    await page.keyboard.press('Enter');
+    const resultado2 = await page.evaluate(() => {
+      try {
+        const boton = document.getElementById('frmLogin:btnIngresar');
+        if (!boton) {
+          return { exito: false, error: 'Botón no encontrado' };
+        }
+        
+        // Método 1: click() nativo
+        boton.click();
+        
+        return { exito: true, metodo: 'boton_click_nativo' };
+      } catch (e) {
+        return { exito: false, error: e.message };
+      }
+    });
     
-    log('success', `LOGIN:${requestId}`, '✓ Login ejecutado con método: keyboard_enter');
-    return { exito: true, metodo: 'keyboard_enter' };
-  } catch (error) {
-    log('error', `LOGIN:${requestId}`, `Error en estrategia 5: ${error.message}`);
+    if (resultado2.exito) {
+      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado2.metodo}`);
+      return resultado2;
+    }
+    log('warn', `LOGIN:${requestId}`, `Estrategia 2 falló: ${resultado2.error}`);
+  } catch (e) {
+    log('warn', `LOGIN:${requestId}`, `Estrategia 2 excepción: ${e.message}`);
   }
   
-  // Si llegamos aquí, ninguna estrategia funcionó
-  return { 
-    exito: false, 
-    metodo: 'ninguno', 
-    error: 'Todas las estrategias de clic fallaron' 
-  };
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 3: Disparar evento MouseEvent completo
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    const resultado3 = await page.evaluate(() => {
+      try {
+        const boton = document.getElementById('frmLogin:btnIngresar');
+        if (!boton) {
+          return { exito: false, error: 'Botón no encontrado' };
+        }
+        
+        // Crear evento de clic completo
+        const evento = new MouseEvent('click', {
+          view: window,
+          bubbles: true,
+          cancelable: true,
+          buttons: 1
+        });
+        
+        boton.dispatchEvent(evento);
+        
+        return { exito: true, metodo: 'dispatch_mouse_event' };
+      } catch (e) {
+        return { exito: false, error: e.message };
+      }
+    });
+    
+    if (resultado3.exito) {
+      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado3.metodo}`);
+      return resultado3;
+    }
+    log('warn', `LOGIN:${requestId}`, `Estrategia 3 falló: ${resultado3.error}`);
+  } catch (e) {
+    log('warn', `LOGIN:${requestId}`, `Estrategia 3 excepción: ${e.message}`);
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 4: Extraer y ejecutar el onclick como string
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    const resultado4 = await page.evaluate(() => {
+      try {
+        const boton = document.getElementById('frmLogin:btnIngresar');
+        if (!boton) {
+          return { exito: false, error: 'Botón no encontrado' };
+        }
+        
+        const onclick = boton.getAttribute('onclick');
+        if (!onclick) {
+          return { exito: false, error: 'Sin atributo onclick' };
+        }
+        
+        // Ejecutar el onclick directamente (incluye el return false, pero no importa)
+        // El onclick es: "PrimeFaces.ab({s:'frmLogin:btnIngresar'});return false;"
+        eval(onclick);
+        
+        return { exito: true, metodo: 'eval_onclick_completo', onclick: onclick };
+      } catch (e) {
+        return { exito: false, error: e.message };
+      }
+    });
+    
+    if (resultado4.exito) {
+      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado4.metodo}`);
+      return resultado4;
+    }
+    log('warn', `LOGIN:${requestId}`, `Estrategia 4 falló: ${resultado4.error}`);
+  } catch (e) {
+    log('warn', `LOGIN:${requestId}`, `Estrategia 4 excepción: ${e.message}`);
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 5: Clic con Puppeteer directamente
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    const boton = await page.$('#frmLogin\\:btnIngresar');
+    if (boton) {
+      await boton.click();
+      log('success', `LOGIN:${requestId}`, '✓ Login ejecutado: puppeteer_click');
+      return { exito: true, metodo: 'puppeteer_click' };
+    } else {
+      log('warn', `LOGIN:${requestId}`, 'Estrategia 5: Botón no encontrado con Puppeteer');
+    }
+  } catch (e) {
+    log('warn', `LOGIN:${requestId}`, `Estrategia 5 excepción: ${e.message}`);
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 6: Presionar Enter (último recurso)
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    await page.keyboard.press('Enter');
+    log('success', `LOGIN:${requestId}`, '✓ Login ejecutado: keyboard_enter');
+    return { exito: true, metodo: 'keyboard_enter' };
+  } catch (e) {
+    log('error', `LOGIN:${requestId}`, `Estrategia 6 excepción: ${e.message}`);
+  }
+  
+  return { exito: false, metodo: 'ninguno', error: 'Todas las estrategias fallaron' };
 }
 
 // ============================================================
@@ -1272,7 +1237,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     // ═══════════════════════════════════════════════════════════════════
     const urlAntes = await leerUrlSegura(page) || SINOE_URLS.login;
     
-    log('info', `SCRAPER:${requestId}`, 'Ejecutando login (FIX v4.9.5 - PrimeFaces)...');
+    log('info', `SCRAPER:${requestId}`, 'Ejecutando login (FIX v4.9.6 - PrimeFaces sintaxis exacta)...');
     
     const resultadoClic = await hacerClicLoginPrimeFaces(page, requestId);
     
@@ -1630,8 +1595,8 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.9.5',
-    fix: 'Clic login PrimeFaces',
+    version: '4.9.6',
+    fix: 'PrimeFaces sintaxis exacta',
     uptime: Math.floor(process.uptime()),
     sesionesActivas: sesionesActivas.size
   });
@@ -1774,7 +1739,7 @@ app.post('/test-whatsapp', async (req, res) => {
     
     const resultado = await enviarWhatsAppTexto(
       validacion.numero, 
-      mensaje || '🤖 Mensaje de prueba de LEXA Scraper v4.9.5'
+      mensaje || '🤖 Mensaje de prueba de LEXA Scraper v4.9.6'
     );
     
     res.json({ success: resultado, numero: enmascarar(validacion.numero) });
@@ -2021,39 +1986,27 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.9.5 - FIX CLIC LOGIN PRIMEFACES             ║
+║           LEXA SCRAPER SERVICE v4.9.6 - FIX PRIMEFACES SINTAXIS               ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${String(PORT).padEnd(70)}║
 ║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
 ║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
 ║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  FIX v4.9.5 - CLIC LOGIN PRIMEFACES:                                          ║
+║  FIX v4.9.6 - PRIMEFACES SINTAXIS EXACTA:                                     ║
 ║                                                                               ║
-║    ✓ Nueva función hacerClicLoginPrimeFaces() dedicada                        ║
-║    ✓ Ejecuta PrimeFaces.ab() directamente (evita return false)                ║
-║    ✓ 5 estrategias de fallback para máxima compatibilidad                     ║
-║    ✓ Nuevo endpoint /test-clic-login para diagnóstico                         ║
+║    ✓ PrimeFaces.ab({s:'frmLogin:btnIngresar'}) - SIN parámetros extras        ║
+║    ✓ Diagnóstico inicial muestra estado de PrimeFaces y botón                 ║
+║    ✓ 6 estrategias de clic (ya NO usa form.submit())                          ║
+║    ✓ v4.9.5 falló por parámetros incorrectos (f, u, onco)                     ║
 ║                                                                               ║
-║  FIX v4.9.4 - TIMING POST-LOGIN:                                              ║
-║                                                                               ║
-║    ✓ Espera waitForNavigation después del clic en login                       ║
-║    ✓ Reintentos de verificación (5x con 3s entre cada uno)                    ║
-║    ✓ Solo declara "login_fallido" después de agotar reintentos                ║
-║                                                                               ║
-║  FIX v4.9.3 - VERIFICACIÓN DE LOGIN:                                          ║
-║                                                                               ║
-║    ✓ analizarResultadoLogin() usa DOM, no page.content()                      ║
-║    ✓ Verifica PRESENCIA de: form#frmNuevo, barra Bienvenido, botones          ║
-║    ✓ Verifica AUSENCIA de: input[type="password"], campo CAPTCHA              ║
-║                                                                               ║
-║  ESTRATEGIAS DE BÚSQUEDA CASILLAS (6):                                        ║
-║    1. ID exacto: #frmNuevo:j_idt38                                            ║
-║    2. span.txtredbtn → enlace padre                                           ║
-║    3. a.ui-commandlink con texto "casillas"                                   ║
-║    4. a[onclick*="submit"] con texto "casillas"                               ║
-║    5. div.btnservicios → enlace padre                                         ║
-║    6. Primer enlace frmNuevo (último recurso)                                 ║
+║  ESTRATEGIAS DE CLIC LOGIN (6):                                               ║
+║    1. PrimeFaces.ab({s:'frmLogin:btnIngresar'}) - exacto del onclick          ║
+║    2. boton.click() - clic nativo JavaScript                                  ║
+║    3. dispatchEvent(MouseEvent) - evento completo                             ║
+║    4. eval(onclick) - ejecutar atributo onclick                               ║
+║    5. Puppeteer click - clic con selector                                     ║
+║    6. keyboard.press('Enter') - último recurso                                ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                                   ║
 ║    GET  /health              POST /scraper           GET  /metricas           ║
