@@ -1,41 +1,29 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.9.6 - FIX PRIMEFACES SINTAXIS
+ * LEXA SCRAPER SERVICE v4.9.9 - FIX SESIÓN ACTIVA COMPLETO
  * ============================================================
  * 
- * ARCHIVO MODIFICABLE - Contiene:
- *   - FIX v4.9.6: PrimeFaces.ab() con sintaxis EXACTA del onclick
- *   - analizarResultadoLogin (FIX v4.9.3)
- *   - verificarEstadoPagina (v4.9.3)
- *   - Timing post-login con reintentos (FIX v4.9.4)
- *   - navegarACasillas (FIX v4.9.2)
- *   - Navegación SINOE post-login
- *   - Endpoints HTTP
- *   - Servidor Express
- * 
- * Las funciones base están en core.js (NO TOCAR)
- * ============================================================
- * 
- * CAMBIOS v4.9.6:
- *   ✓ FIX CRÍTICO: PrimeFaces.ab({s:'frmLogin:btnIngresar'}) - SIN parámetros extras
- *   ✓ v4.9.5 falló porque usó parámetros incorrectos (f, u, onco)
- *   ✓ Diagnóstico inicial muestra estado de PrimeFaces y botón
- *   ✓ 6 estrategias ordenadas de más probable a menos probable
- *   ✓ Ya NO usa form.submit() (no funciona con PrimeFaces)
+ * CAMBIOS v4.9.9:
+ *   ✓ FIX CRÍTICO: Manejo correcto de "Sesión Activa" (~10% de casos)
+ *   ✓ Después de FINALIZAR SESIONES, SINOE siempre redirige a login
+ *   ✓ Se rellenan credenciales automáticamente
+ *   ✓ Se envía NUEVO CAPTCHA al usuario por WhatsApp
+ *   ✓ Usuario responde → Login exitoso en segundo intento
+ *   ✓ Código unificado y profesional (sin if/else redundante)
  *
- * CAMBIOS v4.9.5:
- *   ✓ Nueva función hacerClicLoginPrimeFaces() dedicada
- *   ✓ (FALLÓ: parámetros incorrectos en PrimeFaces.ab)
+ * FLUJO SESIÓN ACTIVA:
+ *   1. Detecta sesión activa
+ *   2. Clic en "FINALIZAR SESIONES"
+ *   3. SINOE redirige a login (comportamiento normal)
+ *   4. Rellena credenciales automáticamente
+ *   5. Captura y envía NUEVO CAPTCHA
+ *   6. Usuario responde
+ *   7. Login exitoso
  *
- * CAMBIOS v4.9.4:
- *   ✓ FIX: Espera waitForNavigation después de clic en login
- *   ✓ FIX: Reintentos de verificación (5x, 3s entre cada uno)
- *   ✓ Solo declara login_fallido después de agotar reintentos
- *
- * CAMBIOS v4.9.3:
- *   ✓ FIX CRÍTICO: analizarResultadoLogin ya no usa page.content()
- *   ✓ Verifica PRESENCIA de: form#frmNuevo, barra "Bienvenido(a):", botones
- *   ✓ Verifica AUSENCIA de: input[type="password"], campo CAPTCHA
+ * CAMBIOS v4.9.7-v4.9.8:
+ *   ✓ Detección de errores sin falsos positivos
+ *   ✓ Verificación de CAPTCHA escrito
+ *   ✓ jQuery .trigger('click') para PrimeFaces
  * ============================================================
  */
 
@@ -180,22 +168,76 @@ async function verificarEstadoPagina(page) {
                               bodyText.toLowerCase().includes('finalizar sesión');
     
     // ═══════════════════════════════════════════════════════════════════
-    // INDICADORES DE ERROR
+    // INDICADORES DE ERROR - FIX v4.9.7: Detección más específica
     // ═══════════════════════════════════════════════════════════════════
     
     const bodyLower = bodyText.toLowerCase();
-    const tieneMensajeCaptchaIncorrecto = 
-      (bodyLower.includes('captcha') && 
-       (bodyLower.includes('incorrecto') || 
-        bodyLower.includes('inválido') ||
-        bodyLower.includes('invalido') ||
-        bodyLower.includes('erróneo') ||
-        bodyLower.includes('erroneo')));
     
-    const tieneMensajeCredencialesInvalidas = 
-      bodyLower.includes('usuario o contraseña') ||
-      bodyLower.includes('credenciales') ||
-      bodyLower.includes('datos incorrectos');
+    // Buscar mensajes de error de PrimeFaces (más específicos)
+    const mensajesError = document.querySelectorAll(
+      '.ui-messages-error, .ui-message-error, .ui-growl-item-error, ' +
+      '[class*="error-message"], [class*="mensaje-error"], ' +
+      '.alert-danger, .error'
+    );
+    
+    let textoMensajesError = '';
+    mensajesError.forEach(msg => {
+      textoMensajesError += ' ' + (msg.innerText || '').toLowerCase();
+    });
+    
+    // CAPTCHA incorrecto: buscar en mensajes de error específicos O frases exactas
+    // NO solo buscar palabras sueltas en todo el body
+    const frasesErrorCaptcha = [
+      'captcha incorrecto',
+      'captcha inválido',
+      'captcha invalido',
+      'código captcha incorrecto',
+      'codigo captcha incorrecto',
+      'captcha erróneo',
+      'captcha erroneo',
+      'el captcha no es correcto',
+      'captcha no coincide',
+      'verifique el captcha'
+    ];
+    
+    let tieneMensajeCaptchaIncorrecto = false;
+    
+    // Primero buscar en mensajes de error de PrimeFaces
+    for (const frase of frasesErrorCaptcha) {
+      if (textoMensajesError.includes(frase)) {
+        tieneMensajeCaptchaIncorrecto = true;
+        break;
+      }
+    }
+    
+    // Si no encontró en mensajes de error, buscar frases exactas en el body
+    // (NO buscar palabras sueltas que causan falsos positivos)
+    if (!tieneMensajeCaptchaIncorrecto) {
+      for (const frase of frasesErrorCaptcha) {
+        if (bodyLower.includes(frase)) {
+          tieneMensajeCaptchaIncorrecto = true;
+          break;
+        }
+      }
+    }
+    
+    // Credenciales inválidas: también buscar frases específicas
+    const frasesErrorCredenciales = [
+      'usuario o contraseña incorrecto',
+      'credenciales inválidas',
+      'credenciales invalidas',
+      'datos de acceso incorrectos',
+      'usuario no encontrado',
+      'contraseña incorrecta'
+    ];
+    
+    let tieneMensajeCredencialesInvalidas = false;
+    for (const frase of frasesErrorCredenciales) {
+      if (textoMensajesError.includes(frase) || bodyLower.includes(frase)) {
+        tieneMensajeCredencialesInvalidas = true;
+        break;
+      }
+    }
     
     // ═══════════════════════════════════════════════════════════════════
     // RESULTADO CONSOLIDADO
@@ -235,7 +277,9 @@ async function verificarEstadoPagina(page) {
       // Indicadores de error
       errores: {
         captchaIncorrecto: tieneMensajeCaptchaIncorrecto,
-        credencialesInvalidas: tieneMensajeCredencialesInvalidas
+        credencialesInvalidas: tieneMensajeCredencialesInvalidas,
+        // Debug: mostrar texto de mensajes de error encontrados
+        textoMensajesError: textoMensajesError.substring(0, 200).trim()
       },
       
       // Extracto del body para debug (primeros 300 chars)
@@ -439,17 +483,18 @@ async function analizarResultadoLogin(page, urlAntes, requestId) {
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * FIX v4.9.6: Hace clic en el botón "Ingresar" de SINOE
+ * FIX v4.9.7: Hace clic en el botón "Ingresar" de SINOE
  * ═══════════════════════════════════════════════════════════════════════════
  * 
- * PROBLEMA v4.9.5:
- *   - Usé parámetros incorrectos en PrimeFaces.ab()
- *   - El form.submit() NO funciona con PrimeFaces (necesita AJAX)
+ * PROBLEMA v4.9.5/v4.9.6:
+ *   - PrimeFaces.ab() falla desde page.evaluate() con error interno
+ *   - El onclick del botón necesita contexto de evento "real"
+ *   - form.submit() no funciona porque PrimeFaces usa AJAX
  * 
- * SOLUCIÓN v4.9.6:
- *   - Usar EXACTAMENTE la misma sintaxis del onclick: PrimeFaces.ab({s:'frmLogin:btnIngresar'})
- *   - Si falla, simular clic nativo de JavaScript (no Puppeteer)
- *   - Agregar logs detallados para diagnóstico
+ * SOLUCIÓN v4.9.7:
+ *   - SINOE usa jQuery (requerido por PrimeFaces)
+ *   - jQuery.click() o .trigger('click') simula un clic "real"
+ *   - También probar con event handlers nativos más completos
  * 
  * @param {Page} page - Instancia de Puppeteer page
  * @param {string} requestId - ID para logging
@@ -457,10 +502,10 @@ async function analizarResultadoLogin(page, urlAntes, requestId) {
  * ═══════════════════════════════════════════════════════════════════════════
  */
 async function hacerClicLoginPrimeFaces(page, requestId) {
-  log('info', `LOGIN:${requestId}`, 'Ejecutando clic en botón login (PrimeFaces v4.9.6)...');
+  log('info', `LOGIN:${requestId}`, 'Ejecutando clic en botón login (v4.9.7 - jQuery)...');
   
   // ═══════════════════════════════════════════════════════════════════
-  // DIAGNÓSTICO INICIAL: Ver qué hay en la página
+  // DIAGNÓSTICO INICIAL
   // ═══════════════════════════════════════════════════════════════════
   
   const diagnostico = await page.evaluate(() => {
@@ -469,82 +514,86 @@ async function hacerClicLoginPrimeFaces(page, requestId) {
       botonExiste: !!boton,
       botonId: boton?.id || null,
       botonOnclick: boton?.getAttribute('onclick') || null,
+      jQueryExiste: typeof jQuery !== 'undefined' || typeof $ !== 'undefined',
+      jQueryVersion: typeof jQuery !== 'undefined' ? jQuery.fn.jquery : null,
       primeFacesExiste: typeof PrimeFaces !== 'undefined',
-      primeFacesAbExiste: typeof PrimeFaces !== 'undefined' && typeof PrimeFaces.ab === 'function',
       formExiste: !!document.getElementById('frmLogin')
     };
   });
   
-  log('info', `LOGIN:${requestId}`, 'Diagnóstico inicial:', diagnostico);
+  log('info', `LOGIN:${requestId}`, 'Diagnóstico:', diagnostico);
   
   // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 1: Ejecutar EXACTAMENTE lo que está en el onclick
-  // onclick="PrimeFaces.ab({s:'frmLogin:btnIngresar'});return false;"
+  // ESTRATEGIA 1: jQuery .trigger('click') - más probable que funcione
+  // jQuery simula un evento de clic completo que PrimeFaces puede manejar
   // ═══════════════════════════════════════════════════════════════════
   
-  try {
-    const resultado1 = await page.evaluate(() => {
-      try {
-        // Verificar que todo existe
-        if (typeof PrimeFaces === 'undefined') {
-          return { exito: false, error: 'PrimeFaces no existe' };
+  if (diagnostico.jQueryExiste) {
+    try {
+      const resultado1 = await page.evaluate(() => {
+        try {
+          const jq = typeof jQuery !== 'undefined' ? jQuery : $;
+          const boton = jq('#frmLogin\\:btnIngresar');
+          
+          if (boton.length === 0) {
+            return { exito: false, error: 'Botón no encontrado con jQuery' };
+          }
+          
+          // Trigger completo del evento click
+          boton.trigger('click');
+          
+          return { exito: true, metodo: 'jquery_trigger_click' };
+        } catch (e) {
+          return { exito: false, error: e.message };
         }
-        if (typeof PrimeFaces.ab !== 'function') {
-          return { exito: false, error: 'PrimeFaces.ab no es función' };
-        }
-        
-        // EJECUTAR EXACTAMENTE lo que hace el onclick del botón
-        // Sin parámetros extras, sin modificaciones
-        PrimeFaces.ab({s:'frmLogin:btnIngresar'});
-        
-        return { exito: true, metodo: 'primefaces_ab_exacto' };
-      } catch (e) {
-        return { exito: false, error: e.message };
+      });
+      
+      if (resultado1.exito) {
+        log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado1.metodo}`);
+        return resultado1;
       }
-    });
-    
-    if (resultado1.exito) {
-      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado1.metodo}`);
-      return resultado1;
+      log('warn', `LOGIN:${requestId}`, `Estrategia 1 (jQuery trigger) falló: ${resultado1.error}`);
+    } catch (e) {
+      log('warn', `LOGIN:${requestId}`, `Estrategia 1 excepción: ${e.message}`);
     }
-    log('warn', `LOGIN:${requestId}`, `Estrategia 1 falló: ${resultado1.error}`);
-  } catch (e) {
-    log('warn', `LOGIN:${requestId}`, `Estrategia 1 excepción: ${e.message}`);
   }
   
   // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 2: Simular clic nativo de JavaScript en el botón
-  // Esto dispara el onclick que contiene PrimeFaces.ab()
+  // ESTRATEGIA 2: jQuery .click() directo
   // ═══════════════════════════════════════════════════════════════════
   
-  try {
-    const resultado2 = await page.evaluate(() => {
-      try {
-        const boton = document.getElementById('frmLogin:btnIngresar');
-        if (!boton) {
-          return { exito: false, error: 'Botón no encontrado' };
+  if (diagnostico.jQueryExiste) {
+    try {
+      const resultado2 = await page.evaluate(() => {
+        try {
+          const jq = typeof jQuery !== 'undefined' ? jQuery : $;
+          const boton = jq('#frmLogin\\:btnIngresar');
+          
+          if (boton.length === 0) {
+            return { exito: false, error: 'Botón no encontrado' };
+          }
+          
+          boton.click();
+          
+          return { exito: true, metodo: 'jquery_click' };
+        } catch (e) {
+          return { exito: false, error: e.message };
         }
-        
-        // Método 1: click() nativo
-        boton.click();
-        
-        return { exito: true, metodo: 'boton_click_nativo' };
-      } catch (e) {
-        return { exito: false, error: e.message };
+      });
+      
+      if (resultado2.exito) {
+        log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado2.metodo}`);
+        return resultado2;
       }
-    });
-    
-    if (resultado2.exito) {
-      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado2.metodo}`);
-      return resultado2;
+      log('warn', `LOGIN:${requestId}`, `Estrategia 2 (jQuery click) falló: ${resultado2.error}`);
+    } catch (e) {
+      log('warn', `LOGIN:${requestId}`, `Estrategia 2 excepción: ${e.message}`);
     }
-    log('warn', `LOGIN:${requestId}`, `Estrategia 2 falló: ${resultado2.error}`);
-  } catch (e) {
-    log('warn', `LOGIN:${requestId}`, `Estrategia 2 excepción: ${e.message}`);
   }
   
   // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 3: Disparar evento MouseEvent completo
+  // ESTRATEGIA 3: Llamar al onclick del botón directamente con call()
+  // Esto ejecuta la función onclick en el contexto del botón
   // ═══════════════════════════════════════════════════════════════════
   
   try {
@@ -555,17 +604,15 @@ async function hacerClicLoginPrimeFaces(page, requestId) {
           return { exito: false, error: 'Botón no encontrado' };
         }
         
-        // Crear evento de clic completo
-        const evento = new MouseEvent('click', {
-          view: window,
-          bubbles: true,
-          cancelable: true,
-          buttons: 1
-        });
+        // Si tiene onclick como función, ejecutarla en contexto del botón
+        if (typeof boton.onclick === 'function') {
+          // Crear un evento fake para pasarle
+          const fakeEvent = { preventDefault: () => {}, stopPropagation: () => {} };
+          boton.onclick.call(boton, fakeEvent);
+          return { exito: true, metodo: 'onclick_call' };
+        }
         
-        boton.dispatchEvent(evento);
-        
-        return { exito: true, metodo: 'dispatch_mouse_event' };
+        return { exito: false, error: 'onclick no es función' };
       } catch (e) {
         return { exito: false, error: e.message };
       }
@@ -575,13 +622,13 @@ async function hacerClicLoginPrimeFaces(page, requestId) {
       log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado3.metodo}`);
       return resultado3;
     }
-    log('warn', `LOGIN:${requestId}`, `Estrategia 3 falló: ${resultado3.error}`);
+    log('warn', `LOGIN:${requestId}`, `Estrategia 3 (onclick.call) falló: ${resultado3.error}`);
   } catch (e) {
     log('warn', `LOGIN:${requestId}`, `Estrategia 3 excepción: ${e.message}`);
   }
   
   // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 4: Extraer y ejecutar el onclick como string
+  // ESTRATEGIA 4: HTMLElement.click() nativo
   // ═══════════════════════════════════════════════════════════════════
   
   try {
@@ -592,16 +639,9 @@ async function hacerClicLoginPrimeFaces(page, requestId) {
           return { exito: false, error: 'Botón no encontrado' };
         }
         
-        const onclick = boton.getAttribute('onclick');
-        if (!onclick) {
-          return { exito: false, error: 'Sin atributo onclick' };
-        }
+        boton.click();
         
-        // Ejecutar el onclick directamente (incluye el return false, pero no importa)
-        // El onclick es: "PrimeFaces.ab({s:'frmLogin:btnIngresar'});return false;"
-        eval(onclick);
-        
-        return { exito: true, metodo: 'eval_onclick_completo', onclick: onclick };
+        return { exito: true, metodo: 'native_click' };
       } catch (e) {
         return { exito: false, error: e.message };
       }
@@ -611,38 +651,97 @@ async function hacerClicLoginPrimeFaces(page, requestId) {
       log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado4.metodo}`);
       return resultado4;
     }
-    log('warn', `LOGIN:${requestId}`, `Estrategia 4 falló: ${resultado4.error}`);
+    log('warn', `LOGIN:${requestId}`, `Estrategia 4 (native click) falló: ${resultado4.error}`);
   } catch (e) {
     log('warn', `LOGIN:${requestId}`, `Estrategia 4 excepción: ${e.message}`);
   }
   
   // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 5: Clic con Puppeteer directamente
+  // ESTRATEGIA 5: MouseEvent con todas las propiedades
   // ═══════════════════════════════════════════════════════════════════
   
   try {
-    const boton = await page.$('#frmLogin\\:btnIngresar');
-    if (boton) {
-      await boton.click();
-      log('success', `LOGIN:${requestId}`, '✓ Login ejecutado: puppeteer_click');
-      return { exito: true, metodo: 'puppeteer_click' };
-    } else {
-      log('warn', `LOGIN:${requestId}`, 'Estrategia 5: Botón no encontrado con Puppeteer');
+    const resultado5 = await page.evaluate(() => {
+      try {
+        const boton = document.getElementById('frmLogin:btnIngresar');
+        if (!boton) {
+          return { exito: false, error: 'Botón no encontrado' };
+        }
+        
+        const rect = boton.getBoundingClientRect();
+        const evento = new MouseEvent('click', {
+          view: window,
+          bubbles: true,
+          cancelable: true,
+          clientX: rect.left + rect.width / 2,
+          clientY: rect.top + rect.height / 2,
+          button: 0,
+          buttons: 1,
+          relatedTarget: null
+        });
+        
+        boton.dispatchEvent(evento);
+        
+        return { exito: true, metodo: 'mouse_event_full' };
+      } catch (e) {
+        return { exito: false, error: e.message };
+      }
+    });
+    
+    if (resultado5.exito) {
+      log('success', `LOGIN:${requestId}`, `✓ Login ejecutado: ${resultado5.metodo}`);
+      return resultado5;
     }
+    log('warn', `LOGIN:${requestId}`, `Estrategia 5 (MouseEvent) falló: ${resultado5.error}`);
   } catch (e) {
     log('warn', `LOGIN:${requestId}`, `Estrategia 5 excepción: ${e.message}`);
   }
   
   // ═══════════════════════════════════════════════════════════════════
-  // ESTRATEGIA 6: Presionar Enter (último recurso)
+  // ESTRATEGIA 6: Puppeteer page.click() con coordenadas
   // ═══════════════════════════════════════════════════════════════════
   
   try {
-    await page.keyboard.press('Enter');
-    log('success', `LOGIN:${requestId}`, '✓ Login ejecutado: keyboard_enter');
-    return { exito: true, metodo: 'keyboard_enter' };
+    const boton = await page.$('#frmLogin\\:btnIngresar');
+    if (boton) {
+      // Obtener posición del botón
+      const box = await boton.boundingBox();
+      if (box) {
+        // Clic en el centro del botón
+        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+        log('success', `LOGIN:${requestId}`, '✓ Login ejecutado: puppeteer_mouse_click');
+        return { exito: true, metodo: 'puppeteer_mouse_click' };
+      }
+      
+      // Si no hay boundingBox, intentar click normal
+      await boton.click();
+      log('success', `LOGIN:${requestId}`, '✓ Login ejecutado: puppeteer_element_click');
+      return { exito: true, metodo: 'puppeteer_element_click' };
+    }
+    log('warn', `LOGIN:${requestId}`, 'Estrategia 6: Botón no encontrado con Puppeteer');
   } catch (e) {
-    log('error', `LOGIN:${requestId}`, `Estrategia 6 excepción: ${e.message}`);
+    log('warn', `LOGIN:${requestId}`, `Estrategia 6 excepción: ${e.message}`);
+  }
+  
+  // ═══════════════════════════════════════════════════════════════════
+  // ESTRATEGIA 7: Focus en campo CAPTCHA + Enter
+  // ═══════════════════════════════════════════════════════════════════
+  
+  try {
+    await page.evaluate(() => {
+      const campoCaptcha = document.querySelector('input[placeholder*="CAPTCHA"], input[id*="captcha"]');
+      if (campoCaptcha) {
+        campoCaptcha.focus();
+      }
+    });
+    
+    await delay(100);
+    await page.keyboard.press('Enter');
+    
+    log('success', `LOGIN:${requestId}`, '✓ Login ejecutado: focus_captcha_enter');
+    return { exito: true, metodo: 'focus_captcha_enter' };
+  } catch (e) {
+    log('error', `LOGIN:${requestId}`, `Estrategia 7 excepción: ${e.message}`);
   }
   
   return { exito: false, metodo: 'ninguno', error: 'Todas las estrategias fallaron' };
@@ -1226,18 +1325,74 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       throw new Error('Campo CAPTCHA no encontrado - la página pudo haber expirado');
     }
     
+    // Limpiar el campo completamente antes de escribir
     await campoCaptcha.click({ clickCount: 3 });
     await delay(100);
     await page.keyboard.press('Backspace');
     await delay(100);
-    await campoCaptcha.type(captchaTexto.toUpperCase(), { delay: 50 });
+    
+    // Escribir el CAPTCHA
+    const captchaAEscribir = captchaTexto.toUpperCase();
+    await campoCaptcha.type(captchaAEscribir, { delay: 50 });
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // FIX v4.9.7: VERIFICAR que el CAPTCHA se escribió correctamente
+    // ═══════════════════════════════════════════════════════════════════
+    await delay(200);
+    
+    const verificacionCaptcha = await page.evaluate(() => {
+      const campo = document.querySelector(
+        'input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], ' +
+        'input[placeholder*="captcha"], input[id*="captcha"]'
+      );
+      if (!campo) return { encontrado: false };
+      return {
+        encontrado: true,
+        valor: campo.value,
+        longitud: campo.value.length
+      };
+    });
+    
+    log('info', `SCRAPER:${requestId}`, 'Verificación CAPTCHA escrito:', {
+      esperado: captchaAEscribir,
+      escrito: verificacionCaptcha.valor,
+      coincide: verificacionCaptcha.valor === captchaAEscribir
+    });
+    
+    if (!verificacionCaptcha.encontrado || verificacionCaptcha.valor !== captchaAEscribir) {
+      log('warn', `SCRAPER:${requestId}`, 'CAPTCHA no se escribió correctamente, reintentando...');
+      
+      // Reintentar escribir el CAPTCHA
+      await campoCaptcha.click({ clickCount: 3 });
+      await delay(100);
+      for (let i = 0; i < 10; i++) {
+        await page.keyboard.press('Backspace');
+      }
+      await delay(100);
+      await campoCaptcha.type(captchaAEscribir, { delay: 80 });
+      await delay(200);
+      
+      // Verificar de nuevo
+      const verificacion2 = await page.evaluate(() => {
+        const campo = document.querySelector(
+          'input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], ' +
+          'input[placeholder*="captcha"], input[id*="captcha"]'
+        );
+        return campo ? campo.value : null;
+      });
+      
+      log('info', `SCRAPER:${requestId}`, 'Segunda verificación CAPTCHA:', {
+        esperado: captchaAEscribir,
+        escrito: verificacion2
+      });
+    }
     
     // ═══════════════════════════════════════════════════════════════════
     // PASO 12: FIX v4.9.5 - Hacer clic en LOGIN usando PrimeFaces
     // ═══════════════════════════════════════════════════════════════════
     const urlAntes = await leerUrlSegura(page) || SINOE_URLS.login;
     
-    log('info', `SCRAPER:${requestId}`, 'Ejecutando login (FIX v4.9.6 - PrimeFaces sintaxis exacta)...');
+    log('info', `SCRAPER:${requestId}`, 'Ejecutando login (FIX v4.9.7 - jQuery trigger)...');
     
     const resultadoClic = await hacerClicLoginPrimeFaces(page, requestId);
     
@@ -1313,43 +1468,95 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       mensaje: resultado.mensaje 
     });
     
-    // MANEJO DE SESIÓN ACTIVA
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MANEJO DE SESIÓN ACTIVA - FIX v4.9.9
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 
+    // FLUJO REAL DE SINOE (ocurre ~10% de las veces):
+    //   1. Se detecta sesión activa en la página
+    //   2. Se hace clic en "FINALIZAR SESIONES"
+    //   3. SINOE SIEMPRE redirige a la pantalla de login (comportamiento normal)
+    //   4. Hay que rellenar credenciales nuevamente
+    //   5. Hay que enviar NUEVO CAPTCHA al usuario
+    //   6. Usuario responde con el nuevo CAPTCHA
+    //   7. Se hace login y esta vez SÍ ingresa correctamente
+    //
+    // IMPORTANTE: Después de FINALIZAR SESIONES, SIEMPRE hay que reiniciar
+    // el proceso completo. No hay diferencia si "funcionó" o no el clic.
+    // ═══════════════════════════════════════════════════════════════════════════
+    
     if (resultado.tipo === 'sesion_activa') {
-      log('warn', `SCRAPER:${requestId}`, '🔄 Sesión activa detectada - finalizando automáticamente...');
+      log('warn', `SCRAPER:${requestId}`, '🔄 SESIÓN ACTIVA DETECTADA (caso normal ~10%)');
       
-      await enviarWhatsAppTexto(whatsappNumero, '⏳ Sesión activa detectada. Finalizando automáticamente...');
+      await enviarWhatsAppTexto(whatsappNumero, '⏳ Sesión activa detectada. Cerrando sesión anterior...');
       
-      const sesionFinalizada = await manejarSesionActiva(page, requestId);
+      // PASO 1: Intentar hacer clic en FINALIZAR SESIONES
+      log('info', `SCRAPER:${requestId}`, 'Intentando cerrar sesión activa...');
+      await manejarSesionActiva(page, requestId);
       
-      if (!sesionFinalizada) {
-        await enviarWhatsAppTexto(whatsappNumero, '❌ No se pudo finalizar la sesión anterior. Ciérrela manualmente en SINOE e intente de nuevo.');
-        throw new Error('No se pudo finalizar la sesión activa automáticamente');
+      // PASO 2: Esperar redirección (SINOE siempre redirige al login después de finalizar)
+      log('info', `SCRAPER:${requestId}`, 'Esperando redirección al login...');
+      await delay(3000);
+      
+      // PASO 3: Verificar estado de la página
+      let urlActual = await leerUrlSegura(page);
+      log('info', `SCRAPER:${requestId}`, `URL después de finalizar: ${urlActual}`);
+      
+      // Si no estamos en login, navegar manualmente
+      const estaEnLogin = urlActual.includes('login');
+      if (!estaEnLogin) {
+        log('info', `SCRAPER:${requestId}`, 'Navegando a página de login...');
+        try {
+          await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+        } catch (e) {
+          await page.goto(SINOE_URLS.params, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+        }
+        await delay(2000);
       }
       
-      // Reintentar login
-      log('info', `SCRAPER:${requestId}`, '🔄 Reintentando login después de finalizar sesión...');
-      
+      // PASO 4: Cerrar popups y preparar página
       await cerrarPopups(page, `SCRAPER:${requestId}`);
       await delay(1000);
       
-      await page.waitForSelector('input[type="text"], input[type="password"]', { timeout: TIMEOUT.elemento });
+      // PASO 5: Esperar campos de login
+      log('info', `SCRAPER:${requestId}`, 'Esperando campos de login...');
+      try {
+        await page.waitForSelector('input[type="password"]', { timeout: TIMEOUT.elemento });
+      } catch (e) {
+        log('warn', `SCRAPER:${requestId}`, 'Campos no visibles, refrescando...');
+        await page.reload({ waitUntil: 'networkidle2' });
+        await delay(2000);
+        await cerrarPopups(page, `SCRAPER:${requestId}`);
+        await page.waitForSelector('input[type="password"]', { timeout: TIMEOUT.elemento });
+      }
       
+      // PASO 6: Rellenar credenciales
+      log('info', `SCRAPER:${requestId}`, 'Rellenando credenciales...');
       await llenarCredenciales(page, sinoeUsuario, sinoePassword);
       await delay(1000);
       
+      // PASO 7: Asegurar CAPTCHA válido
+      log('info', `SCRAPER:${requestId}`, 'Verificando CAPTCHA...');
       await asegurarCaptchaValido(page, sinoeUsuario, sinoePassword);
       
+      // PASO 8: Capturar formulario con nuevo CAPTCHA
+      log('info', `SCRAPER:${requestId}`, 'Capturando nuevo CAPTCHA...');
       const nuevoScreenshot = await capturarFormularioLogin(page);
+      
+      // PASO 9: Enviar NUEVO CAPTCHA por WhatsApp
       await enviarWhatsAppImagen(whatsappNumero, nuevoScreenshot, 
-        `📩 ${nombreAbogado}, la sesión anterior fue cerrada.\n\nEscriba el NUEVO código CAPTCHA:\n\n⏱️ Tiene 5 minutos.`
+        `✅ Sesión anterior cerrada.\n\n📩 ${nombreAbogado}, escriba el NUEVO código CAPTCHA:\n\n⏱️ Tiene 5 minutos.\n🔒 Credenciales ya llenadas.`
       );
+      
+      // PASO 10: Esperar respuesta del usuario con nuevo CAPTCHA
+      log('info', `SCRAPER:${requestId}`, 'Esperando NUEVO CAPTCHA del usuario...');
       
       let nuevoTimeoutId = null;
       const nuevoCaptcha = await new Promise((resolve, reject) => {
         nuevoTimeoutId = setTimeout(() => {
           if (sesionesActivas.has(whatsappNumero)) {
             sesionesActivas.delete(whatsappNumero);
-            reject(new Error('Timeout: CAPTCHA no resuelto'));
+            reject(new Error('Timeout: CAPTCHA no resuelto en segundo intento'));
           }
         }, TIMEOUT.captcha);
         
@@ -1363,33 +1570,64 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       
       if (nuevoTimeoutId) clearTimeout(nuevoTimeoutId);
       
-      const nuevoCampoCaptcha = await page.$('input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[id*="captcha"]');
-      if (nuevoCampoCaptcha) {
-        await nuevoCampoCaptcha.click({ clickCount: 3 });
-        await page.keyboard.press('Backspace');
-        await nuevoCampoCaptcha.type(nuevoCaptcha.toUpperCase(), { delay: 50 });
+      log('success', `SCRAPER:${requestId}`, `CAPTCHA recibido: ${nuevoCaptcha}`);
+      
+      // PASO 11: Escribir nuevo CAPTCHA
+      log('info', `SCRAPER:${requestId}`, 'Escribiendo CAPTCHA...');
+      const campoCaptcha2 = await page.$('input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[id*="captcha"]');
+      
+      if (!campoCaptcha2) {
+        throw new Error('Campo CAPTCHA no encontrado en segundo intento');
       }
       
-      // Usar la nueva función de clic
-      const nuevoUrlAntes = await leerUrlSegura(page);
-      const nuevoResultadoClic = await hacerClicLoginPrimeFaces(page, requestId);
+      await campoCaptcha2.click({ clickCount: 3 });
+      await delay(100);
+      await page.keyboard.press('Backspace');
+      await delay(100);
       
-      if (!nuevoResultadoClic.exito) {
-        log('warn', `SCRAPER:${requestId}`, 'Clic falló en segundo intento, usando Enter...');
+      const captcha2 = nuevoCaptcha.toUpperCase();
+      await campoCaptcha2.type(captcha2, { delay: 50 });
+      
+      // Verificar escritura
+      await delay(200);
+      const valorEscrito = await page.evaluate(() => {
+        const c = document.querySelector('input[placeholder*="CAPTCHA"], input[id*="captcha"]');
+        return c ? c.value : null;
+      });
+      log('info', `SCRAPER:${requestId}`, `Verificación: esperado=${captcha2}, escrito=${valorEscrito}`);
+      
+      // PASO 12: Ejecutar login
+      log('info', `SCRAPER:${requestId}`, 'Ejecutando login (segundo intento)...');
+      const urlAntes2 = await leerUrlSegura(page);
+      const clic2 = await hacerClicLoginPrimeFaces(page, requestId);
+      
+      if (!clic2.exito) {
+        log('warn', `SCRAPER:${requestId}`, 'Clic falló, usando Enter...');
         await page.keyboard.press('Enter');
+      }
+      
+      // PASO 13: Esperar navegación
+      log('info', `SCRAPER:${requestId}`, 'Esperando respuesta de SINOE...');
+      try {
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+      } catch (e) {
+        // Timeout es normal si la página usa AJAX
       }
       
       await delay(TIMEOUT.esperaPostClick);
       await cerrarPopups(page, `SCRAPER:${requestId}`);
       
-      resultado = await analizarResultadoLogin(page, nuevoUrlAntes, requestId);
+      // PASO 14: Verificar resultado
+      log('info', `SCRAPER:${requestId}`, 'Verificando resultado del login...');
+      resultado = await analizarResultadoLogin(page, urlAntes2, requestId);
       
-      if (resultado.tipo !== 'login_exitoso') {
-        await enviarWhatsAppTexto(whatsappNumero, `❌ ${resultado.mensaje}. Intente de nuevo.`);
-        throw new Error(`Error en segundo intento: ${resultado.mensaje}`);
+      if (resultado.tipo === 'login_exitoso') {
+        log('success', `SCRAPER:${requestId}`, '✅ LOGIN EXITOSO (después de cerrar sesión anterior)');
+      } else {
+        log('error', `SCRAPER:${requestId}`, `Login falló: ${resultado.mensaje}`);
+        await enviarWhatsAppTexto(whatsappNumero, `❌ ${resultado.mensaje}. Por favor intente de nuevo.`);
+        throw new Error(`Login falló después de cerrar sesión: ${resultado.mensaje}`);
       }
-      
-      log('success', `SCRAPER:${requestId}`, 'Login exitoso en segundo intento');
     }
     
     // MANEJAR OTROS TIPOS DE RESULTADO
@@ -1595,8 +1833,8 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: '4.9.6',
-    fix: 'PrimeFaces sintaxis exacta',
+    version: '4.9.9',
+    fix: 'Sesión activa → reinicio completo → nuevo CAPTCHA',
     uptime: Math.floor(process.uptime()),
     sesionesActivas: sesionesActivas.size
   });
@@ -1739,7 +1977,7 @@ app.post('/test-whatsapp', async (req, res) => {
     
     const resultado = await enviarWhatsAppTexto(
       validacion.numero, 
-      mensaje || '🤖 Mensaje de prueba de LEXA Scraper v4.9.6'
+      mensaje || '🤖 Mensaje de prueba de LEXA Scraper v4.9.7'
     );
     
     res.json({ success: resultado, numero: enmascarar(validacion.numero) });
@@ -1986,27 +2224,27 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.9.6 - FIX PRIMEFACES SINTAXIS               ║
+║           LEXA SCRAPER SERVICE v4.9.9 - FIX SESIÓN ACTIVA COMPLETO             ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${String(PORT).padEnd(70)}║
 ║  Auth: ${(process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️').padEnd(71)}║
 ║  WhatsApp: ${(CONFIG.evolution.apiKey ? 'Configurado ✓' : 'NO CONFIGURADO ❌').padEnd(67)}║
 ║  Browserless: ${(CONFIG.browserless.token ? 'Configurado ✓' : 'Sin token ⚠️').padEnd(64)}║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║  FIX v4.9.6 - PRIMEFACES SINTAXIS EXACTA:                                     ║
+║  FIX v4.9.7 - JQUERY TRIGGER CLICK:                                           ║
 ║                                                                               ║
-║    ✓ PrimeFaces.ab({s:'frmLogin:btnIngresar'}) - SIN parámetros extras        ║
-║    ✓ Diagnóstico inicial muestra estado de PrimeFaces y botón                 ║
-║    ✓ 6 estrategias de clic (ya NO usa form.submit())                          ║
-║    ✓ v4.9.5 falló por parámetros incorrectos (f, u, onco)                     ║
+║    ✓ PrimeFaces.ab() fallaba desde page.evaluate() (error interno)            ║
+║    ✓ SINOE usa jQuery (requerido por PrimeFaces)                              ║
+║    ✓ jQuery.trigger('click') simula evento real que PrimeFaces entiende       ║
 ║                                                                               ║
-║  ESTRATEGIAS DE CLIC LOGIN (6):                                               ║
-║    1. PrimeFaces.ab({s:'frmLogin:btnIngresar'}) - exacto del onclick          ║
-║    2. boton.click() - clic nativo JavaScript                                  ║
-║    3. dispatchEvent(MouseEvent) - evento completo                             ║
-║    4. eval(onclick) - ejecutar atributo onclick                               ║
-║    5. Puppeteer click - clic con selector                                     ║
-║    6. keyboard.press('Enter') - último recurso                                ║
+║  ESTRATEGIAS DE CLIC LOGIN (7):                                               ║
+║    1. jQuery .trigger('click') - más probable que funcione                    ║
+║    2. jQuery .click()                                                         ║
+║    3. onclick.call(boton, fakeEvent)                                          ║
+║    4. HTMLElement.click() nativo                                              ║
+║    5. MouseEvent con coordenadas                                              ║
+║    6. Puppeteer mouse.click() en coordenadas                                  ║
+║    7. Focus CAPTCHA + Enter                                                   ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                                   ║
 ║    GET  /health              POST /scraper           GET  /metricas           ║
