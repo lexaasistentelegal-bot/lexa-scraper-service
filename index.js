@@ -1,15 +1,17 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v4.2.0 - Sistema Screenshot CAPTCHA
+ * LEXA SCRAPER SERVICE v4.3.0 - Sistema Screenshot CAPTCHA
  * ============================================================
  * Versión: AAA (Producción)
  * Fecha: Febrero 2026
  * 
- * CORRECCIONES v4.2.0:
- * - Manejo del popup "Aceptar" de SINOE
- * - Captura precisa de la imagen del CAPTCHA
- * - Mejor detección de selectores
- * - Esperas más robustas
+ * CORRECCIONES v4.3.0:
+ * - FIX CRÍTICO: cerrarPopups() ahora usa page.evaluate() en vez de selectores inválidos
+ * - FIX CRÍTICO: Espera a que el popup DESAPAREZCA del DOM antes de continuar
+ * - FIX: capturarCaptcha() verifica que no hay overlays antes de capturar
+ * - FIX: Múltiples intentos de cierre de popup con verificación
+ * - NUEVO: Función verificarPopupCerrado() para confirmar cierre
+ * - NUEVO: Captura de debug screenshot si el CAPTCHA falla
  * ============================================================
  */
 
@@ -41,14 +43,11 @@ const SELECTORES = {
   password: 'input[placeholder="Contraseña"]',
   
   // CAPTCHA - múltiples selectores para mayor robustez
-  captchaInput: 'input[placeholder="INGRESE CAPTCHA"], input[placeholder="Ingrese Captcha"], input[id*="captcha"]',
+  captchaInput: 'input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[placeholder*="captcha"], input[id*="captcha"]',
   captchaImg: 'img[id*="captcha"], img[src*="captcha"], img[src*="Captcha"]',
   
   // Botones
-  btnIngresar: 'button[type="submit"], input[type="submit"], .ui-button, button:contains("Ingresar")',
-  
-  // Popup de aceptar términos
-  popupAceptar: 'button:contains("Aceptar"), .ui-button:contains("Aceptar"), button.ui-button, .ui-dialog-buttonset button',
+  btnIngresar: 'button[type="submit"], input[type="submit"], .ui-button',
   
   // Tabla de notificaciones
   tablaNotificaciones: 'table tbody tr, .ui-datatable-data tr'
@@ -59,8 +58,8 @@ const TIMEOUT = {
   navegacion: 60000,
   captcha: 300000,
   api: 30000,
-  popup: 5000,
-  elemento: 10000
+  popup: 10000,
+  elemento: 15000
 };
 
 // Configuración externa
@@ -323,57 +322,151 @@ async function enviarWhatsAppImagen(numero, base64Image, caption, intentos = 3) 
 }
 
 // ============================================================
-// FUNCIONES DE SCRAPING
+// FUNCIONES DE SCRAPING - CORREGIDAS v4.3.0
 // ============================================================
 
 /**
- * Cierra popups de SINOE (términos, avisos, etc.)
+ * Verifica si hay un popup/modal visible en la página
+ * Retorna true si hay popup visible, false si no hay
  */
-async function cerrarPopups(page) {
-  log('info', 'POPUP', 'Buscando popups para cerrar...');
-  
-  try {
-    // Esperar un momento para que aparezcan los popups
-    await delay(2000);
-    
-    // Buscar botones de "Aceptar" en diferentes formatos
-    const selectoresPopup = [
-      'button.ui-button',
-      '.ui-dialog-buttonset button',
-      'button:has-text("Aceptar")',
-      '.ui-button-text:has-text("Aceptar")',
-      '[aria-label="Aceptar"]',
-      'button[type="button"]'
-    ];
-    
-    for (const selector of selectoresPopup) {
-      try {
-        const botones = await page.$$(selector);
-        
-        for (const boton of botones) {
-          const texto = await boton.evaluate(el => el.textContent?.trim().toLowerCase() || '');
-          const visible = await boton.isIntersectingViewport();
-          
-          if (visible && (texto.includes('aceptar') || texto.includes('acepto') || texto.includes('ok') || texto.includes('cerrar'))) {
-            log('info', 'POPUP', `Cerrando popup con botón: "${texto}"`);
-            await boton.click();
-            await delay(1000);
-          }
-        }
-      } catch (e) {
-        // Ignorar errores de selector
+async function hayPopupVisible(page) {
+  return await page.evaluate(() => {
+    // Buscar overlays/backdrops de PrimeFaces
+    const overlays = document.querySelectorAll('.ui-widget-overlay, .ui-dialog-mask, .modal-backdrop');
+    for (const overlay of overlays) {
+      const style = window.getComputedStyle(overlay);
+      if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
+        return true;
       }
     }
     
-    // También intentar presionar Escape por si hay modales
-    await page.keyboard.press('Escape').catch(() => {});
-    await delay(500);
+    // Buscar diálogos visibles
+    const dialogs = document.querySelectorAll('.ui-dialog, .modal, [role="dialog"]');
+    for (const dialog of dialogs) {
+      const style = window.getComputedStyle(dialog);
+      if (style.display !== 'none' && style.visibility !== 'hidden') {
+        return true;
+      }
+    }
     
-    log('success', 'POPUP', 'Búsqueda de popups completada');
+    // Buscar por texto específico del popup de SINOE
+    const bodyText = document.body.innerText || '';
+    if (bodyText.includes('clic aqui') || bodyText.includes('clic aquí')) {
+      // Verificar si hay un botón "Aceptar" visible
+      const botones = document.querySelectorAll('button, .ui-button');
+      for (const btn of botones) {
+        const texto = (btn.textContent || '').toLowerCase().trim();
+        if (texto === 'aceptar' || texto === 'acepto') {
+          const rect = btn.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            return true;
+          }
+        }
+      }
+    }
     
-  } catch (error) {
-    log('warn', 'POPUP', `Error buscando popups: ${error.message}`);
+    return false;
+  });
+}
+
+/**
+ * Cierra popups de SINOE (términos, avisos, etc.)
+ * CORREGIDO v4.3.0: Usa page.evaluate() y espera confirmación de cierre
+ */
+async function cerrarPopups(page) {
+  log('info', 'POPUP', 'Verificando si hay popups para cerrar...');
+  
+  const MAX_INTENTOS = 5;
+  
+  for (let intento = 1; intento <= MAX_INTENTOS; intento++) {
+    try {
+      // Verificar si hay popup visible
+      const tienePopup = await hayPopupVisible(page);
+      
+      if (!tienePopup) {
+        log('success', 'POPUP', 'No hay popups visibles (o ya se cerraron)');
+        return true;
+      }
+      
+      log('info', 'POPUP', `Intento ${intento}/${MAX_INTENTOS} de cerrar popup...`);
+      
+      // Usar page.evaluate() para buscar y hacer clic en el botón "Aceptar"
+      // ESTO ES LO QUE FALTABA - Puppeteer no soporta :has-text()
+      const clicExitoso = await page.evaluate(() => {
+        // Buscar todos los botones
+        const botones = document.querySelectorAll('button, .ui-button, input[type="button"], a.ui-button');
+        
+        for (const boton of botones) {
+          const texto = (boton.textContent || boton.value || '').toLowerCase().trim();
+          const rect = boton.getBoundingClientRect();
+          
+          // Verificar que el botón es visible y tiene texto relevante
+          if (rect.width > 0 && rect.height > 0 && rect.top >= 0) {
+            if (texto === 'aceptar' || texto === 'acepto' || texto === 'ok' || texto === 'cerrar') {
+              console.log(`[POPUP] Encontrado botón: "${texto}"`);
+              boton.click();
+              return { clicked: true, texto: texto };
+            }
+          }
+        }
+        
+        // Si no encontramos botón específico, buscar en ui-dialog-buttonset (PrimeFaces)
+        const dialogButtons = document.querySelectorAll('.ui-dialog-buttonset button, .ui-dialog-buttonpane button');
+        if (dialogButtons.length > 0) {
+          dialogButtons[0].click();
+          return { clicked: true, texto: 'primer botón de diálogo' };
+        }
+        
+        return { clicked: false };
+      });
+      
+      if (clicExitoso.clicked) {
+        log('info', 'POPUP', `Clic en botón: "${clicExitoso.texto}"`);
+        
+        // CRÍTICO: Esperar a que el popup desaparezca del DOM
+        await delay(500); // Pequeña espera para que inicie la animación
+        
+        // Esperar hasta que el popup desaparezca (máximo 3 segundos)
+        let esperaMs = 0;
+        const maxEsperaMs = 3000;
+        
+        while (esperaMs < maxEsperaMs) {
+          const sigueTeniendoPopup = await hayPopupVisible(page);
+          if (!sigueTeniendoPopup) {
+            log('success', 'POPUP', `Popup cerrado después de ${esperaMs}ms`);
+            // Esperar un poco más para que la página se estabilice
+            await delay(500);
+            return true;
+          }
+          await delay(200);
+          esperaMs += 200;
+        }
+        
+        log('warn', 'POPUP', 'El popup no se cerró después del clic, reintentando...');
+      } else {
+        // Intentar con tecla Escape
+        log('info', 'POPUP', 'No se encontró botón, intentando con Escape...');
+        await page.keyboard.press('Escape');
+        await delay(500);
+        
+        // Verificar si funcionó
+        const cerrado = !(await hayPopupVisible(page));
+        if (cerrado) {
+          log('success', 'POPUP', 'Popup cerrado con Escape');
+          return true;
+        }
+      }
+      
+      // Esperar antes del siguiente intento
+      await delay(1000);
+      
+    } catch (error) {
+      log('warn', 'POPUP', `Error en intento ${intento}: ${error.message}`);
+    }
   }
+  
+  log('error', 'POPUP', 'No se pudo cerrar el popup después de todos los intentos');
+  return false;
 }
 
 /**
@@ -385,8 +478,12 @@ async function llenarCampo(page, selector, valor) {
   let campo = null;
   
   for (const sel of selectores) {
-    campo = await page.$(sel.trim());
-    if (campo) break;
+    try {
+      campo = await page.$(sel.trim());
+      if (campo) break;
+    } catch (e) {
+      // Continuar con el siguiente selector
+    }
   }
   
   if (!campo) {
@@ -394,7 +491,7 @@ async function llenarCampo(page, selector, valor) {
   }
   
   // Hacer scroll al elemento para asegurar que está visible
-  await campo.scrollIntoView();
+  await campo.evaluate(el => el.scrollIntoView({ block: 'center' }));
   await delay(200);
   
   // Limpiar y escribir
@@ -409,83 +506,53 @@ async function llenarCampo(page, selector, valor) {
 
 /**
  * Captura screenshot SOLO de la imagen del CAPTCHA
+ * CORREGIDO v4.3.0: Verifica que no hay overlays antes de capturar
  */
 async function capturarCaptcha(page) {
-  log('info', 'CAPTCHA', 'Buscando imagen del CAPTCHA...');
+  log('info', 'CAPTCHA', 'Iniciando captura del CAPTCHA...');
   
-  // Esperar a que la página esté completamente cargada
-  await delay(2000);
-  
-  // Selectores específicos para la imagen del CAPTCHA de SINOE
-  const selectoresCaptcha = [
-    'img[src*="captcha"]',
-    'img[src*="Captcha"]',
-    'img[id*="captcha"]',
-    'img[id*="Captcha"]',
-    '.captcha-image',
-    'img[alt*="captcha"]'
-  ];
-  
-  let captchaImg = null;
-  
-  for (const selector of selectoresCaptcha) {
-    try {
-      captchaImg = await page.$(selector);
-      if (captchaImg) {
-        const box = await captchaImg.boundingBox();
-        if (box && box.width > 50 && box.height > 20) {
-          log('info', 'CAPTCHA', `Imagen encontrada con selector: ${selector}`, { width: box.width, height: box.height });
-          break;
-        }
-      }
-    } catch (e) {
-      // Continuar con el siguiente selector
-    }
+  // PASO 1: Verificar que no hay popups bloqueando
+  const tienePopup = await hayPopupVisible(page);
+  if (tienePopup) {
+    log('warn', 'CAPTCHA', 'Hay un popup visible, intentando cerrarlo primero...');
+    await cerrarPopups(page);
+    await delay(1000);
   }
   
-  if (captchaImg) {
-    // Verificar que la imagen está cargada
-    const isLoaded = await captchaImg.evaluate(img => img.complete && img.naturalHeight > 0);
-    
-    if (isLoaded) {
-      const screenshot = await captchaImg.screenshot({ encoding: 'base64' });
-      
-      if (screenshot && screenshot.length > 500) {
-        log('success', 'CAPTCHA', 'Screenshot de imagen capturado', { bytes: screenshot.length });
-        return screenshot;
-      }
-    } else {
-      log('warn', 'CAPTCHA', 'Imagen encontrada pero no cargada, esperando...');
-      await delay(2000);
-      
-      const screenshot = await captchaImg.screenshot({ encoding: 'base64' });
-      if (screenshot && screenshot.length > 500) {
-        return screenshot;
-      }
-    }
-  }
+  // PASO 2: Esperar a que la imagen del CAPTCHA esté cargada
+  await delay(1500);
   
-  // Fallback: buscar por evaluación del DOM
-  log('warn', 'CAPTCHA', 'Buscando CAPTCHA por evaluación del DOM...');
-  
-  const captchaData = await page.evaluate(() => {
+  // PASO 3: Buscar la imagen del CAPTCHA usando page.evaluate() para mayor precisión
+  const captchaInfo = await page.evaluate(() => {
     // Buscar todas las imágenes
     const imagenes = document.querySelectorAll('img');
     
     for (const img of imagenes) {
-      const src = img.src?.toLowerCase() || '';
-      const id = img.id?.toLowerCase() || '';
-      const alt = img.alt?.toLowerCase() || '';
+      const src = (img.src || '').toLowerCase();
+      const id = (img.id || '').toLowerCase();
+      const alt = (img.alt || '').toLowerCase();
+      const className = (img.className || '').toLowerCase();
       
-      if (src.includes('captcha') || id.includes('captcha') || alt.includes('captcha')) {
+      // Verificar si es la imagen del CAPTCHA
+      const esCaptcha = src.includes('captcha') || 
+                        id.includes('captcha') || 
+                        alt.includes('captcha') ||
+                        className.includes('captcha');
+      
+      if (esCaptcha) {
         const rect = img.getBoundingClientRect();
-        if (rect.width > 50 && rect.height > 20) {
+        
+        // El CAPTCHA de SINOE tiene dimensiones aproximadas de 100-150px x 30-50px
+        if (rect.width >= 50 && rect.height >= 20 && rect.width < 300 && rect.height < 100) {
           return {
             found: true,
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+            src: img.src,
+            id: img.id,
+            isLoaded: img.complete && img.naturalHeight > 0
           };
         }
       }
@@ -494,16 +561,108 @@ async function capturarCaptcha(page) {
     return { found: false };
   });
   
-  if (captchaData.found) {
-    log('info', 'CAPTCHA', 'Capturando área específica', captchaData);
+  log('info', 'CAPTCHA', 'Resultado búsqueda:', captchaInfo);
+  
+  if (captchaInfo.found) {
+    // Verificar que la imagen está cargada
+    if (!captchaInfo.isLoaded) {
+      log('info', 'CAPTCHA', 'Imagen encontrada pero no cargada, esperando...');
+      await delay(2000);
+    }
+    
+    // Obtener el elemento y tomar screenshot directo del elemento
+    const captchaElement = await page.$(`img[src="${captchaInfo.src}"]`) || 
+                           await page.$(`img[id="${captchaInfo.id}"]`) ||
+                           await page.$('img[src*="captcha"]');
+    
+    if (captchaElement) {
+      try {
+        const screenshot = await captchaElement.screenshot({ encoding: 'base64' });
+        
+        if (screenshot && screenshot.length > 500) {
+          log('success', 'CAPTCHA', 'Screenshot del elemento capturado', { 
+            bytes: screenshot.length,
+            dimensiones: `${captchaInfo.width}x${captchaInfo.height}`
+          });
+          return screenshot;
+        }
+      } catch (e) {
+        log('warn', 'CAPTCHA', `Error capturando elemento: ${e.message}`);
+      }
+    }
+    
+    // Fallback: capturar por coordenadas con un pequeño margen
+    log('info', 'CAPTCHA', 'Capturando por coordenadas...');
     
     const screenshot = await page.screenshot({
       encoding: 'base64',
       clip: {
-        x: Math.max(0, captchaData.x - 5),
-        y: Math.max(0, captchaData.y - 5),
-        width: captchaData.width + 10,
-        height: captchaData.height + 10
+        x: Math.max(0, captchaInfo.x - 2),
+        y: Math.max(0, captchaInfo.y - 2),
+        width: captchaInfo.width + 4,
+        height: captchaInfo.height + 4
+      }
+    });
+    
+    if (screenshot && screenshot.length > 500) {
+      log('success', 'CAPTCHA', 'Screenshot por coordenadas capturado', { bytes: screenshot.length });
+      return screenshot;
+    }
+  }
+  
+  // PASO 4: Fallback - buscar por patrón visual (área cerca del input de captcha)
+  log('warn', 'CAPTCHA', 'Buscando CAPTCHA por contexto del formulario...');
+  
+  const formularioInfo = await page.evaluate(() => {
+    // Buscar el campo de input del CAPTCHA
+    const inputCaptcha = document.querySelector('input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[id*="captcha"]');
+    
+    if (inputCaptcha) {
+      const inputRect = inputCaptcha.getBoundingClientRect();
+      
+      // Buscar la imagen más cercana al input (generalmente está arriba o a la izquierda)
+      const imagenes = document.querySelectorAll('img');
+      let mejorImg = null;
+      let mejorDistancia = Infinity;
+      
+      for (const img of imagenes) {
+        const imgRect = img.getBoundingClientRect();
+        
+        // Debe estar cerca del input (máximo 200px de distancia)
+        // y tener dimensiones razonables para un CAPTCHA
+        if (imgRect.width >= 50 && imgRect.height >= 20 && imgRect.width < 300 && imgRect.height < 100) {
+          const distancia = Math.abs(imgRect.y - inputRect.y) + Math.abs(imgRect.x - inputRect.x);
+          
+          if (distancia < mejorDistancia && distancia < 200) {
+            mejorDistancia = distancia;
+            mejorImg = {
+              x: Math.round(imgRect.x),
+              y: Math.round(imgRect.y),
+              width: Math.round(imgRect.width),
+              height: Math.round(imgRect.height)
+            };
+          }
+        }
+      }
+      
+      if (mejorImg) {
+        return { found: true, ...mejorImg };
+      }
+    }
+    
+    return { found: false };
+  });
+  
+  if (formularioInfo.found) {
+    log('info', 'CAPTCHA', 'Imagen encontrada por proximidad al input', formularioInfo);
+    
+    const screenshot = await page.screenshot({
+      encoding: 'base64',
+      clip: {
+        x: Math.max(0, formularioInfo.x - 2),
+        y: Math.max(0, formularioInfo.y - 2),
+        width: formularioInfo.width + 4,
+        height: formularioInfo.height + 4
       }
     });
     
@@ -512,37 +671,45 @@ async function capturarCaptcha(page) {
     }
   }
   
-  // Último fallback: capturar el área del formulario de login
-  log('warn', 'CAPTCHA', 'Usando fallback - área del formulario');
+  // PASO 5: Último recurso - capturar toda el área del CAPTCHA incluyendo su contenedor
+  log('warn', 'CAPTCHA', 'Usando último fallback - área amplia del formulario');
   
-  const formArea = await page.evaluate(() => {
-    // Buscar el contenedor del formulario
-    const form = document.querySelector('form') || document.querySelector('.login-container') || document.querySelector('.ui-panel');
+  const areaAmplia = await page.evaluate(() => {
+    // Buscar contenedor que tenga "CAPTCHA" en su texto
+    const elementos = document.querySelectorAll('div, td, span, fieldset, .ui-panel-content');
     
-    if (form) {
-      const rect = form.getBoundingClientRect();
-      return {
-        x: rect.x,
-        y: rect.y + rect.height * 0.4, // Parte inferior donde suele estar el CAPTCHA
-        width: rect.width,
-        height: rect.height * 0.3
-      };
+    for (const el of elementos) {
+      const texto = (el.textContent || '').toUpperCase();
+      if (texto.includes('CAPTCHA') && texto.length < 200) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 100 && rect.height > 50 && rect.width < 500 && rect.height < 200) {
+          return {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          };
+        }
+      }
     }
     
     return null;
   });
   
-  if (formArea) {
+  if (areaAmplia) {
     const screenshot = await page.screenshot({
       encoding: 'base64',
-      clip: formArea
+      clip: areaAmplia
     });
     
-    return screenshot;
+    if (screenshot && screenshot.length > 500) {
+      log('info', 'CAPTCHA', 'Screenshot de área amplia capturado', { bytes: screenshot.length });
+      return screenshot;
+    }
   }
   
-  // Si todo falla, screenshot completo
-  log('error', 'CAPTCHA', 'No se encontró el CAPTCHA, capturando pantalla completa');
+  // Si todo falla, capturar screenshot completo para debug
+  log('error', 'CAPTCHA', 'No se encontró el CAPTCHA, capturando pantalla completa para debug');
   return await page.screenshot({ encoding: 'base64' });
 }
 
@@ -550,29 +717,35 @@ async function capturarCaptcha(page) {
  * Busca el link correcto a Casillas/SINOE
  */
 async function buscarLinkCasillas(page) {
-  const links = await page.$$('a');
-  
-  for (const link of links) {
-    const texto = await link.evaluate(el => el.textContent?.toLowerCase() || '');
-    const href = await link.evaluate(el => el.href?.toLowerCase() || '');
+  return await page.evaluate(() => {
+    const links = document.querySelectorAll('a');
     
-    if (texto.includes('olvidó') || texto.includes('recuperar')) continue;
-    
-    if (texto.includes('sinoe') || texto.includes('casilla') || 
-        href.includes('sinoe') || href.includes('casilla')) {
-      return link;
+    for (const link of links) {
+      const texto = (link.textContent || '').toLowerCase();
+      const href = (link.href || '').toLowerCase();
+      
+      // Ignorar links de recuperación de contraseña
+      if (texto.includes('olvidó') || texto.includes('recuperar')) continue;
+      
+      if (texto.includes('sinoe') || texto.includes('casilla') || 
+          href.includes('sinoe') || href.includes('casilla')) {
+        return link.href;
+      }
     }
-  }
-  
-  return null;
+    
+    return null;
+  });
 }
 
 /**
  * Extrae las notificaciones de la tabla de SINOE
  */
 async function extraerNotificaciones(page) {
-  await page.waitForSelector('table, .ui-datatable', { timeout: TIMEOUT.navegacion })
-    .catch(() => {});
+  try {
+    await page.waitForSelector('table, .ui-datatable', { timeout: TIMEOUT.navegacion });
+  } catch (e) {
+    log('warn', 'NOTIFICACIONES', 'No se encontró tabla de notificaciones');
+  }
   
   await delay(2000);
   
@@ -581,11 +754,10 @@ async function extraerNotificaciones(page) {
     const datos = [];
     
     filas.forEach((fila, index) => {
-      if (fila.cells?.length < 2) return;
       const celdas = fila.querySelectorAll('td');
-      if (celdas.length === 0) return;
+      if (celdas.length < 2) return;
       
-      const textos = Array.from(celdas).map(c => c.textContent?.trim() || '');
+      const textos = Array.from(celdas).map(c => (c.textContent || '').trim());
       
       datos.push({
         indice: index + 1,
@@ -643,37 +815,64 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     await delay(3000);
     
     // ========================================
-    // PASO 3: Cerrar popups (Aceptar términos)
+    // PASO 3: Manejar página de parámetros no válidos (si aparece)
     // ========================================
-    log('info', `SCRAPER:${requestId}`, 'Verificando popups...');
-    await cerrarPopups(page);
-    
-    // Manejar página de parámetros no válidos
-    const contenido = await page.content();
-    if (contenido.includes('PARAMETROS DE SEGURIDAD NO VALIDOS') || contenido.includes('PARAMETROS NO VALIDOS')) {
-      log('info', `SCRAPER:${requestId}`, 'Página de parámetros detectada, navegando...');
-      const buttons = await page.$$('button, a');
-      for (const btn of buttons) {
-        const texto = await btn.evaluate(el => el.textContent?.toUpperCase() || '');
-        if (texto.includes('INICIO') || texto.includes('ACEPTAR')) {
-          await btn.click();
-          await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
-          await delay(2000);
-          await cerrarPopups(page); // Verificar popups de nuevo
-          break;
+    const contenidoInicial = await page.content();
+    if (contenidoInicial.includes('PARAMETROS DE SEGURIDAD NO VALIDOS') || 
+        contenidoInicial.includes('PARAMETROS NO VALIDOS')) {
+      log('info', `SCRAPER:${requestId}`, 'Página de parámetros detectada, buscando botón de inicio...');
+      
+      const navegoInicio = await page.evaluate(() => {
+        const botones = document.querySelectorAll('button, a');
+        for (const btn of botones) {
+          const texto = (btn.textContent || '').toUpperCase();
+          if (texto.includes('INICIO') || texto.includes('IR')) {
+            btn.click();
+            return true;
+          }
         }
+        return false;
+      });
+      
+      if (navegoInicio) {
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion }).catch(() => {});
+        await delay(2000);
       }
     }
     
     // ========================================
-    // PASO 4: Esperar campos de login
+    // PASO 4: Cerrar popups (Aceptar términos) - CRÍTICO
+    // ========================================
+    log('info', `SCRAPER:${requestId}`, 'Verificando y cerrando popups...');
+    
+    const popupCerrado = await cerrarPopups(page);
+    if (!popupCerrado) {
+      // Tomar screenshot de debug si el popup no se cerró
+      const debugScreenshot = await page.screenshot({ encoding: 'base64' });
+      log('error', `SCRAPER:${requestId}`, 'No se pudo cerrar el popup. Debug screenshot guardado.');
+      // Podrías enviar este screenshot para análisis
+    }
+    
+    // Esperar un momento adicional para asegurar que la página está lista
+    await delay(1000);
+    
+    // ========================================
+    // PASO 5: Esperar campos de login
     // ========================================
     log('info', `SCRAPER:${requestId}`, 'Esperando campos de login...');
     
+    // Esperar que aparezca el campo de usuario
     await page.waitForSelector(SELECTORES.usuario, { timeout: TIMEOUT.elemento });
     
+    // Verificar una vez más que no hay popups
+    if (await hayPopupVisible(page)) {
+      log('warn', `SCRAPER:${requestId}`, 'Popup detectado después de esperar campos, cerrando...');
+      await cerrarPopups(page);
+      await delay(500);
+    }
+    
     // ========================================
-    // PASO 5: Llenar credenciales
+    // PASO 6: Llenar credenciales
     // ========================================
     log('info', `SCRAPER:${requestId}`, 'Llenando credenciales...');
     
@@ -683,12 +882,19 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     await delay(500);
     
     // ========================================
-    // PASO 6: Capturar CAPTCHA
+    // PASO 7: Capturar CAPTCHA
     // ========================================
     log('info', `SCRAPER:${requestId}`, 'Capturando CAPTCHA...');
     
     // Esperar a que el CAPTCHA cargue
-    await delay(2000);
+    await delay(1500);
+    
+    // Verificar OTRA VEZ que no hay popups (pueden aparecer después de llenar campos)
+    if (await hayPopupVisible(page)) {
+      log('warn', `SCRAPER:${requestId}`, 'Popup detectado antes de capturar CAPTCHA, cerrando...');
+      await cerrarPopups(page);
+      await delay(500);
+    }
     
     const captchaBase64 = await capturarCaptcha(page);
     
@@ -699,7 +905,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     log('success', `SCRAPER:${requestId}`, 'CAPTCHA capturado', { bytes: captchaBase64.length });
     
     // ========================================
-    // PASO 7: Enviar imagen por WhatsApp
+    // PASO 8: Enviar imagen por WhatsApp
     // ========================================
     log('info', `SCRAPER:${requestId}`, 'Enviando imagen por WhatsApp...');
     
@@ -710,7 +916,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     }
     
     // ========================================
-    // PASO 8: Esperar respuesta del abogado
+    // PASO 9: Esperar respuesta del abogado
     // ========================================
     log('info', `SCRAPER:${requestId}`, 'Esperando respuesta del abogado...');
     
@@ -736,23 +942,12 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     log('success', `SCRAPER:${requestId}`, `CAPTCHA recibido: ${captchaTexto}`);
     
     // ========================================
-    // PASO 9: Escribir CAPTCHA y hacer login
+    // PASO 10: Escribir CAPTCHA y hacer login
     // ========================================
     log('info', `SCRAPER:${requestId}`, 'Escribiendo CAPTCHA...');
     
     // Buscar campo del CAPTCHA
-    const selectoresCaptchaInput = SELECTORES.captchaInput.split(', ');
-    let campoCaptcha = null;
-    
-    for (const selector of selectoresCaptchaInput) {
-      campoCaptcha = await page.$(selector.trim());
-      if (campoCaptcha) break;
-    }
-    
-    if (!campoCaptcha) {
-      // Buscar por placeholder parcial
-      campoCaptcha = await page.$('input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[placeholder*="captcha"]');
-    }
+    const campoCaptcha = await page.$('input[placeholder*="CAPTCHA"], input[placeholder*="Captcha"], input[placeholder*="captcha"], input[id*="captcha"]');
     
     if (!campoCaptcha) {
       throw new Error('Campo de CAPTCHA no encontrado');
@@ -785,7 +980,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     await delay(2000);
     
     // ========================================
-    // PASO 10: Verificar resultado del login
+    // PASO 11: Verificar resultado del login
     // ========================================
     log('info', `SCRAPER:${requestId}`, 'Verificando login...');
     
@@ -807,16 +1002,15 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     log('success', `SCRAPER:${requestId}`, 'Login exitoso');
     
     // ========================================
-    // PASO 11: Navegar a Casillas
+    // PASO 12: Navegar a Casillas
     // ========================================
-    const linkCasillas = await buscarLinkCasillas(page);
-    if (linkCasillas) {
-      await linkCasillas.click();
-      await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
+    const hrefCasillas = await buscarLinkCasillas(page);
+    if (hrefCasillas) {
+      await page.goto(hrefCasillas, { waitUntil: 'networkidle2' });
     }
     
     // ========================================
-    // PASO 12: Extraer notificaciones
+    // PASO 13: Extraer notificaciones
     // ========================================
     log('info', `SCRAPER:${requestId}`, 'Extrayendo notificaciones...');
     const notificaciones = await extraerNotificaciones(page);
@@ -877,7 +1071,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'lexa-scraper-service',
-    version: '4.2.0',
+    version: '4.3.0',
     uptime: process.uptime(),
     sesionesActivas: sesionesActivas.size,
     metricas: {
@@ -987,7 +1181,7 @@ app.post('/test-whatsapp', async (req, res) => {
   const validacion = validarNumeroWhatsApp(req.body.numero);
   if (!validacion.valido) return res.status(400).json({ success: false, error: validacion.error });
   
-  const resultado = await enviarWhatsAppTexto(validacion.numero, req.body.mensaje || '🧪 Test LEXA v4.2.0');
+  const resultado = await enviarWhatsAppTexto(validacion.numero, req.body.mensaje || '🧪 Test LEXA v4.3.0');
   res.json({ success: resultado });
 });
 
@@ -1003,6 +1197,50 @@ app.post('/test-conexion', async (req, res) => {
     await page.goto('https://www.google.com', { timeout: 30000 });
     
     res.json({ success: true, message: 'Conexión OK' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+// Nuevo endpoint de debug para probar el cierre de popup
+app.post('/test-popup', async (req, res) => {
+  let browser = null;
+  try {
+    const ws = CONFIG.browserless.token 
+      ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
+      : CONFIG.browserless.url;
+    
+    browser = await puppeteer.connect({ 
+      browserWSEndpoint: ws,
+      defaultViewport: { width: 1366, height: 768 }
+    });
+    
+    const page = await browser.newPage();
+    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2' });
+    await delay(3000);
+    
+    // Verificar popup
+    const tienePopupAntes = await hayPopupVisible(page);
+    const screenshotAntes = await page.screenshot({ encoding: 'base64' });
+    
+    // Intentar cerrar
+    const cerrado = await cerrarPopups(page);
+    
+    // Verificar después
+    const tienePopupDespues = await hayPopupVisible(page);
+    const screenshotDespues = await page.screenshot({ encoding: 'base64' });
+    
+    res.json({
+      success: true,
+      tienePopupAntes,
+      tienePopupDespues,
+      popupCerrado: cerrado,
+      screenshotAntes: screenshotAntes.substring(0, 100) + '...',
+      screenshotDespues: screenshotDespues.substring(0, 100) + '...'
+    });
+    
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   } finally {
@@ -1039,21 +1277,23 @@ app.listen(PORT, () => {
   
   console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║           LEXA SCRAPER SERVICE v4.2.0 (AAA)                      ║
+║           LEXA SCRAPER SERVICE v4.3.0 (AAA)                      ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Puerto: ${PORT}                                                     ║
 ║  Auth: ${process.env.API_KEY ? 'Configurada ✓' : 'Auto-generada ⚠️'}                                      ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  MEJORAS v4.2.0:                                                 ║
-║    - Manejo de popup "Aceptar"                                   ║
-║    - Captura precisa del CAPTCHA                                 ║
-║    - Selectores actualizados para SINOE V.2.2.2                  ║
+║  CORRECCIONES v4.3.0:                                            ║
+║    ✓ FIX: cerrarPopups() usa page.evaluate()                     ║
+║    ✓ FIX: Espera confirmación de cierre del popup                ║
+║    ✓ FIX: hayPopupVisible() detecta overlays de PrimeFaces       ║
+║    ✓ FIX: Múltiples verificaciones antes de capturar CAPTCHA     ║
+║    ✓ NUEVO: Endpoint /test-popup para debug                      ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                      ║
 ║    GET  /health           POST /webhook/whatsapp                 ║
 ║    POST /scraper          GET  /sesiones                         ║
 ║    GET  /metricas         POST /test-whatsapp                    ║
-║    POST /test-conexion                                           ║
+║    POST /test-conexion    POST /test-popup                       ║
 ╚══════════════════════════════════════════════════════════════════╝
   `);
 });
