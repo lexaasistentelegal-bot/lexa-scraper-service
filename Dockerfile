@@ -1,13 +1,12 @@
 # =============================================================================
-# LEXA Scraper Service v5.0.0
+# LEXA Scraper Service v5.0.1
 # Dockerfile para deployment en EasyPanel/Docker
 # =============================================================================
-
 FROM node:20-alpine
 
 # Metadata
 LABEL maintainer="LEXA Asistente Legal"
-LABEL version="5.0.0"
+LABEL version="5.0.1"
 LABEL description="SINOE Scraper - Automatización de notificaciones judiciales"
 
 # Configurar timezone Lima
@@ -23,7 +22,9 @@ WORKDIR /app
 COPY package*.json ./
 
 # Instalar dependencias de producción
-RUN npm ci --only=production && \
+# NOTA: Usamos 'npm install' en vez de 'npm ci' porque no tenemos package-lock.json
+# --omit=dev reemplaza el deprecado --only=production
+RUN npm install --omit=dev && \
     npm cache clean --force
 
 # Copiar código fuente
