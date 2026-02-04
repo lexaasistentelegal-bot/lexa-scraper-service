@@ -1,6 +1,6 @@
 /**
  * ════════════════════════════════════════════════════════════════════════════════
- * EXTRACCIÓN v2.0.0 - SINOE SCRAPER
+ * EXTRACCIÓN v2.0.2 - SINOE SCRAPER
  * ════════════════════════════════════════════════════════════════════════════════
  * 
  * Autor: LEXA Assistant (CTO)
@@ -521,9 +521,11 @@ async function extraerNotificaciones(page, requestId) {
       }
       
       // ── Construir objeto de notificación ──
+      // Protección contra dataRi vacío o inválido
+      const indiceNumerico = parseInt(dataRi, 10);
       const notificacion = {
-        indice: parseInt(dataRi, 10),
-        dataRi: dataRi,
+        indice: Number.isNaN(indiceNumerico) ? 0 : indiceNumerico,
+        dataRi: dataRi || '0',
         numeroNotificacion: textos[columnas.numeroNotificacion] || '',
         expediente: textos[columnas.expediente] || '',
         sumilla: textos[columnas.sumilla] || '',
@@ -1028,7 +1030,9 @@ async function cerrarModal(page, requestId) {
           botonX.click();
         }
         return { exito: true, metodo: 'boton_X' };
-      } catch (e) {}
+      } catch (e) {
+        // Continuar con siguiente estrategia si falla
+      }
     }
     
     // ── Estrategia 2: Botón "Cerrar" ──
@@ -1043,7 +1047,9 @@ async function cerrarModal(page, requestId) {
             btn.click();
           }
           return { exito: true, metodo: 'boton_cerrar' };
-        } catch (e) {}
+        } catch (e) {
+          // Continuar con siguiente botón si falla
+        }
       }
     }
     
@@ -1170,7 +1176,9 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
       // Intentar cerrar modal si quedó abierto
       try {
         await cerrarModal(page, requestId);
-      } catch (e) {}
+      } catch (closeError) {
+        // Ignorar error al cerrar - ya estamos en manejo de error
+      }
     }
     
     resultado.detalles.push(detalle);
