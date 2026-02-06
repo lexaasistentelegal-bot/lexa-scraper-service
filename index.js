@@ -677,14 +677,18 @@ app.post('/webhook/whatsapp', (req, res) => {
       // Limpiar mensaje (solo alfanumérico)
       const captcha = mensaje.trim().replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
       
+      // CAPTCHAs de SINOE tienen 4-8 caracteres alfanuméricos.
+      // Mensajes cortos (1-3 chars como "1", "2", "2.1") son opciones de menú,
+      // NO intentos de CAPTCHA. Dejar que n8n los procese como menú.
       if (captcha.length >= 4 && captcha.length <= 8) {
         log('success', 'WEBHOOK', `CAPTCHA válido recibido: ${captcha}`);
         sesion.resolve(captcha);
         return res.json({ status: 'captcha_recibido', captcha });
       } else {
-        log('warn', 'WEBHOOK', `CAPTCHA inválido: ${captcha}`);
-        enviarWhatsAppTexto(numero, '⚠️ El código debe tener entre 4 y 8 caracteres alfanuméricos.');
-        return res.json({ status: 'captcha_invalido' });
+        // Mensaje corto = probablemente opción de menú, NO CAPTCHA
+        // Devolver sin_sesion_activa para que n8n lo procese como menú
+        log('info', 'WEBHOOK', `Mensaje corto "${mensaje}" durante sesión activa - delegando a menú n8n`);
+        return res.json({ status: 'sin_sesion_activa', razon: 'mensaje_no_es_captcha' });
       }
     }
     
