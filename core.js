@@ -385,6 +385,12 @@ async function enviarWhatsAppImagen(numero, base64, caption) {
       })
     });
     
+    if (!response.ok) {
+      const errorBody = await response.text();
+      log('error', 'WHATSAPP', `Evolution API respondió ${response.status} en sendMedia`, { errorBody });
+      return false;
+    }
+    
     log('success', 'WHATSAPP', 'Imagen enviada', { numero: enmascarar(numero), size: base64.length });
     return true;
   } catch (error) {
