@@ -1,22 +1,23 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v5.0.0
+ * LEXA SCRAPER SERVICE v5.1.0
  * ============================================================
  * 
- * Arquitectura modular:
- *   - core.js          → Configuración, utilidades, WhatsApp
- *   - flujo-estable.js → Pasos 10-13 (NO TOCAR)
- *   - extraccion.js    → Pasos 14-15 (MODIFICAR AQUÍ)
- *   - index.js         → Orquestación + API REST (ESTE ARCHIVO)
+ * CORRECCIONES v5.1.0:
+ *   ✓ FIX BUG-001: Nombres de campos compatibles con documentación
+ *     (acepta sinoeUsuario/usuario, sinoePassword/password, etc.)
+ *   ✓ FIX BUG-002: Endpoint /scraper ahora es SÍNCRONO
+ *     (n8n espera resultado con timeout 5 min, no fire-and-forget)
+ *   ✓ FIX BUG-003: Formato de respuesta coincide con documentación
+ *     (success/pdfs/totalNotificaciones en vez de exito/notificaciones)
+ *   ✓ FIX BUG-004: req.socket en vez de req.connection (deprecated)
+ *   ✓ FIX BUG-005: SIGTERM con cleanup de sesiones activas
  * 
- * Flujo completo:
- *   1-9.   Conexión, navegación, credenciales, CAPTCHA, WhatsApp
- *   10.    Escribir CAPTCHA en campo ✅
- *   11.    Hacer clic en "Ingresar" ✅
- *   12.    Verificar dashboard (5 reintentos) ✅
- *   13.    Navegar a "Casillas Electrónicas" ✅
- *   14.    Extraer notificaciones (extraccion.js)
- *   15.    Descargar consolidados (extraccion.js)
+ * Arquitectura modular:
+ *   - core.js          → Configuración, utilidades, WhatsApp (NO TOCAR)
+ *   - flujo-estable.js → Pasos 10-13 (NO TOCAR)
+ *   - extraccion.js    → Pasos 14-15 (NO TOCAR)
+ *   - index.js         → Orquestación + API REST (ESTE ARCHIVO)
  * ============================================================
  */
 
@@ -28,13 +29,8 @@ const crypto = require('crypto');
 // IMPORTAR MÓDULOS
 // ============================================================
 
-// Módulo base (configuración, utilidades, WhatsApp)
 const core = require('./core');
-
-// Módulo de flujo estable (pasos 10-13) - NO MODIFICAR
 const flujoEstable = require('./flujo-estable');
-
-// Módulo de extracción (pasos 14-15) - MODIFICAR AQUÍ
 const extraccion = require('./extraccion');
 
 // ============================================================
@@ -72,16 +68,16 @@ const {
   capturarFormularioLogin
 } = core;
 
-// De flujo-estable.js (Pasos 10-13) - NO MODIFICAR
+// De flujo-estable.js (Pasos 10-13)
 const {
-  escribirCaptchaEnCampo,      // Paso 10
-  hacerClicLoginPrimeFaces,    // Paso 11
-  analizarResultadoLogin,      // Paso 12
-  navegarACasillas,            // Paso 13
+  escribirCaptchaEnCampo,
+  hacerClicLoginPrimeFaces,
+  analizarResultadoLogin,
+  navegarACasillas,
   verificarEstadoPagina
 } = flujoEstable;
 
-// De extraccion.js (Pasos 14-15) - MODIFICAR AQUÍ
+// De extraccion.js (Pasos 14-15)
 const {
   esperarTablaCargada,
   extraerNotificaciones,
@@ -114,10 +110,11 @@ const autenticar = (req, res, next) => {
 
 // ============================================================
 // MIDDLEWARE DE RATE LIMITING
+// FIX BUG-004: req.socket en vez de req.connection (deprecated)
 // ============================================================
 
 const rateLimiter = (req, res, next) => {
-  const ip = req.ip || req.connection.remoteAddress;
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
   const ahora = Date.now();
   
   if (!rateLimitCache.has(ip)) {
@@ -145,11 +142,10 @@ const rateLimiter = (req, res, next) => {
 
 // ============================================================
 // FUNCIÓN PRINCIPAL DEL SCRAPER
+// FIX BUG-003: Retorna formato compatible con documentación
+//   { success, pdfs, totalNotificaciones, mensaje, timestamp }
 // ============================================================
 
-/**
- * Ejecuta el flujo completo del scraper SINOE.
- */
 async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado }) {
   let browser = null;
   let page = null;
@@ -175,7 +171,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     });
     
     page = await browser.newPage();
-    page.setDefaultNavigationTimeout(TIMEOUT.navegacion);
+    page.setDefaultTimeout(TIMEOUT.navegacion);
     
     log('success', `SCRAPER:${requestId}`, 'Conectado a Browserless');
     
@@ -253,11 +249,29 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     // ═══════════════════════════════════════════════════════════════════
     log('info', `SCRAPER:${requestId}`, 'Enviando imagen por WhatsApp...');
     
+    // FIX: Limpiar prefijo data: si existe (Evolution API requiere base64 crudo)
+    let base64Limpio = screenshotBase64;
+    if (base64Limpio.startsWith('data:')) {
+      base64Limpio = base64Limpio.split(',')[1] || base64Limpio;
+      log('info', `SCRAPER:${requestId}`, 'Prefijo data: eliminado del base64');
+    }
+    
+    // Log de diagnóstico del base64
+    log('info', `SCRAPER:${requestId}`, `Base64 preview: ${base64Limpio.substring(0, 50)}...`);
+    log('info', `SCRAPER:${requestId}`, `Base64 tamaño: ${base64Limpio.length} chars`);
+    
     const caption = `📩 ${nombreAbogado}, escriba el código CAPTCHA que ve en la imagen y envíelo como respuesta.\n\n⏱️ Tiene 5 minutos.\n🔒 Credenciales ya llenadas.`;
     
-    if (!await enviarWhatsAppImagen(whatsappNumero, screenshotBase64, caption)) {
-      throw new Error('No se pudo enviar la imagen por WhatsApp');
+    if (!await enviarWhatsAppImagen(whatsappNumero, base64Limpio, caption)) {
+      // Fallback: intentar enviar solo texto si la imagen falla
+      log('warn', `SCRAPER:${requestId}`, 'Imagen falló, intentando enviar texto de aviso...');
+      await enviarWhatsAppTexto(whatsappNumero, 
+        `📩 ${nombreAbogado}, no se pudo enviar la imagen del CAPTCHA.\n\n⚠️ Abra SINOE manualmente o intente de nuevo.`
+      );
+      throw new Error('No se pudo enviar la imagen del CAPTCHA por WhatsApp');
     }
+    
+    log('success', `SCRAPER:${requestId}`, 'Imagen del CAPTCHA enviada por WhatsApp');
     
     // ═══════════════════════════════════════════════════════════════════
     // ESPERAR RESPUESTA DEL ABOGADO (CAPTCHA)
@@ -405,7 +419,13 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       
       const nuevoScreenshot = await capturarFormularioLogin(page);
       
-      await enviarWhatsAppImagen(whatsappNumero, nuevoScreenshot, 
+      // FIX: Limpiar prefijo data: del segundo screenshot también
+      let nuevoBase64 = nuevoScreenshot;
+      if (nuevoBase64 && nuevoBase64.startsWith('data:')) {
+        nuevoBase64 = nuevoBase64.split(',')[1] || nuevoBase64;
+      }
+      
+      await enviarWhatsAppImagen(whatsappNumero, nuevoBase64, 
         `✅ Sesión anterior cerrada.\n\n📩 ${nombreAbogado}, escriba el NUEVO código CAPTCHA:\n\n⏱️ Tiene 5 minutos.`
       );
       
@@ -512,10 +532,13 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       metricas.scrapersExitosos++;
       const tiempoTotal = Math.round((Date.now() - inicioMs) / 1000);
       
+      // FIX BUG-003: Formato de respuesta compatible con documentación
       return {
-        exito: true,
+        success: true,
+        pdfs: [],
+        totalNotificaciones: 0,
         mensaje: 'Sin notificaciones pendientes',
-        notificaciones: [],
+        timestamp: new Date().toISOString(),
         tiempoSegundos: tiempoTotal
       };
     }
@@ -550,11 +573,24 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       `✅ Proceso completado\n\n📊 Resumen:\n• ${notificaciones.length} notificaciones\n• ${resultadoDescargas.exitosas} documentos descargados\n• Tiempo: ${tiempoTotal}s`
     );
     
+    // FIX BUG-003: Formato de respuesta compatible con documentación
+    // Mapear notificaciones al formato "pdfs" que espera n8n
+    const pdfs = notificaciones.map(n => ({
+      expediente: n.expediente || '',
+      juzgado: n.juzgado || '',
+      fecha: n.fecha || '',
+      archivo: n.pdf || n.archivo || '',
+      nombre: n.nombreArchivo || `${(n.expediente || 'doc').replace(/\//g, '_')}.pdf`
+    }));
+    
     return {
-      exito: true,
-      mensaje: 'Scraping completado',
-      notificaciones,
-      descargas: resultadoDescargas,
+      success: true,
+      pdfs,
+      totalNotificaciones: notificaciones.length,
+      descargasExitosas: resultadoDescargas.exitosas,
+      descargasFallidas: resultadoDescargas.fallidas,
+      mensaje: `${notificaciones.length} notificaciones procesadas`,
+      timestamp: new Date().toISOString(),
       tiempoSegundos: tiempoTotal
     };
     
@@ -562,9 +598,23 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     metricas.scrapersFallidos++;
     log('error', `SCRAPER:${requestId}`, `Error: ${error.message}`);
     
+    // FIX BUG-003: Formato de error compatible con documentación
+    // Detectar fase del error para que n8n pueda tomar decisiones
+    let fase = 'desconocido';
+    const msg = error.message.toLowerCase();
+    if (msg.includes('captcha') && msg.includes('timeout')) fase = 'captcha';
+    else if (msg.includes('captcha')) fase = 'captcha';
+    else if (msg.includes('credencial') || msg.includes('password')) fase = 'credenciales';
+    else if (msg.includes('browserless') || msg.includes('connect')) fase = 'conexion';
+    else if (msg.includes('sesion') || msg.includes('sesión')) fase = 'sesion_activa';
+    else if (msg.includes('casilla') || msg.includes('navegar')) fase = 'navegacion';
+    else if (msg.includes('login')) fase = 'login';
+    
     return {
-      exito: false,
+      success: false,
       error: error.message,
+      fase,
+      timestamp: new Date().toISOString(),
       tiempoSegundos: Math.round((Date.now() - inicioMs) / 1000)
     };
     
@@ -598,7 +648,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '5.0.0',
+    version: '5.1.0',
     modulos: ['core.js', 'flujo-estable.js', 'extraccion.js'],
     uptime: process.uptime(),
     timestamp: new Date().toISOString()
@@ -640,13 +690,15 @@ app.post('/webhook/whatsapp', (req, res) => {
     }
     webhooksRecientes.set(webhookId, Date.now());
     
-    // Extraer mensaje
+    // Extraer mensaje — soportar múltiples formatos de Evolution API
     let mensaje = null;
     let numero = null;
     
-    // Formato Evolution API
     if (body.data?.message?.conversation) {
       mensaje = body.data.message.conversation;
+      numero = body.data.key?.remoteJid?.replace('@s.whatsapp.net', '');
+    } else if (body.data?.message?.extendedTextMessage?.text) {
+      mensaje = body.data.message.extendedTextMessage.text;
       numero = body.data.key?.remoteJid?.replace('@s.whatsapp.net', '');
     } else if (body.message?.conversation) {
       mensaje = body.message.conversation;
@@ -657,11 +709,23 @@ app.post('/webhook/whatsapp', (req, res) => {
       return res.json({ status: 'ignorado', razon: 'sin mensaje o número' });
     }
     
+    // Ignorar mensajes propios (fromMe)
+    if (body.data?.key?.fromMe || body.key?.fromMe) {
+      return res.json({ status: 'ignorado', razon: 'mensaje propio' });
+    }
+    
     log('info', 'WEBHOOK', `Mensaje de ${enmascarar(numero)}: ${mensaje}`);
     
     // Verificar si hay sesión activa para este número
     if (sesionesActivas.has(numero)) {
       const sesion = sesionesActivas.get(numero);
+      
+      // Verificar que la sesión no expiró
+      if (Date.now() - sesion.timestamp > TIMEOUT.captcha) {
+        log('warn', 'WEBHOOK', 'Sesión expirada, ignorando mensaje');
+        sesionesActivas.delete(numero);
+        return res.json({ status: 'sesion_expirada' });
+      }
       
       // Limpiar mensaje (solo alfanumérico)
       const captcha = mensaje.trim().replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
@@ -671,8 +735,8 @@ app.post('/webhook/whatsapp', (req, res) => {
         sesion.resolve(captcha);
         return res.json({ status: 'captcha_recibido', captcha });
       } else {
-        log('warn', 'WEBHOOK', `CAPTCHA inválido: ${captcha}`);
-        enviarWhatsAppTexto(numero, '⚠️ El código debe tener entre 4 y 8 caracteres alfanuméricos.');
+        log('warn', 'WEBHOOK', `CAPTCHA inválido: "${captcha}" (${captcha.length} chars)`);
+        enviarWhatsAppTexto(numero, '⚠️ El código debe tener entre 4 y 8 caracteres alfanuméricos. Intente de nuevo.');
         return res.json({ status: 'captcha_invalido' });
       }
     }
@@ -685,51 +749,72 @@ app.post('/webhook/whatsapp', (req, res) => {
   }
 });
 
-// Endpoint principal del scraper
+// ============================================================
+// ENDPOINT PRINCIPAL DEL SCRAPER
+// FIX BUG-001: Acepta ambos formatos de campos
+// FIX BUG-002: Ahora es SÍNCRONO (await ejecutarScraper)
+// ============================================================
+
 app.post('/scraper', autenticar, rateLimiter, async (req, res) => {
   try {
-    const { usuario, password, whatsapp, nombre } = req.body;
+    // FIX BUG-001: Aceptar AMBOS formatos de nombres de campos
+    // Documentación usa: sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado
+    // Legacy/curl usa:   usuario, password, whatsapp, nombre
+    const sinoeUsuario = req.body.sinoeUsuario || req.body.usuario;
+    const sinoePassword = req.body.sinoePassword || req.body.password;
+    const whatsappNumero = req.body.whatsappNumero || req.body.whatsapp;
+    const nombreAbogado = req.body.nombreAbogado || req.body.nombre || 'Abogado';
     
-    if (!usuario || !password || !whatsapp) {
+    if (!sinoeUsuario || !sinoePassword || !whatsappNumero) {
       return res.status(400).json({ 
-        error: 'Faltan campos requeridos: usuario, password, whatsapp' 
+        success: false,
+        error: 'Faltan campos requeridos: sinoeUsuario/usuario, sinoePassword/password, whatsappNumero/whatsapp',
+        camposRecibidos: Object.keys(req.body)
       });
     }
     
-    if (!validarNumeroWhatsApp(whatsapp)) {
-      return res.status(400).json({ error: 'Número de WhatsApp inválido' });
+    if (!validarNumeroWhatsApp(whatsappNumero)) {
+      return res.status(400).json({ success: false, error: 'Número de WhatsApp inválido' });
     }
     
     // Verificar que no haya sesión activa
-    if (sesionesActivas.has(whatsapp)) {
+    if (sesionesActivas.has(whatsappNumero)) {
       return res.status(409).json({ 
+        success: false,
         error: 'Ya hay un proceso activo para este número' 
       });
     }
     
-    log('info', 'API', `Iniciando scraper para ${enmascarar(whatsapp)}`);
+    log('info', 'API', `Iniciando scraper para ${enmascarar(whatsappNumero)}`);
     
-    // Ejecutar scraper (no esperamos, respuesta inmediata)
-    ejecutarScraper({
-      sinoeUsuario: usuario,
-      sinoePassword: password,
-      whatsappNumero: whatsapp,
-      nombreAbogado: nombre || 'Abogado'
-    }).then(resultado => {
-      log('info', 'API', `Scraper finalizado: ${resultado.exito ? 'ÉXITO' : 'ERROR'}`);
-    }).catch(error => {
-      log('error', 'API', `Scraper falló: ${error.message}`);
+    // FIX BUG-002: SÍNCRONO — await para que n8n reciba el resultado real
+    // n8n configura timeout de 5 min (300000ms), suficiente para el CAPTCHA
+    const resultado = await ejecutarScraper({
+      sinoeUsuario,
+      sinoePassword,
+      whatsappNumero,
+      nombreAbogado
     });
     
-    res.json({
-      status: 'iniciado',
-      mensaje: 'Proceso iniciado. Recibirá instrucciones por WhatsApp.',
-      whatsapp: enmascarar(whatsapp)
-    });
+    log('info', 'API', `Scraper finalizado: ${resultado.success ? 'ÉXITO' : 'ERROR'}`);
+    
+    // Devolver resultado directamente — n8n procesa con IF (success === true)
+    if (resultado.success) {
+      res.json(resultado);
+    } else {
+      // Error del scraper pero HTTP 200 para que n8n no entre en error handler
+      // n8n usa $json.success para decidir la rama
+      res.json(resultado);
+    }
     
   } catch (error) {
-    log('error', 'API', `Error: ${error.message}`);
-    res.status(500).json({ error: error.message });
+    log('error', 'API', `Error inesperado: ${error.message}`);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      fase: 'servidor',
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
@@ -744,10 +829,40 @@ app.post('/test-whatsapp', autenticar, async (req, res) => {
     
     const resultado = await enviarWhatsAppTexto(
       numero, 
-      mensaje || '🤖 Test de LEXA Scraper Service v5.0.0'
+      mensaje || '🤖 Test de LEXA Scraper Service v5.1.0'
     );
     
     res.json({ enviado: resultado });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Test de envío de imagen (para diagnosticar problema de CAPTCHA)
+app.post('/test-imagen', autenticar, async (req, res) => {
+  try {
+    const { numero } = req.body;
+    
+    if (!numero) {
+      return res.status(400).json({ error: 'Falta número' });
+    }
+    
+    // Imagen mínima PNG de 1x1 pixel (base64 crudo, sin prefijo)
+    const imagenTest = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    
+    const resultado = await enviarWhatsAppImagen(
+      numero,
+      imagenTest,
+      '🧪 Test de envío de imagen - LEXA v5.1.0'
+    );
+    
+    res.json({ 
+      enviado: resultado,
+      metodo: 'sendMedia',
+      base64Preview: imagenTest.substring(0, 30) + '...',
+      base64Length: imagenTest.length
+    });
     
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -791,62 +906,54 @@ app.post('/test-conexion', autenticar, async (req, res) => {
   }
 });
 
-// Test de diagnóstico de casillas
-app.post('/test-diagnostico', autenticar, async (req, res) => {
-  let browser = null;
-  
-  try {
-    const wsEndpoint = CONFIG.browserless.token 
-      ? `${CONFIG.browserless.url}?token=${CONFIG.browserless.token}`
-      : CONFIG.browserless.url;
-    
-    browser = await puppeteer.connect({
-      browserWSEndpoint: wsEndpoint,
-      defaultViewport: DEFAULT_VIEWPORT
-    });
-    
-    const page = await browser.newPage();
-    
-    // Navegar a SINOE (sin login, solo para ver estructura)
-    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2' });
-    
-    const diagnostico = await diagnosticarPaginaCasillas(page, 'TEST');
-    
-    await browser.close();
-    
-    res.json({ diagnostico });
-    
-  } catch (error) {
-    if (browser) {
-      try { await browser.close(); } catch (e) {}
-    }
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // ============================================================
 // INICIAR SERVIDOR
 // ============================================================
 
-app.listen(PORT, '0.0.0.0', () => {
-  log('success', 'SERVER', `LEXA Scraper Service v5.0.0 iniciado en puerto ${PORT}`);
+let server = null;
+
+server = app.listen(PORT, '0.0.0.0', () => {
+  log('success', 'SERVER', `LEXA Scraper Service v5.1.0 iniciado en puerto ${PORT}`);
   log('info', 'SERVER', `API Key: ${API_KEY.substring(0, 8)}...`);
   log('info', 'SERVER', `Browserless: ${CONFIG.browserless.url}`);
   log('info', 'SERVER', `Evolution: ${CONFIG.evolution.url}`);
+  log('info', 'SERVER', 'FIX v5.1.0: Campos compatibles + Endpoint síncrono + Formato response');
   
   // Iniciar limpieza automática
   iniciarLimpiezaAutomatica();
 });
 
-// Manejo de señales
-process.on('SIGTERM', () => {
-  log('info', 'SERVER', 'SIGTERM recibido, cerrando...');
-  process.exit(0);
-});
+// FIX BUG-005: SIGTERM con cleanup de sesiones activas y cierre graceful
+const cerrarGracefully = (signal) => {
+  log('info', 'SERVER', `${signal} recibido, cerrando gracefully...`);
+  
+  // Cerrar sesiones activas y sus timeouts
+  for (const [numero, sesion] of sesionesActivas.entries()) {
+    if (sesion.timeoutId) clearTimeout(sesion.timeoutId);
+    if (sesion.reject) {
+      try { sesion.reject(new Error('Servidor cerrándose')); } catch (e) {}
+    }
+  }
+  sesionesActivas.clear();
+  log('info', 'SERVER', 'Sesiones activas cerradas');
+  
+  // Cerrar servidor Express
+  if (server) {
+    server.close(() => {
+      log('info', 'SERVER', 'Servidor Express cerrado');
+      process.exit(0);
+    });
+    // Forzar cierre después de 5 segundos si no se cierra solo
+    setTimeout(() => {
+      log('warn', 'SERVER', 'Forzando cierre después de 5s');
+      process.exit(1);
+    }, 5000);
+  } else {
+    process.exit(0);
+  }
+};
 
-process.on('SIGINT', () => {
-  log('info', 'SERVER', 'SIGINT recibido, cerrando...');
-  process.exit(0);
-});
+process.on('SIGTERM', () => cerrarGracefully('SIGTERM'));
+process.on('SIGINT', () => cerrarGracefully('SIGINT'));
 
 module.exports = { app, ejecutarScraper };
