@@ -390,7 +390,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       mensaje: resultado.mensaje 
     });
     
-    // ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
     // MANEJO DE SESIÓN ACTIVA
     // ═══════════════════════════════════════════════════════════════════
     if (resultado.tipo === 'sesion_activa') {
@@ -398,31 +398,59 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       
       await enviarWhatsAppTexto(whatsappNumero, '⏳ Sesión activa detectada. Cerrando sesión anterior...');
       
-      await manejarSesionActiva(page, requestId);
+      // Capturar retorno: true = page viva en login, false = page muerta
+      const sesionCerrada = await manejarSesionActiva(page, requestId);
       
-      // SINOE redirige automáticamente al login después de finalizar sesión
-      // Esperar a que la redirección termine
-      log('info', `SCRAPER:${requestId}`, 'Esperando redirección al login...');
-      try {
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
-      } catch (e) {
-        log('info', `SCRAPER:${requestId}`, 'Timeout de redirección, navegando manualmente al login...');
-      }
-      
-      await delay(3000);
-      
-      // Verificar si llegamos al login, si no, navegar manualmente
-      let urlActual = '';
-      try {
-        urlActual = (await leerUrlSegura(page)) || '';
-      } catch (e) {
-        urlActual = '';
-      }
-      
-      if (!urlActual.includes('validar') && !urlActual.includes('login')) {
-        log('info', `SCRAPER:${requestId}`, `URL actual: ${urlActual}, navegando al login...`);
-        await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
-        await delay(3000);
+      if (sesionCerrada) {
+        log('success', `SCRAPER:${requestId}`, 'Sesión cerrada, page activa en login');
+      } else {
+        // SINOE destruyó el frame — reintentar creación de página hasta 3 veces
+        log('warn', `SCRAPER:${requestId}`, 'Page muerta después de FINALIZAR SESIONES');
+        
+        // Cerrar page vieja (ya está muerta, ignorar errores)
+        try { await page.close(); } catch (_) {}
+        
+        const MAX_REINTENTOS_RECOVERY = 3;
+        let recuperado = false;
+        
+        for (let intento = 1; intento <= MAX_REINTENTOS_RECOVERY; intento++) {
+          log('info', `SCRAPER:${requestId}`, `Reintento ${intento}/${MAX_REINTENTOS_RECOVERY}: creando nueva página...`);
+          
+          try {
+            page = await browser.newPage();
+            page.setDefaultTimeout(TIMEOUT.navegacion);
+            
+            await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+            await delay(3000);
+            
+            // Verificar que realmente cargó el login
+            const urlRecovery = await leerUrlSegura(page);
+            if (urlRecovery && (urlRecovery.includes('validar') || urlRecovery.includes('login'))) {
+              log('success', `SCRAPER:${requestId}`, `Página recuperada en intento ${intento}`);
+              recuperado = true;
+              break;
+            }
+            
+            // Cargó pero no es el login — SINOE respondió otra cosa
+            log('warn', `SCRAPER:${requestId}`, `Intento ${intento}: URL inesperada: ${urlRecovery}`);
+            try { await page.close(); } catch (_) {}
+            
+          } catch (recoveryError) {
+            log('warn', `SCRAPER:${requestId}`, `Intento ${intento} falló: ${recoveryError.message}`);
+            // Cerrar page si quedó a medias
+            try { await page.close(); } catch (_) {}
+          }
+          
+          // Esperar antes de reintentar (2s, 4s, 6s — incremental)
+          if (intento < MAX_REINTENTOS_RECOVERY) {
+            await delay(intento * 2000);
+          }
+        }
+        
+        if (!recuperado) {
+          await enviarWhatsAppTexto(whatsappNumero, '❌ Error técnico de SINOE. El sistema no pudo reconectar después de cerrar la sesión. Intente en unos minutos.');
+          throw new Error('SINOE no respondió después de 3 reintentos post-sesión activa');
+        }
       }
       
       await cerrarPopups(page, `SCRAPER:${requestId}`);
