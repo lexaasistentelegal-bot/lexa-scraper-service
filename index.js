@@ -654,6 +654,17 @@ app.post('/webhook/whatsapp', (req, res) => {
     }
     
     if (!mensaje || !numero) {
+      // Formato simplificado desde n8n: { numero, captcha } o { numero, mensaje }
+      if (body.captcha && body.numero) {
+        mensaje = body.captcha;
+        numero = body.numero;
+      } else if (body.mensaje && body.numero) {
+        mensaje = body.mensaje;
+        numero = body.numero;
+      }
+    }
+    
+    if (!mensaje || !numero) {
       return res.json({ status: 'ignorado', razon: 'sin mensaje o número' });
     }
     
@@ -688,11 +699,15 @@ app.post('/webhook/whatsapp', (req, res) => {
 // Endpoint principal del scraper
 app.post('/scraper', autenticar, rateLimiter, async (req, res) => {
   try {
-    const { usuario, password, whatsapp, nombre } = req.body;
+    // Compatibilidad: acepta ambos formatos de parámetros (n8n envía sinoeUsuario/etc)
+    const usuario = req.body.usuario || req.body.sinoeUsuario;
+    const password = req.body.password || req.body.sinoePassword;
+    const whatsapp = req.body.whatsapp || req.body.whatsappNumero;
+    const nombre = req.body.nombre || req.body.nombreAbogado || 'Abogado';
     
     if (!usuario || !password || !whatsapp) {
       return res.status(400).json({ 
-        error: 'Faltan campos requeridos: usuario, password, whatsapp' 
+        error: 'Faltan campos requeridos: usuario/sinoeUsuario, password/sinoePassword, whatsapp/whatsappNumero' 
       });
     }
     
