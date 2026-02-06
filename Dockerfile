@@ -44,15 +44,15 @@ RUN chown -R lexa:nodejs /app
 USER lexa
 
 # Exponer puerto
-EXPOSE 3050
+EXPOSE 3001
 
 # Variables de entorno por defecto
 ENV NODE_ENV=production
-ENV PORT=3050
+ENV PORT=3001
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:3050/health || exit 1
+# Health check - puerto 3001, start-period 30s para dar tiempo al arranque
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:3001/health || exit 1
 
 # Comando de inicio
 CMD ["node", "index.js"]
