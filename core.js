@@ -381,7 +381,7 @@ async function enviarWhatsAppImagen(numero, base64, caption) {
         mediatype: 'image',
         mimetype: 'image/png',
         caption: caption,
-        media: base64.startsWith('data:') ? base64 : `data:image/png;base64,${base64}`
+        media: base64
       })
     });
     
