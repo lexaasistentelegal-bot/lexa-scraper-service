@@ -22,8 +22,6 @@ WORKDIR /app
 COPY package*.json ./
 
 # Instalar dependencias de producción
-# NOTA: Usamos 'npm install' en vez de 'npm ci' porque no tenemos package-lock.json
-# --omit=dev reemplaza el deprecado --only=production
 RUN npm install --omit=dev && \
     npm cache clean --force
 
@@ -50,9 +48,8 @@ EXPOSE 3001
 ENV NODE_ENV=production
 ENV PORT=3001
 
-# Health check - puerto 3001, start-period 30s para dar tiempo al arranque
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:3001/health || exit 1
+# SIN HEALTHCHECK — EasyPanel maneja el ciclo de vida del contenedor
+# El endpoint /health existe en el código pero Docker no lo verifica
 
 # Comando de inicio
 CMD ["node", "index.js"]
