@@ -399,12 +399,30 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       await enviarWhatsAppTexto(whatsappNumero, '⏳ Sesión activa detectada. Cerrando sesión anterior...');
       
       await manejarSesionActiva(page, requestId);
+      
+      // SINOE redirige automáticamente al login después de finalizar sesión
+      // Esperar a que la redirección termine
+      log('info', `SCRAPER:${requestId}`, 'Esperando redirección al login...');
+      try {
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+      } catch (e) {
+        log('info', `SCRAPER:${requestId}`, 'Timeout de redirección, navegando manualmente al login...');
+      }
+      
       await delay(3000);
       
-      let urlActual = await leerUrlSegura(page);
-      if (!urlActual.includes('login')) {
+      // Verificar si llegamos al login, si no, navegar manualmente
+      let urlActual = '';
+      try {
+        urlActual = (await leerUrlSegura(page)) || '';
+      } catch (e) {
+        urlActual = '';
+      }
+      
+      if (!urlActual.includes('validar') && !urlActual.includes('login')) {
+        log('info', `SCRAPER:${requestId}`, `URL actual: ${urlActual}, navegando al login...`);
         await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
-        await delay(2000);
+        await delay(3000);
       }
       
       await cerrarPopups(page, `SCRAPER:${requestId}`);
@@ -425,9 +443,14 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
         nuevoBase64 = nuevoBase64.split(',')[1] || nuevoBase64;
       }
       
-      await enviarWhatsAppImagen(whatsappNumero, nuevoBase64, 
+      if (!await enviarWhatsAppImagen(whatsappNumero, nuevoBase64, 
         `✅ Sesión anterior cerrada.\n\n📩 ${nombreAbogado}, escriba el NUEVO código CAPTCHA:\n\n⏱️ Tiene 5 minutos.`
-      );
+      )) {
+        await enviarWhatsAppTexto(whatsappNumero, 
+          `⚠️ ${nombreAbogado}, no se pudo enviar la imagen del nuevo CAPTCHA. Intente de nuevo.`
+        );
+        throw new Error('No se pudo enviar imagen del segundo CAPTCHA');
+      }
       
       let nuevoTimeoutId = null;
       const nuevoCaptcha = await new Promise((resolve, reject) => {
@@ -450,9 +473,14 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       
       log('success', `SCRAPER:${requestId}`, `CAPTCHA recibido: ${nuevoCaptcha}`);
       
-      await escribirCaptchaEnCampo(page, nuevoCaptcha, requestId);
+      const resultadoEscritura2 = await escribirCaptchaEnCampo(page, nuevoCaptcha, requestId);
       
-      const urlAntes2 = await leerUrlSegura(page);
+      if (!resultadoEscritura2.exito) {
+        await enviarWhatsAppTexto(whatsappNumero, '⚠️ La página de SINOE expiró durante el segundo intento. Intente de nuevo.');
+        throw new Error(`Escritura de CAPTCHA falló en segundo intento: ${resultadoEscritura2.error}`);
+      }
+      
+      const urlAntes2 = await leerUrlSegura(page) || SINOE_URLS.login;
       const clic2 = await hacerClicLoginPrimeFaces(page, requestId);
       
       if (!clic2.exito) {
