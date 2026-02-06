@@ -1,28 +1,22 @@
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v5.1.0
+ * LEXA SCRAPER SERVICE v5.0.0
  * ============================================================
  * 
  * Arquitectura modular:
- *   - core.js          → Configuración, utilidades, WhatsApp (NO TOCAR)
+ *   - core.js          → Configuración, utilidades, WhatsApp
  *   - flujo-estable.js → Pasos 10-13 (NO TOCAR)
- *   - extraccion.js    → Pasos 14-15 (NO TOCAR)
+ *   - extraccion.js    → Pasos 14-15 (MODIFICAR AQUÍ)
  *   - index.js         → Orquestación + API REST (ESTE ARCHIVO)
  * 
  * Flujo completo:
  *   1-9.   Conexión, navegación, credenciales, CAPTCHA, WhatsApp
- *   10.    Escribir CAPTCHA en campo
- *   11.    Hacer clic en "Ingresar"
- *   12.    Verificar dashboard (5 reintentos)
- *   13.    Navegar a "Casillas Electrónicas"
+ *   10.    Escribir CAPTCHA en campo ✅
+ *   11.    Hacer clic en "Ingresar" ✅
+ *   12.    Verificar dashboard (5 reintentos) ✅
+ *   13.    Navegar a "Casillas Electrónicas" ✅
  *   14.    Extraer notificaciones (extraccion.js)
  *   15.    Descargar consolidados (extraccion.js)
- * 
- * Changelog v5.1.0:
- *   - Fix: enviarWhatsAppImagen con prefijo data URI para Evolution API v2.x
- *   - Fix: validación de response.ok en envío de imagen
- *   - Fix: compatibilidad de parámetros n8n en endpoint /scraper
- *   - Fix: webhook WhatsApp delega mensajes cortos a n8n (menú)
  * ============================================================
  */
 
@@ -34,21 +28,20 @@ const crypto = require('crypto');
 // IMPORTAR MÓDULOS
 // ============================================================
 
-// Módulo base (configuración, utilidades, WhatsApp) - NO MODIFICAR
+// Módulo base (configuración, utilidades, WhatsApp)
 const core = require('./core');
 
 // Módulo de flujo estable (pasos 10-13) - NO MODIFICAR
 const flujoEstable = require('./flujo-estable');
 
-// Módulo de extracción (pasos 14-15) - NO MODIFICAR
+// Módulo de extracción (pasos 14-15) - MODIFICAR AQUÍ
 const extraccion = require('./extraccion');
 
 // ============================================================
 // EXTRAER FUNCIONES DE LOS MÓDULOS
 // ============================================================
 
-// De core.js — se importa TODO excepto enviarWhatsAppImagen,
-// que se redefine más abajo con compatibilidad Evolution API v2.x
+// De core.js
 const {
   PORT,
   API_KEY,
@@ -71,7 +64,7 @@ const {
   leerContenidoSeguro,
   evaluarSeguro,
   enviarWhatsAppTexto,
-  // enviarWhatsAppImagen → NO se importa, se redefine abajo
+  enviarWhatsAppImagen,
   cerrarPopups,
   manejarSesionActiva,
   llenarCredenciales,
@@ -88,7 +81,7 @@ const {
   verificarEstadoPagina
 } = flujoEstable;
 
-// De extraccion.js (Pasos 14-15) - NO MODIFICAR
+// De extraccion.js (Pasos 14-15) - MODIFICAR AQUÍ
 const {
   esperarTablaCargada,
   extraerNotificaciones,
@@ -99,56 +92,6 @@ const {
   procesarNotificaciones,
   capturarPantallaCasillas
 } = extraccion;
-
-// ============================================================
-// OVERRIDE: enviarWhatsAppImagen (Evolution API v2.x)
-// ============================================================
-// Puppeteer screenshot({ encoding: 'base64' }) devuelve base64 crudo.
-// Evolution API v2.x requiere prefijo "data:image/png;base64," para
-// reconocer el contenido como base64 en el campo media.
-// core.js no se modifica — el override vive aquí en index.js.
-// ============================================================
-
-async function enviarWhatsAppImagen(numero, base64, caption) {
-  try {
-    // Agregar prefijo data URI si no lo tiene
-    const mediaData = base64.startsWith('data:')
-      ? base64
-      : `data:image/png;base64,${base64}`;
-
-    const response = await fetch(`${CONFIG.evolution.url}/message/sendMedia/${CONFIG.evolution.instance}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': CONFIG.evolution.apiKey
-      },
-      body: JSON.stringify({
-        number: numero,
-        mediatype: 'image',
-        mimetype: 'image/png',
-        caption: caption,
-        media: mediaData,
-        fileName: 'captcha.png'
-      })
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text().catch(() => 'Sin detalle');
-      log('error', 'WHATSAPP', `Evolution API respondió ${response.status} en sendMedia`, { errorBody });
-      return false;
-    }
-
-    log('success', 'WHATSAPP', 'Imagen enviada', {
-      numero: enmascarar(numero),
-      status: response.status,
-      size: base64.length
-    });
-    return true;
-  } catch (error) {
-    log('error', 'WHATSAPP', `Error enviando imagen: ${error.message}`);
-    return false;
-  }
-}
 
 // ============================================================
 // CREAR APLICACIÓN EXPRESS
@@ -655,7 +598,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '5.1.0',
+    version: '5.0.0',
     modulos: ['core.js', 'flujo-estable.js', 'extraccion.js'],
     uptime: process.uptime(),
     timestamp: new Date().toISOString()
@@ -697,28 +640,17 @@ app.post('/webhook/whatsapp', (req, res) => {
     }
     webhooksRecientes.set(webhookId, Date.now());
     
-    // Extraer mensaje — soporta formato Evolution API y formato simplificado de n8n
+    // Extraer mensaje
     let mensaje = null;
     let numero = null;
     
-    // Formato Evolution API v2.x
+    // Formato Evolution API
     if (body.data?.message?.conversation) {
       mensaje = body.data.message.conversation;
       numero = body.data.key?.remoteJid?.replace('@s.whatsapp.net', '');
     } else if (body.message?.conversation) {
       mensaje = body.message.conversation;
       numero = body.key?.remoteJid?.replace('@s.whatsapp.net', '');
-    }
-    
-    if (!mensaje || !numero) {
-      // Formato simplificado desde n8n: { numero, captcha } o { numero, mensaje }
-      if (body.captcha && body.numero) {
-        mensaje = body.captcha;
-        numero = body.numero;
-      } else if (body.mensaje && body.numero) {
-        mensaje = body.mensaje;
-        numero = body.numero;
-      }
     }
     
     if (!mensaje || !numero) {
@@ -734,16 +666,14 @@ app.post('/webhook/whatsapp', (req, res) => {
       // Limpiar mensaje (solo alfanumérico)
       const captcha = mensaje.trim().replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
       
-      // CAPTCHAs de SINOE tienen 4-8 caracteres alfanuméricos.
-      // Mensajes cortos (1-3 chars como "1", "2", "2.1") son opciones de menú,
-      // NO intentos de CAPTCHA. Delegar a n8n para que los procese como menú.
       if (captcha.length >= 4 && captcha.length <= 8) {
         log('success', 'WEBHOOK', `CAPTCHA válido recibido: ${captcha}`);
         sesion.resolve(captcha);
         return res.json({ status: 'captcha_recibido', captcha });
       } else {
-        log('info', 'WEBHOOK', `Mensaje corto "${mensaje}" durante sesión activa - delegando a menú n8n`);
-        return res.json({ status: 'sin_sesion_activa', razon: 'mensaje_no_es_captcha' });
+        log('warn', 'WEBHOOK', `CAPTCHA inválido: ${captcha}`);
+        enviarWhatsAppTexto(numero, '⚠️ El código debe tener entre 4 y 8 caracteres alfanuméricos.');
+        return res.json({ status: 'captcha_invalido' });
       }
     }
     
@@ -756,19 +686,13 @@ app.post('/webhook/whatsapp', (req, res) => {
 });
 
 // Endpoint principal del scraper
-// Acepta ambos formatos de parámetros:
-//   - Original:  { usuario, password, whatsapp, nombre }
-//   - Desde n8n: { sinoeUsuario, sinoePassword, whatsappNumero, nombreAbogado }
 app.post('/scraper', autenticar, rateLimiter, async (req, res) => {
   try {
-    const usuario = req.body.usuario || req.body.sinoeUsuario;
-    const password = req.body.password || req.body.sinoePassword;
-    const whatsapp = req.body.whatsapp || req.body.whatsappNumero;
-    const nombre = req.body.nombre || req.body.nombreAbogado || 'Abogado';
+    const { usuario, password, whatsapp, nombre } = req.body;
     
     if (!usuario || !password || !whatsapp) {
       return res.status(400).json({ 
-        error: 'Faltan campos requeridos: usuario/sinoeUsuario, password/sinoePassword, whatsapp/whatsappNumero' 
+        error: 'Faltan campos requeridos: usuario, password, whatsapp' 
       });
     }
     
@@ -785,12 +709,12 @@ app.post('/scraper', autenticar, rateLimiter, async (req, res) => {
     
     log('info', 'API', `Iniciando scraper para ${enmascarar(whatsapp)}`);
     
-    // Ejecutar scraper de forma asíncrona (respuesta inmediata al cliente)
+    // Ejecutar scraper (no esperamos, respuesta inmediata)
     ejecutarScraper({
       sinoeUsuario: usuario,
       sinoePassword: password,
       whatsappNumero: whatsapp,
-      nombreAbogado: nombre
+      nombreAbogado: nombre || 'Abogado'
     }).then(resultado => {
       log('info', 'API', `Scraper finalizado: ${resultado.exito ? 'ÉXITO' : 'ERROR'}`);
     }).catch(error => {
@@ -820,7 +744,7 @@ app.post('/test-whatsapp', autenticar, async (req, res) => {
     
     const resultado = await enviarWhatsAppTexto(
       numero, 
-      mensaje || '🤖 Test de LEXA Scraper Service v5.1.0'
+      mensaje || '🤖 Test de LEXA Scraper Service v5.0.0'
     );
     
     res.json({ enviado: resultado });
@@ -905,7 +829,7 @@ app.post('/test-diagnostico', autenticar, async (req, res) => {
 // ============================================================
 
 app.listen(PORT, '0.0.0.0', () => {
-  log('success', 'SERVER', `LEXA Scraper Service v5.1.0 iniciado en puerto ${PORT}`);
+  log('success', 'SERVER', `LEXA Scraper Service v5.0.0 iniciado en puerto ${PORT}`);
   log('info', 'SERVER', `API Key: ${API_KEY.substring(0, 8)}...`);
   log('info', 'SERVER', `Browserless: ${CONFIG.browserless.url}`);
   log('info', 'SERVER', `Evolution: ${CONFIG.evolution.url}`);
