@@ -654,17 +654,6 @@ app.post('/webhook/whatsapp', (req, res) => {
     }
     
     if (!mensaje || !numero) {
-      // Formato simplificado desde n8n: { numero, captcha } o { numero, mensaje }
-      if (body.captcha && body.numero) {
-        mensaje = body.captcha;
-        numero = body.numero;
-      } else if (body.mensaje && body.numero) {
-        mensaje = body.mensaje;
-        numero = body.numero;
-      }
-    }
-    
-    if (!mensaje || !numero) {
       return res.json({ status: 'ignorado', razon: 'sin mensaje o número' });
     }
     
@@ -677,18 +666,14 @@ app.post('/webhook/whatsapp', (req, res) => {
       // Limpiar mensaje (solo alfanumérico)
       const captcha = mensaje.trim().replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
       
-      // CAPTCHAs de SINOE tienen 4-8 caracteres alfanuméricos.
-      // Mensajes cortos (1-3 chars como "1", "2", "2.1") son opciones de menú,
-      // NO intentos de CAPTCHA. Dejar que n8n los procese como menú.
       if (captcha.length >= 4 && captcha.length <= 8) {
         log('success', 'WEBHOOK', `CAPTCHA válido recibido: ${captcha}`);
         sesion.resolve(captcha);
         return res.json({ status: 'captcha_recibido', captcha });
       } else {
-        // Mensaje corto = probablemente opción de menú, NO CAPTCHA
-        // Devolver sin_sesion_activa para que n8n lo procese como menú
-        log('info', 'WEBHOOK', `Mensaje corto "${mensaje}" durante sesión activa - delegando a menú n8n`);
-        return res.json({ status: 'sin_sesion_activa', razon: 'mensaje_no_es_captcha' });
+        log('warn', 'WEBHOOK', `CAPTCHA inválido: ${captcha}`);
+        enviarWhatsAppTexto(numero, '⚠️ El código debe tener entre 4 y 8 caracteres alfanuméricos.');
+        return res.json({ status: 'captcha_invalido' });
       }
     }
     
@@ -703,15 +688,11 @@ app.post('/webhook/whatsapp', (req, res) => {
 // Endpoint principal del scraper
 app.post('/scraper', autenticar, rateLimiter, async (req, res) => {
   try {
-    // Compatibilidad: acepta ambos formatos de parámetros (n8n envía sinoeUsuario/etc)
-    const usuario = req.body.usuario || req.body.sinoeUsuario;
-    const password = req.body.password || req.body.sinoePassword;
-    const whatsapp = req.body.whatsapp || req.body.whatsappNumero;
-    const nombre = req.body.nombre || req.body.nombreAbogado || 'Abogado';
+    const { usuario, password, whatsapp, nombre } = req.body;
     
     if (!usuario || !password || !whatsapp) {
       return res.status(400).json({ 
-        error: 'Faltan campos requeridos: usuario/sinoeUsuario, password/sinoePassword, whatsapp/whatsappNumero' 
+        error: 'Faltan campos requeridos: usuario, password, whatsapp' 
       });
     }
     
