@@ -1,7 +1,13 @@
 /**
+/**
  * ============================================================
- * LEXA SCRAPER SERVICE v5.1.0
+ * LEXA SCRAPER SERVICE v5.2.0
  * ============================================================
+ * 
+ * CORRECCIONES v5.2.0:
+ *   ✓ FIX BUG-006: Race condition en segundo CAPTCHA
+ *     (webhook elimina sesión ANTES de resolver para evitar que
+ *      el segundo CAPTCHA sea "consumido" por la sesión vieja)
  * 
  * CORRECCIONES v5.1.0:
  *   ✓ FIX BUG-001: Nombres de campos compatibles con documentación
@@ -729,7 +735,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '5.1.0',
+    version: '5.2.0',
     modulos: ['core.js', 'flujo-estable.js', 'extraccion.js'],
     uptime: process.uptime(),
     timestamp: new Date().toISOString()
