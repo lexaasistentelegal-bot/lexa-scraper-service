@@ -1,12 +1,24 @@
 /**
  * ════════════════════════════════════════════════════════════════════════════════
- * LEXA SCRAPER — EXTRACCIÓN v3.0.0
+ * LEXA SCRAPER — EXTRACCIÓN v5.5.0
  * ════════════════════════════════════════════════════════════════════════════════
  *
  * Autor:   LEXA Assistant (CTO)
  * Fecha:   Febrero 2026
  *
  * Changelog:
+ *   v5.5.0  — AUDITORÍA SENIOR — FIX CRÍTICO "0 NOTIFICACIONES"
+ *     • FIX BUG-007: SINOE carga tabla con datos por defecto (últimos 7 días).
+ *       El código anterior SIEMPRE re-aplicaba el filtro, lo cual causaba que
+ *       PrimeFaces recargara la tabla vía AJAX y la dejara vacía temporalmente.
+ *       SOLUCIÓN: Nueva función verificarEstadoTablaActual() verifica si la
+ *       tabla YA tiene datos ANTES de decidir si aplicar filtro.
+ *     • FIX BUG-008: tiempoEstabilidadDom aumentado de 800ms a 1500ms para
+ *       dar más tiempo a PrimeFaces de reconstruir el DOM.
+ *     • NUEVO: Parámetro opciones.forzarSinFiltro para bypass total del filtro.
+ *     • NUEVO: Logging mejorado con separadores visuales para debugging.
+ *     • NUEVO: extraerNotificacionesPaginaActual ahora loguea el método usado.
+ *
  *   v3.0.0  — Reescritura completa
  *     • FIX BUG CRÍTICO: Después de cerrarModal(), se llama a
  *       esperarTablaCargada() para que PrimeFaces reconstruya las filas
@@ -64,31 +76,33 @@ const {
 } = core;
 
 // ════════════════════════════════════════════════════════════════════════════════
-// CONFIGURACIÓN
+// CONFIGURACIÓN — v5.5.0 OPTIMIZADA
 // ════════════════════════════════════════════════════════════════════════════════
 
 /**
  * Timeouts específicos para extracción.
  * Estos valores han sido calibrados para el rendimiento real de SINOE.
+ *
+ * v5.5.0: Ajustados para mayor estabilidad con PrimeFaces AJAX
  */
 const CONFIG_EXTRACCION = {
   // Tiempo máximo para que cargue la tabla vía AJAX
-  timeoutCargaTabla: 20000,
+  timeoutCargaTabla: 25000,  // ⬆️ v5.5.0: 25s (era 20s)
 
   // Intervalo entre verificaciones de carga
-  intervaloVerificacion: 800,
+  intervaloVerificacion: 1000,  // ⬆️ v5.5.0: 1s (era 800ms)
 
   // Tiempo máximo para que abra el modal de anexos
-  timeoutModal: 12000,
+  timeoutModal: 15000,  // ⬆️ v5.5.0: 15s (era 12s)
 
   // Tiempo de espera después de hacer clic (para que PrimeFaces procese)
-  esperaPostClic: 2000,
+  esperaPostClic: 2500,  // ⬆️ v5.5.0: 2.5s (era 2s)
 
   // Tiempo entre procesamiento de notificaciones (evita saturar SINOE)
-  pausaEntreNotificaciones: 1500,
+  pausaEntreNotificaciones: 2000,  // ⬆️ v5.5.0: 2s (era 1.5s)
 
   // Tiempo de espera para que inicie la descarga
-  esperaDescarga: 4000,
+  esperaDescarga: 5000,  // ⬆️ v5.5.0: 5s (era 4s)
 
   // Máximo de reintentos para operaciones fallidas
   maxReintentos: 3,
@@ -96,11 +110,14 @@ const CONFIG_EXTRACCION = {
   // Timeout para descarga de PDF vía fetch (ms)
   timeoutDescargaPdf: 30000,
 
-  // Tiempo de estabilidad DOM — sin mutaciones durante este período = estable
-  tiempoEstabilidadDom: 800,
+  // ⭐ CRÍTICO v5.5.0: Tiempo de estabilidad DOM
+  // PrimeFaces puede tardar en reconstruir filas después de AJAX.
+  // Este valor determina cuánto tiempo esperar después de detectar
+  // que la tabla "parece" cargada, antes de intentar leer las filas.
+  tiempoEstabilidadDom: 1500,  // ⬆️ v5.5.0: 1.5s (era 800ms)
 
   // Timeout para aplicar filtro de fechas
-  timeoutFiltro: 15000,
+  timeoutFiltro: 20000,  // ⬆️ v5.5.0: 20s (era 15s)
 
   // Máximo de páginas a recorrer en paginación
   maxPaginas: 20
@@ -116,7 +133,7 @@ const CONFIG_EXTRACCION = {
  * IMPORTANTE: Si SINOE cambia su estructura HTML, este es el único
  * lugar que necesita actualizarse.
  *
- * Última verificación: 06/02/2026
+ * Última verificación: 07/02/2026
  */
 const SELECTORES = {
 
@@ -615,7 +632,7 @@ async function rellenarCampoFecha(page, selectores, valor, ctx, nombreCampo) {
  *   1. Que los spinners/overlays de PrimeFaces hayan desaparecido
  *   2. Que exista el tbody de la tabla
  *   3. Que haya filas con datos O un mensaje de "no hay datos"
- *   4. Que el DOM esté estable (sin mutaciones durante ~800ms)
+ *   4. Que el DOM esté estable (sin mutaciones durante ~1500ms)
  *
  * Es la función más importante del archivo. El bug principal
  * ("resultado null" en notificaciones 2-7) se debía a no llamar
@@ -790,6 +807,139 @@ async function esperarTablaCargada(page, requestId) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// ⭐ NUEVO v5.5.0: VERIFICACIÓN RÁPIDA DE ESTADO DE TABLA
+// ════════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Verifica si la tabla YA tiene datos SIN modificar nada.
+ * Se usa ANTES de decidir si aplicar filtro de fechas.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │  FIX BUG-007: Esta función es la solución al bug "0 notificaciones".       │
+ * │                                                                            │
+ * │  PROBLEMA: SINOE carga la tabla con los últimos 7 días por defecto.        │
+ * │            El código anterior SIEMPRE re-aplicaba el filtro, causando      │
+ * │            que PrimeFaces recargara la tabla vía AJAX y la dejara vacía    │
+ * │            temporalmente mientras el DOM se reconstruía.                   │
+ * │                                                                            │
+ * │  SOLUCIÓN: Verificar si la tabla YA tiene datos ANTES de aplicar filtro.   │
+ * │            Si ya hay datos → NO tocar el filtro → extraer directamente.    │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ * @param {Page}   page      - Instancia de Puppeteer page
+ * @param {string} requestId - ID único para logs
+ * @returns {Promise<Object>} Estado de la tabla con información detallada
+ */
+async function verificarEstadoTablaActual(page, requestId) {
+  const ctx = `CHECK:${requestId}`;
+
+  const estado = await evaluarSeguro(page, (selectores) => {
+    let resultado = {
+      tablaCargada: false,
+      tieneFilas: false,
+      cantidadFilas: 0,
+      estadoCarga: 'desconocido',
+      detalles: {}
+    };
+
+    // ── 1. Verificar si hay indicadores de carga activos ──
+    for (const selCarga of selectores.tabla.cargando) {
+      const indicador = document.querySelector(selCarga);
+      if (indicador) {
+        const estilo = window.getComputedStyle(indicador);
+        if (estilo.display !== 'none' && estilo.visibility !== 'hidden') {
+          resultado.estadoCarga = 'cargando';
+          return resultado;
+        }
+      }
+    }
+
+    // Verificar overlays de PrimeFaces
+    const blockUis = document.querySelectorAll('.ui-blockui, .ui-blockui-content');
+    for (const block of blockUis) {
+      const estilo = window.getComputedStyle(block);
+      if (estilo.display !== 'none' && estilo.visibility !== 'hidden' && estilo.opacity !== '0') {
+        resultado.estadoCarga = 'cargando';
+        return resultado;
+      }
+    }
+
+    // ── 2. Buscar el tbody de la tabla ──
+    let tbody = null;
+    let tbodySelector = null;
+    for (const sel of selectores.tabla.cuerpo) {
+      tbody = document.querySelector(sel);
+      if (tbody) {
+        tbodySelector = sel;
+        break;
+      }
+    }
+
+    if (!tbody) {
+      resultado.estadoCarga = 'sin_tabla';
+      return resultado;
+    }
+
+    // ── 3. Contar filas válidas con data-ri ──
+    const filasDataRi = tbody.querySelectorAll('tr[data-ri]');
+    const filasValidas = Array.from(filasDataRi).filter(fila => {
+      // Excluir filas de mensaje vacío
+      if (fila.classList.contains('ui-datatable-empty-message')) return false;
+      // Verificar que tenga suficientes celdas (mínimo 5 para ser una fila real)
+      const celdas = fila.querySelectorAll('td');
+      return celdas.length >= 5;
+    });
+
+    resultado.tablaCargada = true;
+    resultado.tieneFilas = filasValidas.length > 0;
+    resultado.cantidadFilas = filasValidas.length;
+    resultado.estadoCarga = filasValidas.length > 0 ? 'con_datos' : 'sin_datos';
+    resultado.detalles = {
+      tbodyId: tbody.id || '(sin id)',
+      selectorUsado: tbodySelector,
+      filasConDataRi: filasDataRi.length,
+      filasValidas: filasValidas.length
+    };
+
+    // ── 4. Obtener info del paginador si existe ──
+    const infoPag = document.querySelector('.ui-paginator-current');
+    if (infoPag) {
+      const texto = infoPag.textContent || '';
+      const matchReg = texto.match(/Registros:\s*(\d+)/i);
+      if (matchReg) {
+        resultado.detalles.registrosSegunPaginador = parseInt(matchReg[1], 10);
+      }
+    }
+
+    // ── 5. Verificar valores de los campos de fecha (para debug) ──
+    const fechaIniInput = document.querySelector('input[id*="fechaIni"], input[id*="fecIni"]');
+    const fechaFinInput = document.querySelector('input[id*="fechaFin"], input[id*="fecFin"]');
+    if (fechaIniInput || fechaFinInput) {
+      resultado.detalles.filtroActual = {
+        fechaInicial: fechaIniInput ? fechaIniInput.value : null,
+        fechaFinal: fechaFinInput ? fechaFinInput.value : null
+      };
+    }
+
+    return resultado;
+
+  }, SELECTORES);
+
+  if (estado) {
+    log('info', ctx, `Estado tabla: ${estado.estadoCarga} | Filas: ${estado.cantidadFilas}`, estado.detalles || {});
+  } else {
+    log('warn', ctx, 'No se pudo verificar estado de tabla (evaluarSeguro retornó null)');
+  }
+
+  return estado || {
+    tablaCargada: false,
+    tieneFilas: false,
+    cantidadFilas: 0,
+    estadoCarga: 'error_evaluacion'
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // PASO 14.2: EXTRAER NOTIFICACIONES DE LA PÁGINA ACTUAL
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -928,35 +1078,84 @@ async function extraerNotificacionesPaginaActual(page, requestId, paginaNum = 1)
     _pagina: paginaNum
   }));
 
+  // v5.5.0: Log mejorado con método usado
+  log('info', ctx, `Página ${paginaNum}: ${notificaciones.length} notificaciones extraídas (${resultado.metodo})`);
+
   return notificaciones;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// PASO 14.3: EXTRAER NOTIFICACIONES (CON FILTRO Y PAGINACIÓN)
+// ⭐ PASO 14.3: EXTRAER NOTIFICACIONES — v5.5.0 CORREGIDA
 // ════════════════════════════════════════════════════════════════════════════════
 
 /**
  * Función principal de extracción. Opcionalmente filtra por fecha,
  * luego extrae notificaciones de todas las páginas de resultados.
  *
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │  v5.5.0 — CAMBIO CRÍTICO:                                                  │
+ * │                                                                            │
+ * │  Ahora verifica si la tabla YA tiene datos ANTES de aplicar filtro.        │
+ * │  Si ya hay datos visibles → NO toca el filtro → extrae directamente.       │
+ * │                                                                            │
+ * │  Esto soluciona el bug "0 notificaciones" causado por PrimeFaces           │
+ * │  recargando la tabla y dejándola vacía temporalmente.                      │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ *
  * @param {Page}   page      - Instancia de Puppeteer page
  * @param {string} requestId - ID único para logs
  * @param {Object} opciones  - Opciones de filtrado
- * @param {string} opciones.fechaInicial  - "DD/MM/YYYY" o null
- * @param {string} opciones.fechaFinal    - "DD/MM/YYYY" o null
- * @param {boolean} opciones.aplicarFiltro - true para filtrar (default: true)
+ * @param {string} opciones.fechaInicial    - "DD/MM/YYYY" o null
+ * @param {string} opciones.fechaFinal      - "DD/MM/YYYY" o null
+ * @param {boolean} opciones.aplicarFiltro  - true para permitir filtrado (default: true)
+ * @param {boolean} opciones.forzarSinFiltro - true para NUNCA filtrar (default: false) ⬅️ NUEVO v5.5.0
  * @returns {Promise<Array>} Array completo de notificaciones (todas las páginas)
  */
 async function extraerNotificaciones(page, requestId, opciones = {}) {
   const ctx = `NOTIF:${requestId}`;
-  const aplicarFiltro = opciones.aplicarFiltro !== false; // Default: true
+  const forzarSinFiltro = opciones.forzarSinFiltro === true;
+  let aplicarFiltro = opciones.aplicarFiltro !== false; // Default: true
 
-  log('info', ctx, 'Iniciando extracción de notificaciones...');
+  log('info', ctx, '════════════════════════════════════════════════════════════════');
+  log('info', ctx, 'EXTRACCIÓN DE NOTIFICACIONES v5.5.0');
+  log('info', ctx, `Opciones: aplicarFiltro=${aplicarFiltro}, forzarSinFiltro=${forzarSinFiltro}`);
+  log('info', ctx, '════════════════════════════════════════════════════════════════');
 
   // ────────────────────────────────────────────────────────────────────────
-  // 1. Aplicar filtro de fechas (si corresponde)
+  // ⭐ PASO 0 (NUEVO v5.5.0): Verificar si la tabla YA tiene datos
+  //
+  // LÓGICA: Si la tabla ya tiene notificaciones cargadas, NO tocar el filtro.
+  //         Esto evita que PrimeFaces recargue la tabla vía AJAX y la deje
+  //         vacía temporalmente, causando que se extraigan 0 notificaciones.
+  // ────────────────────────────────────────────────────────────────────────
+  if (forzarSinFiltro) {
+    log('info', ctx, 'PASO 0: forzarSinFiltro=true → Saltando verificación y filtro');
+    aplicarFiltro = false;
+  } else {
+    log('info', ctx, 'PASO 0: Verificando estado actual de la tabla...');
+
+    const estadoActual = await verificarEstadoTablaActual(page, requestId);
+
+    if (estadoActual.tieneFilas && estadoActual.cantidadFilas > 0) {
+      log('success', ctx, '════════════════════════════════════════════════════════');
+      log('success', ctx, `⭐ TABLA YA TIENE ${estadoActual.cantidadFilas} FILAS VISIBLES`);
+      log('success', ctx, '   → NO se aplicará filtro de fechas (evita romper DOM)');
+      log('success', ctx, '════════════════════════════════════════════════════════');
+      aplicarFiltro = false;
+    } else if (estadoActual.estadoCarga === 'cargando') {
+      log('info', ctx, 'Tabla en estado de carga, esperando estabilización...');
+      await delay(CONFIG_EXTRACCION.esperaPostClic);
+    } else {
+      log('info', ctx, `Estado de tabla: ${estadoActual.estadoCarga} — se evaluará filtro`);
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // PASO 1: Aplicar filtro de fechas (SOLO si no hay datos y está permitido)
   // ────────────────────────────────────────────────────────────────────────
   if (aplicarFiltro) {
+    log('info', ctx, 'PASO 1: Aplicando filtro de fechas...');
+
     const filtroOk = await filtrarBandejaPorFecha(
       page,
       opciones.fechaInicial || null,
@@ -965,41 +1164,50 @@ async function extraerNotificaciones(page, requestId, opciones = {}) {
     );
 
     if (!filtroOk) {
-      log('warn', ctx, 'Filtro no se aplicó — extrayendo tabla tal cual');
+      log('warn', ctx, 'Filtro no se aplicó correctamente — extrayendo tabla tal cual');
     }
+  } else {
+    log('info', ctx, 'PASO 1: Saltando filtro de fechas (tabla ya tiene datos o forzarSinFiltro)');
   }
 
   // ────────────────────────────────────────────────────────────────────────
-  // 2. Esperar que la tabla cargue
+  // PASO 2: Esperar que la tabla cargue y esté estable
   // ────────────────────────────────────────────────────────────────────────
+  log('info', ctx, 'PASO 2: Esperando carga de tabla...');
+
   const estadoCarga = await esperarTablaCargada(page, requestId);
 
   if (!estadoCarga.cargada) {
-    log('error', ctx, 'Tabla no cargó correctamente');
+    log('error', ctx, '❌ Tabla no cargó correctamente');
     await diagnosticarPaginaCasillas(page, requestId);
     return [];
   }
 
   if (!estadoCarga.tieneFilas) {
-    log('info', ctx, 'No hay notificaciones para extraer');
+    log('info', ctx, '✓ Tabla cargada pero no hay notificaciones');
     return [];
   }
 
+  log('success', ctx, `✓ Tabla cargada y estable — ${estadoCarga.cantidadFilas} filas detectadas`);
+
   // ────────────────────────────────────────────────────────────────────────
-  // 3. Extraer notificaciones de la primera página
+  // PASO 3: Extraer notificaciones de la primera página
   // ────────────────────────────────────────────────────────────────────────
+  log('info', ctx, 'PASO 3: Extrayendo notificaciones de página 1...');
+
   let todasLasNotificaciones = await extraerNotificacionesPaginaActual(page, requestId, 1);
 
   if (todasLasNotificaciones.length === 0) {
-    log('warn', ctx, 'Primera página sin notificaciones extraíbles');
+    log('warn', ctx, '❌ Primera página sin notificaciones extraíbles');
+    log('info', ctx, 'Ejecutando diagnóstico para entender el problema...');
     await diagnosticarPaginaCasillas(page, requestId);
     return [];
   }
 
-  log('info', ctx, `Página 1: ${todasLasNotificaciones.length} notificaciones extraídas`);
+  log('success', ctx, `✓ Página 1: ${todasLasNotificaciones.length} notificaciones extraídas`);
 
   // ────────────────────────────────────────────────────────────────────────
-  // 4. Manejar paginación — recorrer páginas siguientes
+  // PASO 4: Manejar paginación — recorrer páginas siguientes (si las hay)
   // ────────────────────────────────────────────────────────────────────────
   let paginaActual = 1;
 
@@ -1020,7 +1228,7 @@ async function extraerNotificaciones(page, requestId, opciones = {}) {
 
     paginaActual++;
 
-    // Extraer notificaciones de la nueva página (con su número de página)
+    // Extraer notificaciones de la nueva página
     const notifsPagina = await extraerNotificacionesPaginaActual(page, requestId, paginaActual);
     log('info', ctx, `Página ${paginaActual}: ${notifsPagina.length} notificaciones extraídas`);
 
@@ -1028,24 +1236,25 @@ async function extraerNotificaciones(page, requestId, opciones = {}) {
   }
 
   // ────────────────────────────────────────────────────────────────────────
-  // 4.5. Si hubo múltiples páginas, navegar de vuelta a la página 1.
-  //      procesarNotificaciones necesita la tabla en la página correcta
-  //      para abrir los modales de cada fila.
+  // PASO 4.5: Si hubo múltiples páginas, volver a página 1
   // ────────────────────────────────────────────────────────────────────────
   if (paginaActual > 1) {
     log('info', ctx, `Navegando de vuelta a página 1 (estamos en página ${paginaActual})...`);
     const volverOk = await navegarAPagina(page, 1, requestId);
     if (!volverOk) {
-      log('warn', ctx, 'No se pudo volver a página 1 — procesarNotificaciones manejará la navegación');
+      log('warn', ctx, 'No se pudo volver a página 1 — procesarNotificaciones manejará navegación');
     }
   }
 
   // ────────────────────────────────────────────────────────────────────────
-  // 5. Resumen y retorno
+  // PASO 5: Resumen y retorno
   // ────────────────────────────────────────────────────────────────────────
-  log('success', ctx, `✓ Total extraído: ${todasLasNotificaciones.length} notificaciones de ${paginaActual} página(s)`);
+  log('success', ctx, '════════════════════════════════════════════════════════════════');
+  log('success', ctx, `✓ EXTRACCIÓN COMPLETADA: ${todasLasNotificaciones.length} notificaciones`);
+  log('success', ctx, `  de ${paginaActual} página(s)`);
+  log('success', ctx, '════════════════════════════════════════════════════════════════');
 
-  // Log de las primeras 3 para verificación
+  // Log de las primeras notificaciones para verificación
   if (todasLasNotificaciones.length > 0) {
     const muestra = todasLasNotificaciones.slice(0, 3);
     muestra.forEach((n, i) => {
@@ -2172,13 +2381,14 @@ async function capturarPantallaCasillas(page, requestId) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// EXPORTACIONES
+// EXPORTACIONES — v5.5.0 ACTUALIZADA
 // ════════════════════════════════════════════════════════════════════════════════
 
 module.exports = {
   // ── Paso 14: Filtrado + Extracción ──
   filtrarBandejaPorFecha,
   esperarTablaCargada,
+  verificarEstadoTablaActual,  // ⬅️ NUEVO v5.5.0
   extraerNotificaciones,
   diagnosticarPaginaCasillas,
 
