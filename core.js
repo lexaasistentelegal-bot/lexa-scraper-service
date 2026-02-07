@@ -528,22 +528,21 @@ async function manejarSesionActiva(page, requestId) {
   await cerrarPopups(page, `SESION:${requestId}`);
   await delay(1000);
   
-  // Paso 2: Buscar y hacer clic en "FINALIZAR SESIONES"
   // Paso 2: Buscar botón de cierre de sesión por estructura del DOM
-  // Estrategia: selectores > atributos > texto (en ese orden de prioridad)
+  // Prioridad: selector ID/name → form action → clase PrimeFaces → texto
   log('info', `SESION:${requestId}`, 'Buscando botón de cierre de sesión...');
   
   const clickeado = await evaluarSeguro(page, () => {
-    // --- NIVEL 1: Selector directo por ID o name (más confiable) ---
+    // NIVEL 1: Por ID o name del botón (más confiable)
     const porId = document.querySelector(
       '[id*="btnSalir"], [name*="btnSalir"], [id*="btnFinalizar"], [name*="btnFinalizar"]'
     );
     if (porId) {
       porId.click();
-      return { clickeado: true, metodo: 'id/name', id: porId.id || porId.name };
+      return { clickeado: true, metodo: 'id/name', detalle: porId.id || porId.name };
     }
     
-    // --- NIVEL 2: Submit dentro del form de sesión activa ---
+    // NIVEL 2: Botón submit dentro del form de sesión activa
     const formSesion = document.querySelector(
       'form[action*="session-activa"], form[action*="sesion-activa"], form[action*="sso-session"]'
     );
@@ -551,18 +550,18 @@ async function manejarSesionActiva(page, requestId) {
       const submitBtn = formSesion.querySelector('button[type="submit"], input[type="submit"]');
       if (submitBtn) {
         submitBtn.click();
-        return { clickeado: true, metodo: 'form-submit', action: formSesion.action.substring(0, 60) };
+        return { clickeado: true, metodo: 'form-action', detalle: formSesion.action.substring(0, 60) };
       }
     }
     
-    // --- NIVEL 3: Botón PrimeFaces en página de sesión ---
+    // NIVEL 3: Botón PrimeFaces en contexto de sesión activa
     const uiButton = document.querySelector('.ui-button[type="submit"]');
     if (uiButton && document.body.innerText.includes('SESION ACTIVA')) {
       uiButton.click();
-      return { clickeado: true, metodo: 'ui-button', id: uiButton.id };
+      return { clickeado: true, metodo: 'ui-button', detalle: uiButton.id };
     }
     
-    // --- NIVEL 4: Fallback por texto (último recurso) ---
+    // NIVEL 4: Fallback por texto (último recurso)
     const botones = document.querySelectorAll('button, input[type="submit"], input[type="button"]');
     for (const el of botones) {
       const texto = (el.textContent || el.value || '').toUpperCase().trim();
@@ -570,7 +569,7 @@ async function manejarSesionActiva(page, requestId) {
         const rect = el.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {
           el.click();
-          return { clickeado: true, metodo: 'texto', texto: texto.substring(0, 40) };
+          return { clickeado: true, metodo: 'texto', detalle: texto.substring(0, 40) };
         }
       }
     }
@@ -579,47 +578,58 @@ async function manejarSesionActiva(page, requestId) {
   });
   
   if (!clickeado || !clickeado.clickeado) {
+    // Diagnóstico: qué botones hay en la página
     const diagnostico = await evaluarSeguro(page, () => {
-      const forms = [...document.querySelectorAll('form')].map(f => ({
-        id: f.id, action: (f.action || '').substring(0, 80)
-      }));
-      const botones = [...document.querySelectorAll('button, input[type="submit"]')].map(b => ({
-        tag: b.tagName, id: b.id, name: b.name, 
-        texto: (b.textContent || b.value || '').trim().substring(0, 50)
-      }));
-      return { forms, botones, url: location.href };
+      return {
+        url: location.href,
+        forms: [...document.querySelectorAll('form')].map(f => ({
+          id: f.id, action: (f.action || '').substring(0, 80)
+        })),
+        botones: [...document.querySelectorAll('button, input[type="submit"]')].map(b => ({
+          tag: b.tagName, id: b.id, name: b.name,
+          texto: (b.textContent || b.value || '').trim().substring(0, 50)
+        }))
+      };
     });
-    log('warn', `SESION:${requestId}`, 'No se encontró botón. Diagnóstico:', JSON.stringify(diagnostico));
+    log('warn', `SESION:${requestId}`, 'Botón no encontrado. Diagnóstico:', JSON.stringify(diagnostico));
     return false;
   }
   
-  log('success', `SESION:${requestId}`, `✓ Botón encontrado por ${clickeado.metodo}: ${clickeado.id || clickeado.action || clickeado.texto || ''}`);
+  log('success', `SESION:${requestId}`, `✓ Botón encontrado [${clickeado.metodo}]: ${clickeado.detalle}`);
   metricas.sesionesFinalizadas++;
   
-  // Paso 3: Esperar a que se procese el clic
-  log('info', `SESION:${requestId}`, `Esperando ${TIMEOUT.esperaFinalizarSesion/1000}s...`);
-  await delay(TIMEOUT.esperaFinalizarSesion);
+  // Paso 3: Esperar que PrimeFaces procese el cierre (AJAX, no navegación)
+  log('info', `SESION:${requestId}`, 'Esperando que SINOE procese el cierre...');
+  await delay(3000);
   
-  // Paso 4: Esperar más y verificar que estamos en el login
-  await delay(TIMEOUT.esperaPostFinalizacion);
-  
-  const urlActual = await leerUrlSegura(page);
-  
-  if (urlActual && urlActual.includes('sso-validar')) {
-    log('success', `SESION:${requestId}`, 'Redirigido al login exitosamente');
-    return true;
-  }
-  
-  // Si no estamos en el login, intentar navegar manualmente
-  log('info', `SESION:${requestId}`, 'Navegando manualmente al login...');
+  // Paso 4: Navegar al login (SINOE no redirige automáticamente)
+  log('info', `SESION:${requestId}`, 'Navegando al login...');
   try {
     await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
-    await delay(3000);
-    return true;
   } catch (error) {
-    log('error', `SESION:${requestId}`, `Error navegando: ${error.message}`);
+    log('error', `SESION:${requestId}`, `Error navegando al login: ${error.message}`);
     return false;
   }
+  
+  // Paso 5: Confirmar que el login cargó (protección contra frame inestable)
+  log('info', `SESION:${requestId}`, 'Verificando que el login esté estable...');
+  for (let i = 1; i <= 10; i++) {
+    await delay(1000);
+    try {
+      const tienePassword = await evaluarSeguro(page, () => {
+        return !!document.querySelector('input[type="password"]');
+      });
+      if (tienePassword) {
+        log('success', `SESION:${requestId}`, `Login estable en intento ${i}`);
+        return true;
+      }
+    } catch (e) {
+      log('debug', `SESION:${requestId}`, `Frame no listo (${i}/10): ${e.message}`);
+    }
+  }
+  
+  log('warn', `SESION:${requestId}`, 'Login no se estabilizó después de 10 intentos');
+  return false;
 }
 
 // ============================================================
