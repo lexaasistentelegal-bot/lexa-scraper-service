@@ -1,9 +1,15 @@
 /**
  * ============================================================
- * LEXA SCRAPER - CORE MODULE v4.9.0
+ * LEXA SCRAPER - CORE MODULE v5.0.0
  * ============================================================
  * 
- * ⚠️  NO MODIFICAR ESTE ARCHIVO - ES LA BASE ESTABLE
+ * CAMBIOS v5.0.0 (2025-02-07):
+ * - manejarSesionActiva() REESCRITO completamente
+ * - Ahora espera navegación natural de PrimeFaces (no fuerza page.goto)
+ * - Diagnóstico completo cuando el login no aparece
+ * - Detección de loop: si SINOE muestra sesión activa otra vez
+ * - Reintentos automáticos (máx 2 veces) si hay loop
+ * - Logs detallados para debugging
  * 
  * Contiene:
  *   - Configuración y constantes
@@ -11,11 +17,10 @@
  *   - Lectura segura de páginas
  *   - WhatsApp (Evolution API)
  *   - Manejo de popups
- *   - Manejo de sesión activa
+ *   - Manejo de sesión activa (MEJORADO)
  *   - Credenciales
  *   - CAPTCHA
  * 
- * Si necesitas modificar algo, hazlo en index.js
  * ============================================================
  */
 
@@ -518,22 +523,55 @@ async function cerrarPopups(page, contexto = 'POPUP') {
 // ============================================================
 
 /**
- * Maneja la página de sesión activa haciendo clic en FINALIZAR SESIONES
+ * Diagnostica el estado actual de la página de SINOE
+ * Retorna información detallada sobre qué hay en la página
  */
-async function manejarSesionActiva(page, requestId) {
-  log('info', `SESION:${requestId}`, '🔄 Manejando sesión activa...');
-  
-  // Paso 1: Cerrar cualquier popup
-  log('info', `SESION:${requestId}`, 'Cerrando popups previos...');
-  await cerrarPopups(page, `SESION:${requestId}`);
-  await delay(1000);
-  
-  // Paso 2: Buscar botón de cierre de sesión por estructura del DOM
-  // Prioridad: selector ID/name → form action → clase PrimeFaces → texto
-  log('info', `SESION:${requestId}`, 'Buscando botón de cierre de sesión...');
-  
-  const clickeado = await evaluarSeguro(page, () => {
-    // NIVEL 1: Por ID o name del botón (más confiable)
+async function diagnosticarPaginaSINOE(page, contexto) {
+  try {
+    const diagnostico = await evaluarSeguro(page, () => {
+      const bodyText = document.body.innerText || '';
+      return {
+        url: location.href,
+        titulo: document.title,
+        // Detectar si es página de sesión activa
+        tieneSesionActiva: bodyText.includes('SESION ACTIVA') || 
+                          bodyText.includes('sesión activa') ||
+                          bodyText.includes('FINALIZAR SESIONES'),
+        tieneBotonFinalizar: !!document.querySelector('[id*="btnSalir"], [name*="btnSalir"], [id*="btnFinalizar"]'),
+        // Detectar si es página de login
+        tieneCampoPassword: !!document.querySelector('input[type="password"]'),
+        tieneFormLogin: !!document.querySelector('#frmLogin, form[action*="validar"]'),
+        tieneCaptcha: !!document.querySelector('[id*="captcha" i], img[src*="captcha"]'),
+        // Detectar si es dashboard
+        tieneDashboard: !!document.querySelector('#frmNuevo') || bodyText.includes('Bienvenido'),
+        // Detectar errores
+        tieneError: bodyText.toLowerCase().includes('error') || 
+                   bodyText.toLowerCase().includes('no válid'),
+        // Info adicional para debug
+        forms: [...document.querySelectorAll('form')].map(f => f.id || f.action?.substring(0, 50)).filter(Boolean),
+        inputs: [...document.querySelectorAll('input')].map(i => i.type).slice(0, 10),
+        textoVisible: bodyText.substring(0, 300).replace(/\s+/g, ' ').trim()
+      };
+    });
+    
+    if (diagnostico) {
+      log('debug', contexto, 'Diagnóstico de página:', JSON.stringify(diagnostico));
+    }
+    
+    return diagnostico;
+  } catch (error) {
+    log('warn', contexto, `Error en diagnóstico: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Busca y hace clic en el botón de FINALIZAR SESIONES por DOM
+ * Retorna { clickeado: boolean, metodo: string, detalle: string }
+ */
+async function clicBotonFinalizarSesiones(page, contexto) {
+  const resultado = await evaluarSeguro(page, () => {
+    // NIVEL 1: Por ID o name del botón (más confiable - el ID real es j_idt9:btnSalir)
     const porId = document.querySelector(
       '[id*="btnSalir"], [name*="btnSalir"], [id*="btnFinalizar"], [name*="btnFinalizar"]'
     );
@@ -542,26 +580,29 @@ async function manejarSesionActiva(page, requestId) {
       return { clickeado: true, metodo: 'id/name', detalle: porId.id || porId.name };
     }
     
-    // NIVEL 2: Botón submit dentro del form de sesión activa
+    // NIVEL 2: Botón submit dentro de un form en página de sesión activa
     const formSesion = document.querySelector(
       'form[action*="session-activa"], form[action*="sesion-activa"], form[action*="sso-session"]'
     );
     if (formSesion) {
-      const submitBtn = formSesion.querySelector('button[type="submit"], input[type="submit"]');
+      const submitBtn = formSesion.querySelector('button[type="submit"], input[type="submit"], button');
       if (submitBtn) {
         submitBtn.click();
-        return { clickeado: true, metodo: 'form-action', detalle: formSesion.action.substring(0, 60) };
+        return { clickeado: true, metodo: 'form-action', detalle: formSesion.action?.substring(0, 60) || formSesion.id };
       }
     }
     
-    // NIVEL 3: Botón PrimeFaces en contexto de sesión activa
-    const uiButton = document.querySelector('.ui-button[type="submit"]');
-    if (uiButton && document.body.innerText.includes('SESION ACTIVA')) {
-      uiButton.click();
-      return { clickeado: true, metodo: 'ui-button', detalle: uiButton.id };
+    // NIVEL 3: Botón PrimeFaces (.ui-button) si estamos en contexto de sesión activa
+    const bodyText = document.body.innerText || '';
+    if (bodyText.includes('SESION ACTIVA') || bodyText.includes('FINALIZAR')) {
+      const uiButton = document.querySelector('.ui-button[type="submit"], .ui-button');
+      if (uiButton) {
+        uiButton.click();
+        return { clickeado: true, metodo: 'ui-button', detalle: uiButton.id || 'ui-button' };
+      }
     }
     
-    // NIVEL 4: Fallback por texto (último recurso)
+    // NIVEL 4: Cualquier botón con texto FINALIZAR o CERRAR SESI
     const botones = document.querySelectorAll('button, input[type="submit"], input[type="button"]');
     for (const el of botones) {
       const texto = (el.textContent || el.value || '').toUpperCase().trim();
@@ -574,61 +615,193 @@ async function manejarSesionActiva(page, requestId) {
       }
     }
     
-    return { clickeado: false };
+    return { clickeado: false, metodo: 'ninguno', detalle: 'No se encontró botón' };
   });
   
-  if (!clickeado || !clickeado.clickeado) {
-    // Diagnóstico: qué botones hay en la página
-    const diagnostico = await evaluarSeguro(page, () => {
-      return {
-        url: location.href,
-        forms: [...document.querySelectorAll('form')].map(f => ({
-          id: f.id, action: (f.action || '').substring(0, 80)
-        })),
-        botones: [...document.querySelectorAll('button, input[type="submit"]')].map(b => ({
-          tag: b.tagName, id: b.id, name: b.name,
-          texto: (b.textContent || b.value || '').trim().substring(0, 50)
-        }))
-      };
-    });
-    log('warn', `SESION:${requestId}`, 'Botón no encontrado. Diagnóstico:', JSON.stringify(diagnostico));
-    return false;
+  return resultado || { clickeado: false, metodo: 'error', detalle: 'evaluarSeguro retornó null' };
+}
+
+/**
+ * Maneja la página de sesión activa haciendo clic en FINALIZAR SESIONES
+ * 
+ * FLUJO MEJORADO v5.0:
+ * 1. Cerrar popups
+ * 2. Hacer clic en FINALIZAR SESIONES
+ * 3. Esperar navegación natural de PrimeFaces (o timeout)
+ * 4. Diagnosticar qué cargó SINOE
+ * 5. Si hay sesión activa OTRA VEZ → reintentar (máx 2 veces)
+ * 6. Si no hay login → navegar manualmente
+ * 7. Verificar que el login esté listo
+ */
+async function manejarSesionActiva(page, requestId) {
+  const MAX_REINTENTOS_SESION = 2;
+  
+  log('info', `SESION:${requestId}`, '🔄 Manejando sesión activa...');
+  
+  for (let intentoSesion = 1; intentoSesion <= MAX_REINTENTOS_SESION; intentoSesion++) {
+    
+    // ─────────────────────────────────────────────────────────────
+    // PASO 1: Cerrar popups previos
+    // ─────────────────────────────────────────────────────────────
+    log('info', `SESION:${requestId}`, `[Intento ${intentoSesion}/${MAX_REINTENTOS_SESION}] Cerrando popups previos...`);
+    await cerrarPopups(page, `SESION:${requestId}`);
+    await delay(1000);
+    
+    // ─────────────────────────────────────────────────────────────
+    // PASO 2: Buscar y hacer clic en el botón FINALIZAR SESIONES
+    // ─────────────────────────────────────────────────────────────
+    log('info', `SESION:${requestId}`, 'Buscando botón de cierre de sesión...');
+    
+    const clickeado = await clicBotonFinalizarSesiones(page, `SESION:${requestId}`);
+    
+    if (!clickeado || !clickeado.clickeado) {
+      // Diagnóstico detallado si no encontró el botón
+      const diag = await diagnosticarPaginaSINOE(page, `SESION:${requestId}`);
+      log('warn', `SESION:${requestId}`, `Botón no encontrado. URL: ${diag?.url}, Forms: ${diag?.forms?.join(', ')}`);
+      
+      // Si no hay botón pero tampoco hay sesión activa, tal vez ya estamos en login
+      if (diag && diag.tieneCampoPassword && !diag.tieneSesionActiva) {
+        log('success', `SESION:${requestId}`, 'Ya estamos en la página de login (no había sesión activa)');
+        return true;
+      }
+      
+      return false;
+    }
+    
+    log('success', `SESION:${requestId}`, `✓ Clic en botón [${clickeado.metodo}]: ${clickeado.detalle}`);
+    metricas.sesionesFinalizadas++;
+    
+    // ─────────────────────────────────────────────────────────────
+    // PASO 3: Esperar navegación natural de PrimeFaces
+    // PrimeFaces hace AJAX y luego redirige automáticamente
+    // ─────────────────────────────────────────────────────────────
+    log('info', `SESION:${requestId}`, 'Esperando que PrimeFaces procese y redirija...');
+    
+    let navegacionDetectada = false;
+    try {
+      // Esperar navegación con timeout de 8 segundos
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
+        delay(8000) // Fallback si no hay navegación
+      ]);
+      navegacionDetectada = true;
+      log('info', `SESION:${requestId}`, 'Navegación/espera completada');
+    } catch (navError) {
+      // Timeout o error - no es crítico, continuamos con diagnóstico
+      log('debug', `SESION:${requestId}`, `waitForNavigation: ${navError.message}`);
+    }
+    
+    // Espera adicional para que SINOE estabilice la página
+    await delay(2000);
+    
+    // ─────────────────────────────────────────────────────────────
+    // PASO 4: Diagnosticar qué cargó SINOE
+    // ─────────────────────────────────────────────────────────────
+    log('info', `SESION:${requestId}`, 'Diagnosticando página actual...');
+    const diagnostico = await diagnosticarPaginaSINOE(page, `SESION:${requestId}`);
+    
+    if (!diagnostico) {
+      log('warn', `SESION:${requestId}`, 'No se pudo diagnosticar la página (frame inestable)');
+      await delay(2000);
+      continue; // Reintentar
+    }
+    
+    // ─────────────────────────────────────────────────────────────
+    // PASO 5: Tomar decisiones según el diagnóstico
+    // ─────────────────────────────────────────────────────────────
+    
+    // CASO A: Ya estamos en el login con campo password → ÉXITO
+    if (diagnostico.tieneCampoPassword && !diagnostico.tieneSesionActiva) {
+      log('success', `SESION:${requestId}`, '✅ Login detectado después de cerrar sesión');
+      return true;
+    }
+    
+    // CASO B: SINOE mostró "FINALIZAR SESIONES" OTRA VEZ → Reintentar clic
+    if (diagnostico.tieneSesionActiva || diagnostico.tieneBotonFinalizar) {
+      log('warn', `SESION:${requestId}`, `⚠️ Sesión activa detectada OTRA VEZ (intento ${intentoSesion}/${MAX_REINTENTOS_SESION})`);
+      
+      if (intentoSesion < MAX_REINTENTOS_SESION) {
+        log('info', `SESION:${requestId}`, 'Reintentando clic en FINALIZAR SESIONES...');
+        await delay(2000);
+        continue; // Volver al inicio del loop
+      } else {
+        log('error', `SESION:${requestId}`, 'Loop de sesión activa detectado. Abortando después de 2 intentos.');
+        return false;
+      }
+    }
+    
+    // CASO C: Dashboard (login exitoso previo?) → Éxito parcial
+    if (diagnostico.tieneDashboard) {
+      log('warn', `SESION:${requestId}`, 'Dashboard detectado (¿sesión ya activa válida?)');
+      // Esto no debería pasar, pero si estamos en el dashboard es "éxito" técnicamente
+      return true;
+    }
+    
+    // CASO D: Página desconocida → Navegar manualmente al login
+    log('warn', `SESION:${requestId}`, `Página inesperada: ${diagnostico.url}`);
+    log('info', `SESION:${requestId}`, 'Navegando manualmente al login...');
+    
+    try {
+      await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
+      await delay(2000);
+    } catch (gotoError) {
+      log('error', `SESION:${requestId}`, `Error navegando al login: ${gotoError.message}`);
+      return false;
+    }
+    
+    // Verificar después de la navegación manual
+    const diagPostGoto = await diagnosticarPaginaSINOE(page, `SESION:${requestId}`);
+    
+    if (diagPostGoto && diagPostGoto.tieneCampoPassword && !diagPostGoto.tieneSesionActiva) {
+      log('success', `SESION:${requestId}`, '✅ Login encontrado después de navegación manual');
+      return true;
+    }
+    
+    // Si después del goto todavía hay sesión activa, el loop continuará
+    if (diagPostGoto && diagPostGoto.tieneSesionActiva) {
+      log('warn', `SESION:${requestId}`, 'Sesión activa persiste después de navegación manual');
+      continue; // Reintentar
+    }
   }
   
-  log('success', `SESION:${requestId}`, `✓ Botón encontrado [${clickeado.metodo}]: ${clickeado.detalle}`);
-  metricas.sesionesFinalizadas++;
+  // ─────────────────────────────────────────────────────────────
+  // PASO 6: Verificación final con reintentos
+  // ─────────────────────────────────────────────────────────────
+  log('info', `SESION:${requestId}`, 'Verificación final del login (10 intentos)...');
   
-  // Paso 3: Esperar que PrimeFaces procese el cierre (AJAX, no navegación)
-  log('info', `SESION:${requestId}`, 'Esperando que SINOE procese el cierre...');
-  await delay(3000);
-  
-  // Paso 4: Navegar al login (SINOE no redirige automáticamente)
-  log('info', `SESION:${requestId}`, 'Navegando al login...');
-  try {
-    await page.goto(SINOE_URLS.login, { waitUntil: 'networkidle2', timeout: TIMEOUT.navegacion });
-  } catch (error) {
-    log('error', `SESION:${requestId}`, `Error navegando al login: ${error.message}`);
-    return false;
-  }
-  
-  // Paso 5: Confirmar que el login cargó (protección contra frame inestable)
-  log('info', `SESION:${requestId}`, 'Verificando que el login esté estable...');
   for (let i = 1; i <= 10; i++) {
     await delay(1000);
+    
     try {
       const tienePassword = await evaluarSeguro(page, () => {
         return !!document.querySelector('input[type="password"]');
       });
+      
       if (tienePassword) {
-        log('success', `SESION:${requestId}`, `Login estable en intento ${i}`);
-        return true;
+        // Verificar que NO sea página de sesión activa
+        const tieneSesionActiva = await evaluarSeguro(page, () => {
+          return document.body.innerText.includes('FINALIZAR SESIONES') ||
+                 document.body.innerText.includes('SESION ACTIVA');
+        });
+        
+        if (!tieneSesionActiva) {
+          log('success', `SESION:${requestId}`, `✅ Login verificado en intento ${i}/10`);
+          return true;
+        } else {
+          log('debug', `SESION:${requestId}`, `Intento ${i}/10: Password field existe pero también sesión activa`);
+        }
       }
     } catch (e) {
-      log('debug', `SESION:${requestId}`, `Frame no listo (${i}/10): ${e.message}`);
+      if (esErrorDeFrame(e)) {
+        log('debug', `SESION:${requestId}`, `Frame no listo (${i}/10)`);
+      }
     }
   }
   
-  log('warn', `SESION:${requestId}`, 'Login no se estabilizó después de 10 intentos');
+  // Diagnóstico final antes de fallar
+  const diagFinal = await diagnosticarPaginaSINOE(page, `SESION:${requestId}`);
+  log('error', `SESION:${requestId}`, `❌ Login no se estabilizó. Estado final: URL=${diagFinal?.url}, SesionActiva=${diagFinal?.tieneSesionActiva}, Password=${diagFinal?.tieneCampoPassword}`);
+  
   return false;
 }
 
