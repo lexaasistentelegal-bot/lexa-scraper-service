@@ -813,6 +813,7 @@ app.post('/webhook/whatsapp', (req, res) => {
       
       if (captcha.length >= 4 && captcha.length <= 8) {
         log('success', 'WEBHOOK', `CAPTCHA válido recibido: ${captcha}`);
+        sesionesActivas.delete(numero);  // FIX: Eliminar sesión ANTES de resolver (evita race condition)
         sesion.resolve(captcha);
         return res.json({ status: 'captcha_recibido', captcha });
       } else {
@@ -822,6 +823,7 @@ app.post('/webhook/whatsapp', (req, res) => {
       }
     }
     
+    log('warn', 'WEBHOOK', `Sin sesión activa para ${enmascarar(numero)}. Sesiones: ${sesionesActivas.size}`);
     res.json({ status: 'sin_sesion_activa' });
     
   } catch (error) {
