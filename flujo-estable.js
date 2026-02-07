@@ -99,74 +99,103 @@ const INDICADORES_LOGIN = [
  */
 async function escribirCaptchaEnCampo(page, captchaTexto, requestId) {
   const ctx = `ESTABLE:${requestId}`;
+  const MAX_REINTENTOS = 3;
   
   try {
     log('info', ctx, `Escribiendo CAPTCHA: ${captchaTexto}`);
     
-    // Buscar campo CAPTCHA
-    let campoCaptcha = null;
-    
-    for (const selector of SELECTORES_CAMPO_CAPTCHA) {
-      try {
-        campoCaptcha = await page.$(selector);
-        if (campoCaptcha) {
-          log('info', ctx, `Campo CAPTCHA encontrado: ${selector}`);
-          break;
-        }
-      } catch (e) { }
-    }
-    
-    if (!campoCaptcha) {
-      return { exito: false, error: 'No se encontró el campo CAPTCHA' };
-    }
-    
-    // Limpiar campo
-    await campoCaptcha.click({ clickCount: 3 });
-    await delay(100);
-    await page.keyboard.press('Backspace');
-    await delay(100);
-    
-    // Escribir CAPTCHA
-    await campoCaptcha.type(captchaTexto, { delay: 50 });
-    await delay(500);
-    
-    // Verificar que se escribió
-    const valorEscrito = await evaluarSeguro(page, (sel) => {
-      const campo = document.querySelector(sel);
-      return campo ? campo.value : '';
-    }, SELECTORES_CAMPO_CAPTCHA[0]);
-    
-    if (valorEscrito !== captchaTexto) {
-      log('warn', ctx, `Valor escrito no coincide: "${valorEscrito}" vs "${captchaTexto}"`);
+    for (let intento = 1; intento <= MAX_REINTENTOS; intento++) {
+      // Re-buscar el campo en cada intento (evita handles stale por PrimeFaces)
+      let campoCaptcha = null;
+      let selectorEncontrado = null;
       
-      // Intentar con JavaScript directo
-      await page.evaluate((texto, selectores) => {
-        for (const sel of selectores) {
-          const campo = document.querySelector(sel);
-          if (campo) {
-            campo.value = texto;
-            campo.dispatchEvent(new Event('input', { bubbles: true }));
-            campo.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
+      for (const selector of SELECTORES_CAMPO_CAPTCHA) {
+        try {
+          campoCaptcha = await page.$(selector);
+          if (campoCaptcha) {
+            selectorEncontrado = selector;
+            break;
           }
+        } catch (e) { }
+      }
+      
+      if (!campoCaptcha) {
+        if (intento < MAX_REINTENTOS) {
+          log('warn', ctx, `Campo no encontrado (${intento}/${MAX_REINTENTOS}), reintentando...`);
+          await delay(1000);
+          continue;
         }
-        return false;
-      }, captchaTexto, SELECTORES_CAMPO_CAPTCHA);
+        return { exito: false, error: 'No se encontró el campo CAPTCHA' };
+      }
+      
+      log('info', ctx, `Campo encontrado: ${selectorEncontrado} (intento ${intento}/${MAX_REINTENTOS})`);
+      
+      // Limpiar campo con focus explícito
+      await campoCaptcha.click({ clickCount: 3 });
+      await delay(100);
+      await page.keyboard.press('Backspace');
+      await delay(100);
+      
+      // Escribir CAPTCHA carácter por carácter
+      await campoCaptcha.type(captchaTexto, { delay: 50 });
+      await delay(500);
+      
+      // Verificar con el MISMO selector que encontró el campo (FIX: antes usaba [0])
+      const valorEscrito = await evaluarSeguro(page, (sel) => {
+        const campo = document.querySelector(sel);
+        return campo ? campo.value : '';
+      }, selectorEncontrado);
+      
+      if (valorEscrito === captchaTexto) {
+        log('success', ctx, `✅ CAPTCHA escrito correctamente (intento ${intento})`);
+        return { exito: true };
+      }
+      
+      log('warn', ctx, `type() no funcionó: "${valorEscrito}" vs "${captchaTexto}" (intento ${intento})`);
+      
+      // Fallback: escribir con JavaScript directo usando el selector correcto
+      const jsValor = await evaluarSeguro(page, (texto, sel) => {
+        const campo = document.querySelector(sel);
+        if (!campo) return null;
+        campo.value = '';
+        campo.value = texto;
+        campo.dispatchEvent(new Event('input', { bubbles: true }));
+        campo.dispatchEvent(new Event('change', { bubbles: true }));
+        return campo.value;
+      }, captchaTexto, selectorEncontrado);
+      
+      if (jsValor === captchaTexto) {
+        log('success', ctx, `✅ CAPTCHA escrito con JS directo (intento ${intento})`);
+        return { exito: true };
+      }
+      
+      log('warn', ctx, `JS directo retornó: "${jsValor}" (intento ${intento}/${MAX_REINTENTOS})`);
+      
+      // Si no es el último intento, esperar antes de reintentar
+      if (intento < MAX_REINTENTOS) {
+        await delay(1000);
+      }
     }
     
-    // Verificación final
-    const valorFinal = await evaluarSeguro(page, (sel) => {
-      const campo = document.querySelector(sel);
-      return campo ? campo.value : '';
-    }, SELECTORES_CAMPO_CAPTCHA[0]);
+    // Verificación final: buscar en TODOS los selectores por si el valor quedó en otro
+    const valorFinal = await evaluarSeguro(page, (selectores) => {
+      for (const sel of selectores) {
+        try {
+          const campo = document.querySelector(sel);
+          if (campo && campo.value) return campo.value;
+        } catch (e) { }
+      }
+      return '';
+    }, SELECTORES_CAMPO_CAPTCHA);
     
     if (valorFinal === captchaTexto) {
-      log('success', ctx, '✅ CAPTCHA escrito correctamente');
+      log('success', ctx, '✅ CAPTCHA confirmado en verificación final');
       return { exito: true };
-    } else {
-      log('warn', ctx, `CAPTCHA escrito parcialmente: "${valorFinal}"`);
-      return { exito: true }; // Continuar de todos modos
     }
+    
+    // FIX: Retornar FALSE cuando el campo está vacío (antes retornaba true)
+    log('error', ctx, `❌ CAPTCHA no escrito después de ${MAX_REINTENTOS} intentos. Campo: "${valorFinal}"`);
+    return { exito: false, error: `CAPTCHA no se escribió en el campo. Valor actual: "${valorFinal}"` };
     
   } catch (error) {
     log('error', ctx, `Error escribiendo CAPTCHA: ${error.message}`);
