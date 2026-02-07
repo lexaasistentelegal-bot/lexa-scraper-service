@@ -285,6 +285,8 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
           const s = sesionesActivas.get(whatsappNumero);
           if (s.requestId === requestId) {
             sesionesActivas.delete(whatsappNumero);
+            // Avisar al usuario que el CAPTCHA expiró (evita confusión con doble imagen)
+            enviarWhatsAppTexto(whatsappNumero, '⏰ Tiempo agotado. El CAPTCHA expiró. Solicite un nuevo acceso.').catch(() => {});
             reject(new Error('Timeout: CAPTCHA no resuelto en 5 minutos'));
           }
         }
@@ -507,6 +509,7 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
         nuevoTimeoutId = setTimeout(() => {
           if (sesionesActivas.has(whatsappNumero)) {
             sesionesActivas.delete(whatsappNumero);
+            enviarWhatsAppTexto(whatsappNumero, '⏰ Tiempo agotado. El CAPTCHA expiró. Solicite un nuevo acceso.').catch(() => {});
             reject(new Error('Timeout: CAPTCHA no resuelto en segundo intento'));
           }
         }, TIMEOUT.captcha);
