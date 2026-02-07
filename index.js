@@ -53,6 +53,7 @@ const {
   delay,
   log,
   enmascarar,
+  esErrorDeFrame,
   validarNumeroWhatsApp,
   validarCaptcha,
   iniciarLimpiezaAutomatica,
@@ -453,10 +454,31 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
         }
       }
       
+      await delay(2000);
       await cerrarPopups(page, `SCRAPER:${requestId}`);
-      await delay(1000);
       
-      await page.waitForSelector('input[type="password"]', { timeout: TIMEOUT.elemento });
+      // Esperar campo password con protección contra frame inestable
+      let loginListo = false;
+      for (let intento = 1; intento <= 5; intento++) {
+        try {
+          await page.waitForSelector('input[type="password"]', { timeout: 5000 });
+          loginListo = true;
+          break;
+        } catch (e) {
+          if (esErrorDeFrame(e)) {
+            log('debug', `SCRAPER:${requestId}`, `Frame no listo post-sesión (${intento}/5)`);
+            await delay(2000);
+          } else if (intento === 5) {
+            throw e;
+          } else {
+            await delay(1000);
+          }
+        }
+      }
+      
+      if (!loginListo) {
+        throw new Error('Login no cargó después de cerrar sesión activa');
+      }
       
       await llenarCredenciales(page, sinoeUsuario, sinoePassword);
       await delay(1000);
