@@ -529,29 +529,48 @@ async function manejarSesionActiva(page, requestId) {
   await delay(1000);
   
   // Paso 2: Buscar y hacer clic en "FINALIZAR SESIONES"
-  log('info', `SESION:${requestId}`, 'Buscando botón FINALIZAR SESIONES...');
+  // Paso 2: Buscar botón de cierre de sesión por estructura del DOM
+  // Estrategia: selectores > atributos > texto (en ese orden de prioridad)
+  log('info', `SESION:${requestId}`, 'Buscando botón de cierre de sesión...');
   
   const clickeado = await evaluarSeguro(page, () => {
-    const elementos = document.querySelectorAll('button, a, input[type="submit"], input[type="button"], .ui-button');
+    // --- NIVEL 1: Selector directo por ID o name (más confiable) ---
+    const porId = document.querySelector(
+      '[id*="btnSalir"], [name*="btnSalir"], [id*="btnFinalizar"], [name*="btnFinalizar"]'
+    );
+    if (porId) {
+      porId.click();
+      return { clickeado: true, metodo: 'id/name', id: porId.id || porId.name };
+    }
     
-    for (const el of elementos) {
-      const texto = (el.textContent || '').toUpperCase().trim();
-      const valor = (el.value || '').toUpperCase().trim();
-      const onclick = (el.getAttribute('onclick') || '').toLowerCase();
-      
-      const esBotonFinalizar = 
-        texto.includes('FINALIZAR') || 
-        valor.includes('FINALIZAR') ||
-        onclick.includes('finalizar');
-      
-      if (esBotonFinalizar) {
+    // --- NIVEL 2: Submit dentro del form de sesión activa ---
+    const formSesion = document.querySelector(
+      'form[action*="session-activa"], form[action*="sesion-activa"], form[action*="sso-session"]'
+    );
+    if (formSesion) {
+      const submitBtn = formSesion.querySelector('button[type="submit"], input[type="submit"]');
+      if (submitBtn) {
+        submitBtn.click();
+        return { clickeado: true, metodo: 'form-submit', action: formSesion.action.substring(0, 60) };
+      }
+    }
+    
+    // --- NIVEL 3: Botón PrimeFaces en página de sesión ---
+    const uiButton = document.querySelector('.ui-button[type="submit"]');
+    if (uiButton && document.body.innerText.includes('SESION ACTIVA')) {
+      uiButton.click();
+      return { clickeado: true, metodo: 'ui-button', id: uiButton.id };
+    }
+    
+    // --- NIVEL 4: Fallback por texto (último recurso) ---
+    const botones = document.querySelectorAll('button, input[type="submit"], input[type="button"]');
+    for (const el of botones) {
+      const texto = (el.textContent || el.value || '').toUpperCase().trim();
+      if (texto.includes('FINALIZAR') || texto.includes('CERRAR SESI')) {
         const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        
-        if (rect.width > 0 && rect.height > 0 && 
-            style.display !== 'none' && style.visibility !== 'hidden') {
+        if (rect.width > 0 && rect.height > 0) {
           el.click();
-          return { clickeado: true, texto: texto.substring(0, 30) || valor.substring(0, 30) };
+          return { clickeado: true, metodo: 'texto', texto: texto.substring(0, 40) };
         }
       }
     }
@@ -560,11 +579,21 @@ async function manejarSesionActiva(page, requestId) {
   });
   
   if (!clickeado || !clickeado.clickeado) {
-    log('warn', `SESION:${requestId}`, 'No se encontró botón FINALIZAR SESIONES');
+    const diagnostico = await evaluarSeguro(page, () => {
+      const forms = [...document.querySelectorAll('form')].map(f => ({
+        id: f.id, action: (f.action || '').substring(0, 80)
+      }));
+      const botones = [...document.querySelectorAll('button, input[type="submit"]')].map(b => ({
+        tag: b.tagName, id: b.id, name: b.name, 
+        texto: (b.textContent || b.value || '').trim().substring(0, 50)
+      }));
+      return { forms, botones, url: location.href };
+    });
+    log('warn', `SESION:${requestId}`, 'No se encontró botón. Diagnóstico:', JSON.stringify(diagnostico));
     return false;
   }
   
-  log('success', `SESION:${requestId}`, `✓ Clic en "${clickeado.texto}"`);
+  log('success', `SESION:${requestId}`, `✓ Botón encontrado por ${clickeado.metodo}: ${clickeado.id || clickeado.action || clickeado.texto || ''}`);
   metricas.sesionesFinalizadas++;
   
   // Paso 3: Esperar a que se procese el clic
