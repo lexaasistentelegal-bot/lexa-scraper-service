@@ -1,12 +1,23 @@
 /**
  * ════════════════════════════════════════════════════════════════════════════════
- * LEXA SCRAPER — EXTRACCIÓN v7.0.0
+ * LEXA SCRAPER — EXTRACCIÓN v7.1.0
  * ════════════════════════════════════════════════════════════════════════════════
  *
  * Autor:   LEXA Assistant (CTO)
  * Fecha:   Febrero 2026
  *
  * Changelog:
+ *   v7.1.0  — FIX CASCADA DE FALLOS EN MODALES
+ *     • FIX BUG-CASCADE-001: Detección de página muerta (evaluarSeguro=null)
+ *     • FIX BUG-CASCADE-002: Recovery automático (reload/navegación a casillas)
+ *     • FIX BUG-CASCADE-003: Verificación de salud ANTES de esperar tabla
+ *       (evita 25s de timeout inútil en página muerta)
+ *     • FIX BUG-MODAL-001: timeoutModal 15s → 25s (SINOE puede ser lento)
+ *     • NUEVO: verificarSaludPagina() — detecta contexto JS muerto
+ *     • NUEVO: recuperarPaginaCasillas() — reload o navegación directa
+ *     • NUEVO: Contador de fallos consecutivos con auto-recovery
+ *     • NUEVO: Abort automático después de N recuperaciones fallidas
+ *
  *   v7.0.0  — FIX CRÍTICO: DESCARGA CROSS-CONTAINER
  *     • FIX BUG FATAL: lexa-scraper y browserless son contenedores Docker
  *       separados. CDP Browser.downloadProgress descargaba al filesystem
@@ -64,7 +75,7 @@ const CONFIG_EXTRACCION = {
   intervaloVerificacion: 1000,  // ⬆️ v5.5.0: 1s (era 800ms)
 
   // Tiempo máximo para que abra el modal de anexos
-  timeoutModal: 15000,  // ⬆️ v5.5.0: 15s (era 12s)
+  timeoutModal: 25000,  // ⬆️ v7.1.0: 25s (era 15s — SINOE puede ser MUY lento)
 
   // Tiempo de espera después de hacer clic (para que PrimeFaces procese)
   esperaPostClic: 2500,  // ⬆️ v5.5.0: 2.5s (era 2s)
@@ -91,7 +102,20 @@ const CONFIG_EXTRACCION = {
   timeoutFiltro: 20000,  // ⬆️ v5.5.0: 20s (era 15s)
 
   // Máximo de páginas a recorrer en paginación
-  maxPaginas: 20
+  maxPaginas: 20,
+
+  // ⭐ v7.1.0: Configuración de recuperación
+  // Máximo de fallos consecutivos antes de intentar recuperar la página
+  maxFallosConsecutivos: 2,
+
+  // Máximo de recuperaciones antes de abortar
+  maxRecuperaciones: 2,
+
+  // URL de la bandeja de casillas (para navegación de recovery)
+  urlCasillas: 'https://casillas.pj.gob.pe/sinoe/pages/casillas/notificaciones/notificacion-bandeja.xhtml',
+
+  // Timeout para recovery navigation
+  timeoutRecovery: 30000
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -2010,6 +2034,187 @@ async function cerrarModal(page, requestId) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// PASO 15.3b: VERIFICACIÓN DE SALUD Y RECUPERACIÓN DE PÁGINA (v7.1.0)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Verifica si la página sigue viva y en la bandeja de casillas.
+ *
+ * ┌────────────────────────────────────────────────────────────────────────┐
+ * │  v7.1.0 — FIX BUG-CASCADE-001                                        │
+ * │  Después de un modal fallido, PrimeFaces puede destruir el contexto  │
+ * │  JS. evaluarSeguro() retorna null y TODAS las siguientes fallan.     │
+ * │  Esta función detecta ese estado para poder recuperar.               │
+ * └────────────────────────────────────────────────────────────────────────┘
+ *
+ * @param {Page}   page      - Instancia de Puppeteer page
+ * @param {string} requestId - ID único para logs
+ * @returns {Promise<{viva: boolean, enCasillas: boolean, tieneTabla: boolean, url: string}>}
+ */
+async function verificarSaludPagina(page, requestId) {
+  const ctx = `SALUD:${requestId}`;
+
+  try {
+    // Test 1: ¿La página está cerrada?
+    if (page.isClosed()) {
+      log('error', ctx, 'Página cerrada (isClosed=true)');
+      return { viva: false, enCasillas: false, tieneTabla: false, url: 'closed' };
+    }
+
+    // Test 2: ¿Podemos obtener la URL?
+    let url;
+    try {
+      url = page.url();
+    } catch (e) {
+      log('error', ctx, `No se puede obtener URL: ${e.message}`);
+      return { viva: false, enCasillas: false, tieneTabla: false, url: 'error' };
+    }
+
+    // Test 3: ¿El contexto JS está vivo? (evaluarSeguro retorna null si no)
+    const test = await evaluarSeguro(page, () => {
+      const tbody = document.querySelector('tbody[id*="tblLista_data"]');
+      const filas = tbody ? tbody.querySelectorAll('tr[data-ri]').length : 0;
+      return {
+        readyState: document.readyState,
+        tieneTabla: filas > 0,
+        filas: filas
+      };
+    });
+
+    if (!test) {
+      log('warn', ctx, `Contexto JS muerto (evaluarSeguro=null). URL: ${url}`);
+      return { viva: true, enCasillas: false, tieneTabla: false, url: url, contextoMuerto: true };
+    }
+
+    const enCasillas = url.includes('notificacion-bandeja') || url.includes('casillas');
+
+    log('debug', ctx, `OK — URL: ${url.substring(url.lastIndexOf('/') + 1)}, tabla: ${test.tieneTabla}, filas: ${test.filas}`);
+
+    return {
+      viva: true,
+      enCasillas: enCasillas,
+      tieneTabla: test.tieneTabla,
+      filas: test.filas,
+      url: url,
+      contextoMuerto: false
+    };
+
+  } catch (error) {
+    log('error', ctx, `Error verificando salud: ${error.message}`);
+    return { viva: false, enCasillas: false, tieneTabla: false, url: 'error' };
+  }
+}
+
+
+/**
+ * Recupera la página de casillas cuando el DOM está roto.
+ *
+ * Estrategias en orden:
+ *   1. Reload de la página actual (si todavía estamos en casillas)
+ *   2. Navegación directa a la URL de casillas
+ *   3. Esperar que la tabla se cargue
+ *
+ * @param {Page}   page      - Instancia de Puppeteer page
+ * @param {string} requestId - ID único para logs
+ * @returns {Promise<{recuperada: boolean, filas: number}>}
+ */
+async function recuperarPaginaCasillas(page, requestId) {
+  const ctx = `RECOVERY:${requestId}`;
+
+  log('warn', ctx, '🔄 INICIANDO RECUPERACIÓN DE PÁGINA...');
+
+  try {
+    // ── Estrategia 1: Reload si estamos en casillas ──
+    const salud = await verificarSaludPagina(page, requestId);
+
+    if (salud.enCasillas || salud.contextoMuerto) {
+      log('info', ctx, 'Recargando página actual...');
+      try {
+        await page.reload({ waitUntil: 'networkidle2', timeout: CONFIG_EXTRACCION.timeoutRecovery });
+        await delay(3000); // Esperar que PrimeFaces inicialice
+
+        // Cerrar popup de bienvenida si aparece
+        try {
+          await evaluarSeguro(page, () => {
+            const botones = document.querySelectorAll('button, a');
+            for (const btn of botones) {
+              const texto = (btn.textContent || '').toLowerCase();
+              if (texto.includes('aceptar') || texto.includes('cerrar') || texto.includes('ok')) {
+                btn.click();
+                return { cerrado: true };
+              }
+            }
+            return { cerrado: false };
+          });
+          await delay(1000);
+        } catch (e) { /* ignorar popup */ }
+
+        // Verificar que la tabla cargó
+        const recarga = await esperarTablaCargada(page, requestId);
+        if (recarga.cargada && recarga.tieneFilas) {
+          log('success', ctx, `✅ RECUPERADA (reload) — ${recarga.cantidadFilas} filas`);
+          return { recuperada: true, filas: recarga.cantidadFilas };
+        }
+      } catch (reloadError) {
+        log('warn', ctx, `Reload falló: ${reloadError.message}`);
+      }
+    }
+
+    // ── Estrategia 2: Navegación directa a casillas ──
+    log('info', ctx, 'Navegando directamente a bandeja de casillas...');
+    try {
+      await page.goto(CONFIG_EXTRACCION.urlCasillas, {
+        waitUntil: 'networkidle2',
+        timeout: CONFIG_EXTRACCION.timeoutRecovery
+      });
+      await delay(3000);
+
+      // Cerrar popup si aparece
+      try {
+        await evaluarSeguro(page, () => {
+          const botones = document.querySelectorAll('button, a');
+          for (const btn of botones) {
+            const texto = (btn.textContent || '').toLowerCase();
+            if (texto.includes('aceptar') || texto.includes('cerrar')) {
+              btn.click();
+              return true;
+            }
+          }
+          return false;
+        });
+        await delay(1000);
+      } catch (e) { /* ignorar */ }
+
+      // Verificar tabla
+      const recarga = await esperarTablaCargada(page, requestId);
+      if (recarga.cargada && recarga.tieneFilas) {
+        log('success', ctx, `✅ RECUPERADA (navegación) — ${recarga.cantidadFilas} filas`);
+        return { recuperada: true, filas: recarga.cantidadFilas };
+      }
+
+      // Puede que la tabla cargue sin filtro, intentar una vez más
+      log('info', ctx, 'Tabla sin datos, esperando más...');
+      await delay(5000);
+      const recarga2 = await esperarTablaCargada(page, requestId);
+      if (recarga2.cargada) {
+        log('success', ctx, `✅ RECUPERADA (2do intento) — ${recarga2.cantidadFilas} filas`);
+        return { recuperada: true, filas: recarga2.cantidadFilas };
+      }
+    } catch (navError) {
+      log('error', ctx, `Navegación falló: ${navError.message}`);
+    }
+
+    log('error', ctx, '❌ NO SE PUDO RECUPERAR LA PÁGINA');
+    return { recuperada: false, filas: 0 };
+
+  } catch (error) {
+    log('error', ctx, `Error en recuperación: ${error.message}`);
+    return { recuperada: false, filas: 0 };
+  }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════════
 // PASO 15.4: PROCESAR TODAS LAS NOTIFICACIONES
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -2041,6 +2246,8 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
   };
 
   const total = notificaciones.length;
+  let fallosConsecutivos = 0;    // ⭐ v7.1.0: Contador de cascada
+  let recuperacionesUsadas = 0;  // ⭐ v7.1.0: Contador de recoveries
 
   log('info', ctx, `════════════════════════════════════════════════════`);
   log('info', ctx, `Iniciando procesamiento de ${total} notificaciones...`);
@@ -2072,6 +2279,63 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
       error: null
     };
 
+    // ══════════════════════════════════════════════════════════════════════
+    // ⭐ v7.1.0: DETECCIÓN DE CASCADA — Si hay N fallos consecutivos,
+    // la página probablemente está muerta. Intentar recovery.
+    // ══════════════════════════════════════════════════════════════════════
+    if (fallosConsecutivos >= CONFIG_EXTRACCION.maxFallosConsecutivos) {
+      log('warn', ctx, `⚠️ ${fallosConsecutivos} fallos consecutivos detectados — verificando salud de página...`);
+
+      const salud = await verificarSaludPagina(page, requestId);
+
+      if (!salud.viva || salud.contextoMuerto || !salud.tieneTabla) {
+        // Página muerta — intentar recovery
+        if (recuperacionesUsadas >= CONFIG_EXTRACCION.maxRecuperaciones) {
+          log('error', ctx, `❌ ABORTANDO — ${recuperacionesUsadas} recuperaciones fallidas. Página irrecuperable.`);
+          // Marcar todas las restantes como fallidas
+          for (let j = i; j < total; j++) {
+            resultado.fallidas++;
+            resultado.detalles.push({
+              indice: j,
+              expediente: notificaciones[j].expediente,
+              numeroNotificacion: notificaciones[j].numNotificacion || notificaciones[j].numeroNotificacion || '',
+              exito: false,
+              error: 'Abortado: página irrecuperable después de múltiples intentos'
+            });
+          }
+          break; // Salir del for
+        }
+
+        log('warn', ctx, `🔄 Intentando recuperación ${recuperacionesUsadas + 1}/${CONFIG_EXTRACCION.maxRecuperaciones}...`);
+        const recovery = await recuperarPaginaCasillas(page, requestId);
+        recuperacionesUsadas++;
+
+        if (recovery.recuperada) {
+          log('success', ctx, `✅ Página recuperada — continuando desde notificación ${i + 1}`);
+          fallosConsecutivos = 0; // Reset contador
+          // La tabla se re-cargó, los data-ri pueden haber cambiado
+          // Las notificaciones se re-localizan por numNotificacion
+        } else {
+          log('error', ctx, `❌ Recovery falló — abortando procesamiento`);
+          for (let j = i; j < total; j++) {
+            resultado.fallidas++;
+            resultado.detalles.push({
+              indice: j,
+              expediente: notificaciones[j].expediente,
+              numeroNotificacion: notificaciones[j].numNotificacion || notificaciones[j].numeroNotificacion || '',
+              exito: false,
+              error: 'Abortado: no se pudo recuperar la página'
+            });
+          }
+          break;
+        }
+      } else {
+        // Página viva pero los modales fallan — puede ser un problema de SINOE
+        log('info', ctx, `Página viva (${salud.filas} filas) — reiniciando contador de fallos`);
+        fallosConsecutivos = 0;
+      }
+    }
+
     try {
       // ── 0. Navegar a la página correcta si es necesario ──
       if (paginaNotif !== paginaActualTabla) {
@@ -2092,6 +2356,7 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
         log('warn', ctx, `${progreso} ✗ ${detalle.error}`);
         resultado.fallidas++;
         resultado.detalles.push(detalle);
+        fallosConsecutivos++;  // ⭐ v7.1.0: Incrementar cascada
 
         // ── Limpieza defensiva: el clic PrimeFaces pudo haber disparado ──
         // ── un AJAX aunque el modal no se detectó. Cerrar modal zombie   ──
@@ -2099,7 +2364,14 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
         try {
           await cerrarModal(page, requestId);
           await delay(CONFIG_EXTRACCION.pausaEntreNotificaciones);
-          await esperarTablaCargada(page, requestId);
+
+          // ⭐ v7.1.0: Verificar salud antes de esperar tabla (evita 25s de timeout inútil)
+          const saludPost = await verificarSaludPagina(page, requestId);
+          if (saludPost.viva && !saludPost.contextoMuerto) {
+            await esperarTablaCargada(page, requestId);
+          } else {
+            log('warn', ctx, `${progreso} Página muerta después de modal fallido — saltando espera de tabla`);
+          }
         } catch (cleanupError) {
           // Ignorar — es limpieza defensiva
         }
@@ -2114,6 +2386,7 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
         detalle.error = descargaResult.error || 'No se pudo descargar';
         log('warn', ctx, `${progreso} ✗ ${detalle.error}`);
         resultado.fallidas++;
+        fallosConsecutivos++;  // ⭐ v7.1.0
       } else {
         // Guardar PDF en el objeto de la notificación
         if (descargaResult.base64) {
@@ -2123,6 +2396,7 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
           notif.descargado = true;
           detalle.exito = true;
           resultado.exitosas++;
+          fallosConsecutivos = 0;  // ⭐ v7.1.0: Reset en éxito
           log('success', ctx, `${progreso} ✓ PDF descargado (${Math.round(descargaResult.base64.length / 1024)}KB)`);
         } else {
           // Clic exitoso pero sin base64 (Método C fallback)
@@ -2131,6 +2405,7 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
           detalle.exito = true;
           detalle.sinBase64 = true;
           resultado.parciales++;
+          fallosConsecutivos = 0;  // ⭐ v7.1.0: Reset parcial también cuenta
           log('warn', ctx, `${progreso} ⚠ Clic en Consolidado OK pero PDF no capturado como base64`);
         }
       }
@@ -2141,17 +2416,16 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
       // ══════════════════════════════════════════════════════════════════
       // ██ FIX CRÍTICO v3.0.0: Esperar que PrimeFaces recargue la tabla
       // ══════════════════════════════════════════════════════════════════
-      //
-      // Después de cerrar el modal, PrimeFaces hace un AJAX update que
-      // DESTRUYE y RECREA todas las filas de la tabla. Si intentamos
-      // abrir el siguiente modal sin esperar, el DOM está en transición
-      // y evaluarSeguro() retorna null → "resultado null".
-      //
-      // Este era el bug original que causaba que solo la 1ra descarga
-      // funcionara y las 2-7 fallaran.
-      // ══════════════════════════════════════════════════════════════════
       if (i < total - 1) {
         await delay(CONFIG_EXTRACCION.pausaEntreNotificaciones);
+
+        // ⭐ v7.1.0: Verificar salud ANTES de esperar tabla
+        const saludPost = await verificarSaludPagina(page, requestId);
+        if (!saludPost.viva || saludPost.contextoMuerto) {
+          log('warn', ctx, `${progreso} Página muerta después de cerrar modal — recovery en siguiente iteración`);
+          fallosConsecutivos = CONFIG_EXTRACCION.maxFallosConsecutivos; // Forzar recovery
+          continue;
+        }
 
         // Esperar que la tabla se reconstruya antes de tocar la siguiente fila
         const recarga = await esperarTablaCargada(page, requestId);
@@ -2163,7 +2437,8 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
           // Segundo intento
           const recarga2 = await esperarTablaCargada(page, requestId);
           if (!recarga2.cargada) {
-            log('error', ctx, `${progreso} Tabla sigue sin cargar — las siguientes notificaciones pueden fallar`);
+            log('error', ctx, `${progreso} Tabla sigue sin cargar — forzando recovery`);
+            fallosConsecutivos = CONFIG_EXTRACCION.maxFallosConsecutivos; // Forzar recovery
           }
         }
       }
@@ -2172,6 +2447,7 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
       detalle.error = error.message;
       log('error', ctx, `${progreso} ✗ Error: ${error.message}`);
       resultado.fallidas++;
+      fallosConsecutivos++;  // ⭐ v7.1.0
 
       // Intentar cerrar modal si quedó abierto
       try {
@@ -2180,10 +2456,13 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
         // Ignorar error al cerrar — ya estamos en manejo de error
       }
 
-      // Intentar recuperar la tabla
+      // ⭐ v7.1.0: Verificar salud antes de intentar recuperar tabla
       try {
-        await delay(2000);
-        await esperarTablaCargada(page, requestId);
+        const saludPost = await verificarSaludPagina(page, requestId);
+        if (saludPost.viva && !saludPost.contextoMuerto) {
+          await delay(2000);
+          await esperarTablaCargada(page, requestId);
+        }
       } catch (recoverError) {
         // Ignorar
       }
@@ -2197,6 +2476,9 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
   // ────────────────────────────────────────────────────────────────────────
   log('info', ctx, `════════════════════════════════════════════════════`);
   log('info', ctx, `RESUMEN: ${resultado.exitosas} exitosas, ${resultado.parciales} parciales, ${resultado.fallidas} fallidas de ${total}`);
+  if (recuperacionesUsadas > 0) {
+    log('info', ctx, `  Recuperaciones de página: ${recuperacionesUsadas}`);
+  }
   log('info', ctx, `════════════════════════════════════════════════════`);
 
   return resultado;
@@ -2441,6 +2723,10 @@ module.exports = {
   descargarConsolidado,
   cerrarModal,
   procesarNotificaciones,
+
+  // ── v7.1.0: Salud + Recovery ──
+  verificarSaludPagina,
+  recuperarPaginaCasillas,
 
   // ── Utilidades ──
   capturarPantallaCasillas,
