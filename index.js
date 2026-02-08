@@ -1,8 +1,14 @@
 /**
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v5.2.0
+ * LEXA SCRAPER SERVICE v5.3.0
  * ============================================================
+ * 
+ * CORRECCIONES v5.3.0:
+ *   ✓ FIX BUG-007: Race condition en descarga de PDFs
+ *     (delay de 500ms antes del click para que listener se registre)
+ *   ✓ IMPLEMENTACIÓN: Módulos modal.js, descarga.js, cerrar.js
+ *     (procesamiento correcto de 1-N notificaciones)
  * 
  * CORRECCIONES v5.2.0:
  *   ✓ FIX BUG-006: Race condition en segundo CAPTCHA
@@ -38,6 +44,9 @@ const crypto = require('crypto');
 const core = require('./core');
 const flujoEstable = require('./flujo-estable');
 const extraccion = require('./extraccion');
+const modal = require('./modal');
+const descarga = require('./descarga');
+const cerrar = require('./cerrar');
 
 // ============================================================
 // EXTRAER FUNCIONES DE LOS MÓDULOS
@@ -84,17 +93,29 @@ const {
   verificarEstadoPagina
 } = flujoEstable;
 
-// De extraccion.js (Pasos 14-15)
+// De extraccion.js (Paso 14)
 const {
   esperarTablaCargada,
   extraerNotificaciones,
   diagnosticarPaginaCasillas,
   abrirModalAnexos,
-  descargarConsolidado,
-  cerrarModal,
-  procesarNotificaciones,
   capturarPantallaCasillas
 } = extraccion;
+
+// De modal.js (Paso 15.1)
+const {
+  esperarModalListo
+} = modal;
+
+// De descarga.js (Paso 15.2)
+const {
+  descargarConsolidado
+} = descarga;
+
+// De cerrar.js (Paso 15.3)
+const {
+  cerrarModal
+} = cerrar;
 
 // ============================================================
 // CREAR APLICACIÓN EXPRESS
@@ -643,7 +664,75 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     // ═══════════════════════════════════════════════════════════════════
     log('info', `SCRAPER:${requestId}`, 'Iniciando descarga de consolidados...');
     
-    const resultadoDescargas = await procesarNotificaciones(page, notificaciones, requestId);
+    // Loop de procesamiento por notificación
+    const resultadoDescargas = {
+      exitosas: 0,
+      fallidas: 0,
+      pdfsDescargados: []
+    };
+    
+    for (let i = 0; i < notificaciones.length; i++) {
+      const notif = notificaciones[i];
+      const numNotif = i + 1;
+      
+      log('info', `SCRAPER:${requestId}`, `Procesando ${numNotif}/${notificaciones.length}: ${notif.expediente || 'N/A'}`);
+      
+      try {
+        // 1. Abrir modal de anexos
+        const modalAbierto = await abrirModalAnexos(page, notif.dataRi, requestId, numNotif);
+        if (!modalAbierto || !modalAbierto.exito) {
+          throw new Error('No se pudo abrir modal de anexos');
+        }
+        
+        // 2. Esperar que modal esté listo
+        const modalListo = await esperarModalListo(page, requestId);
+        if (!modalListo || !modalListo.listo) {
+          throw new Error(modalListo?.error || 'Modal no quedó listo');
+        }
+        
+        // 3. Descargar PDF consolidado
+        const pdfDescargado = await descargarConsolidado(page, requestId);
+        if (!pdfDescargado || !pdfDescargado.exito) {
+          throw new Error(pdfDescargado?.error || 'No se pudo descargar PDF');
+        }
+        
+        // 4. Cerrar modal
+        const modalCerrado = await cerrarModal(page, requestId);
+        if (!modalCerrado || !modalCerrado.cerrado) {
+          log('warn', `SCRAPER:${requestId}`, 'Modal no se cerró correctamente, continuando...');
+        }
+        
+        // Guardar PDF descargado
+        notif.pdf = pdfDescargado.base64;
+        notif.nombreArchivo = pdfDescargado.nombreArchivo;
+        notif.tamano = pdfDescargado.tamano;
+        
+        resultadoDescargas.exitosas++;
+        resultadoDescargas.pdfsDescargados.push({
+          expediente: notif.expediente,
+          nombreArchivo: pdfDescargado.nombreArchivo,
+          tamano: pdfDescargado.tamano
+        });
+        
+        log('success', `SCRAPER:${requestId}`, `✓ Notificación ${numNotif}/${notificaciones.length} procesada`);
+        
+      } catch (error) {
+        log('error', `SCRAPER:${requestId}`, `Error en notificación ${numNotif}: ${error.message}`);
+        resultadoDescargas.fallidas++;
+        
+        // Intentar cerrar modal si quedó abierto
+        try {
+          await cerrarModal(page, requestId);
+        } catch (e) {
+          // Ignorar error de cierre
+        }
+      }
+      
+      // Delay entre notificaciones
+      if (i < notificaciones.length - 1) {
+        await delay(1000);
+      }
+    }
     
     log('info', `SCRAPER:${requestId}`, 
       `Descargas: ${resultadoDescargas.exitosas} exitosas, ${resultadoDescargas.fallidas} fallidas`
