@@ -1,8 +1,16 @@
 /**
 /**
  * ============================================================
- * LEXA SCRAPER SERVICE v5.2.0
+ * LEXA SCRAPER SERVICE v5.3.0
  * ============================================================
+ * 
+ * CORRECCIONES v5.3.0 (2026-02-08):
+ *   ✓ FIX BUG-009: Limpieza de sesiones zombie
+ *     (elimina sesión vieja y su timeout antes de crear nueva)
+ *   ✓ FIX BUG-010: Validación de requestId en timeouts
+ *     (evita que timeout de scraper viejo borre sesión de scraper nuevo)
+ *   ✓ MEJORA: Logging detallado en webhook para debugging
+ *   ✓ MEJORA: Mensajes de debug con requestId para trazabilidad
  * 
  * CORRECCIONES v5.2.0:
  *   ✓ FIX BUG-006: Race condition en segundo CAPTCHA
@@ -283,17 +291,46 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
     // ═══════════════════════════════════════════════════════════════════
     // ESPERAR RESPUESTA DEL ABOGADO (CAPTCHA)
     // ═══════════════════════════════════════════════════════════════════
+    
+    // ⭐ FIX v5.3.0: Limpiar sesión zombie si existe (de scraper anterior con timeout)
+    if (sesionesActivas.has(whatsappNumero)) {
+      const sesionVieja = sesionesActivas.get(whatsappNumero);
+      const edadSesion = Date.now() - sesionVieja.timestamp;
+      
+      log('warn', `SCRAPER:${requestId}`, `Sesión zombie detectada (${sesionVieja.requestId}, edad: ${Math.round(edadSesion/1000)}s)`);
+      
+      // Cancelar timeout de la sesión vieja
+      if (sesionVieja.timeoutId) {
+        clearTimeout(sesionVieja.timeoutId);
+        log('info', `SCRAPER:${requestId}`, 'Timeout de sesión vieja cancelado');
+      }
+      
+      // Rechazar Promise de sesión vieja (silent fail si ya fue resuelta)
+      if (sesionVieja.reject) {
+        try {
+          sesionVieja.reject(new Error('Sesión reemplazada por nuevo scraper'));
+        } catch (e) {
+          // Ignorar - Promise ya fue resuelta/rechazada
+        }
+      }
+      
+      sesionesActivas.delete(whatsappNumero);
+      log('success', `SCRAPER:${requestId}`, 'Sesión zombie eliminada');
+    }
+    
     log('info', `SCRAPER:${requestId}`, 'Esperando respuesta del abogado (máx 5 min)...');
     
     const captchaTexto = await new Promise((resolve, reject) => {
       timeoutCaptchaId = setTimeout(() => {
         if (sesionesActivas.has(whatsappNumero)) {
           const s = sesionesActivas.get(whatsappNumero);
+          // ⭐ Verificar requestId para evitar borrar sesión de otro scraper
           if (s.requestId === requestId) {
             sesionesActivas.delete(whatsappNumero);
-            // Avisar al usuario que el CAPTCHA expiró (evita confusión con doble imagen)
             enviarWhatsAppTexto(whatsappNumero, '⏰ Tiempo agotado. El CAPTCHA expiró. Solicite un nuevo acceso.').catch(() => {});
             reject(new Error('Timeout: CAPTCHA no resuelto en 5 minutos'));
+          } else {
+            log('debug', `SCRAPER:${requestId}`, `Timeout ignorado - sesión actual es ${s.requestId}`);
           }
         }
       }, TIMEOUT.captcha);
@@ -308,6 +345,8 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
         nombreAbogado, 
         requestId
       });
+      
+      log('debug', `SCRAPER:${requestId}`, `Sesión creada - esperando CAPTCHA`);
     });
     
     if (timeoutCaptchaId) {
@@ -514,9 +553,15 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
       const nuevoCaptcha = await new Promise((resolve, reject) => {
         nuevoTimeoutId = setTimeout(() => {
           if (sesionesActivas.has(whatsappNumero)) {
-            sesionesActivas.delete(whatsappNumero);
-            enviarWhatsAppTexto(whatsappNumero, '⏰ Tiempo agotado. El CAPTCHA expiró. Solicite un nuevo acceso.').catch(() => {});
-            reject(new Error('Timeout: CAPTCHA no resuelto en segundo intento'));
+            const s = sesionesActivas.get(whatsappNumero);
+            // ⭐ Verificar requestId para evitar borrar sesión de otro scraper
+            if (s.requestId === requestId) {
+              sesionesActivas.delete(whatsappNumero);
+              enviarWhatsAppTexto(whatsappNumero, '⏰ Tiempo agotado. El CAPTCHA expiró. Solicite un nuevo acceso.').catch(() => {});
+              reject(new Error('Timeout: CAPTCHA no resuelto en segundo intento'));
+            } else {
+              log('debug', `SCRAPER:${requestId}`, `Timeout ignorado - sesión actual es ${s.requestId}`);
+            }
           }
         }, TIMEOUT.captcha);
         
@@ -526,6 +571,8 @@ async function ejecutarScraper({ sinoeUsuario, sinoePassword, whatsappNumero, no
           timestamp: Date.now(), 
           nombreAbogado, requestId
         });
+        
+        log('debug', `SCRAPER:${requestId}`, `Sesión creada (2do CAPTCHA) - esperando respuesta`);
       });
       
       if (nuevoTimeoutId) clearTimeout(nuevoTimeoutId);
@@ -801,35 +848,37 @@ app.post('/webhook/whatsapp', (req, res) => {
       return res.json({ status: 'ignorado', razon: 'mensaje propio' });
     }
     
-    log('info', 'WEBHOOK', `Mensaje de ${enmascarar(numero)}: ${mensaje}`);
+    log('info', 'WEBHOOK', `Mensaje de ${enmascarar(numero)}: ${mensaje.substring(0, 20)}...`);
     
     // Verificar si hay sesión activa para este número
     if (sesionesActivas.has(numero)) {
       const sesion = sesionesActivas.get(numero);
       
+      log('debug', 'WEBHOOK', `Sesión encontrada: requestId=${sesion.requestId}, edad=${Math.round((Date.now() - sesion.timestamp)/1000)}s`);
+      
       // Verificar que la sesión no expiró
       if (Date.now() - sesion.timestamp > TIMEOUT.captcha) {
-        log('warn', 'WEBHOOK', 'Sesión expirada, ignorando mensaje');
+        log('warn', 'WEBHOOK', `Sesión expirada (${sesion.requestId}), ignorando mensaje`);
         sesionesActivas.delete(numero);
-        return res.json({ status: 'sesion_expirada' });
+        return res.json({ status: 'sesion_expirada', requestId: sesion.requestId });
       }
       
       // Limpiar mensaje (solo alfanumérico)
       const captcha = mensaje.trim().replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
       
       if (captcha.length >= 4 && captcha.length <= 8) {
-        log('success', 'WEBHOOK', `CAPTCHA válido recibido: ${captcha}`);
-        sesionesActivas.delete(numero);  // FIX: Eliminar sesión ANTES de resolver (evita race condition)
+        log('success', 'WEBHOOK', `CAPTCHA válido recibido: ${captcha} (requestId: ${sesion.requestId})`);
+        sesionesActivas.delete(numero);  // FIX v5.2.0: Eliminar sesión ANTES de resolver
         sesion.resolve(captcha);
-        return res.json({ status: 'captcha_recibido', captcha });
+        return res.json({ status: 'captcha_recibido', captcha, requestId: sesion.requestId });
       } else {
-        log('warn', 'WEBHOOK', `CAPTCHA inválido: "${captcha}" (${captcha.length} chars)`);
+        log('warn', 'WEBHOOK', `CAPTCHA inválido: "${captcha}" (${captcha.length} chars, esperado 4-8)`);
         enviarWhatsAppTexto(numero, '⚠️ El código debe tener entre 4 y 8 caracteres alfanuméricos. Intente de nuevo.');
-        return res.json({ status: 'captcha_invalido' });
+        return res.json({ status: 'captcha_invalido', longitud: captcha.length });
       }
     }
     
-    log('warn', 'WEBHOOK', `Sin sesión activa para ${enmascarar(numero)}. Sesiones: ${sesionesActivas.size}`);
+    log('warn', 'WEBHOOK', `Sin sesión activa para ${enmascarar(numero)}. Sesiones activas: ${sesionesActivas.size}`);
     res.json({ status: 'sin_sesion_activa' });
     
   } catch (error) {
