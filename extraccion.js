@@ -1787,6 +1787,11 @@ async function descargarConsolidado(page, requestId) {
 
   page.on('response', responseHandler);
 
+  // ⭐ FIX CRÍTICO: Delay de 1000ms para que el listener se registre completamente
+  // Esto resuelve el race condition donde el PDF pasa antes de que el listener esté activo
+  log('info', ctx, '⭐ Esperando 1000ms para registro de listener (fix race condition)...');
+  await delay(1000);
+
   // Hacer clic en el botón Consolidado
   const clicOk = await evaluarSeguro(page, (botonId) => {
     let boton = null;
@@ -1880,9 +1885,16 @@ async function descargarConsolidado(page, requestId) {
 async function cerrarModal(page, requestId) {
   const ctx = `CERRAR:${requestId}`;
 
-  // ────────────────────────────────────────────────────────────────────────
-  // 1. Intentar cerrar con botón
-  // ────────────────────────────────────────────────────────────────────────
+  try {
+    // ⭐ FIX: Validar que la sesión siga activa antes de intentar cerrar
+    if (!page || page.isClosed()) {
+      log('warn', ctx, 'Página ya cerrada, modal no necesita cerrarse');
+      return true; // Considerar exitoso porque el modal ya no existe
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 1. Intentar cerrar con botón
+    // ────────────────────────────────────────────────────────────────────────
   const cerrado = await evaluarSeguro(page, (selectores) => {
 
     // Buscar modal visible
@@ -1954,13 +1966,42 @@ async function cerrarModal(page, requestId) {
   // ────────────────────────────────────────────────────────────────────────
   // 3. Fallback: Tecla Escape
   // ────────────────────────────────────────────────────────────────────────
+  
+  // ⭐ FIX: Verificar sesión antes de usar keyboard
+  if (page.isClosed()) {
+    log('warn', ctx, 'Página cerrada antes de Escape, asumiendo modal cerrado');
+    return true;
+  }
+  
   try {
     await page.keyboard.press('Escape');
     log('info', ctx, 'Modal cerrado (Escape)');
     await delay(500);
     return true;
   } catch (e) {
+    // ⭐ FIX: Manejar específicamente error de sesión cerrada
+    if (e.message && (
+        e.message.includes('Session closed') ||
+        e.message.includes('Target closed') ||
+        e.message.includes('Protocol error'))) {
+      log('warn', ctx, 'Sesión cerrada durante cierre de modal (ignorar - modal ya no existe)');
+      return true; // Considerar exitoso
+    }
+    
     log('warn', ctx, `Error cerrando modal: ${e.message}`);
+    return false;
+  }
+  
+  } catch (error) {
+    // ⭐ NUEVO: Catch global para errores inesperados
+    if (error.message && (
+        error.message.includes('Session closed') ||
+        error.message.includes('Target closed'))) {
+      log('warn', ctx, 'Sesión cerrada (catch global) - asumiendo modal cerrado');
+      return true;
+    }
+    
+    log('error', ctx, `Error inesperado: ${error.message}`);
     return false;
   }
 }
