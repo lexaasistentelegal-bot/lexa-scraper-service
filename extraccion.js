@@ -1,12 +1,35 @@
 /**
  * ════════════════════════════════════════════════════════════════════════════════
- * LEXA SCRAPER — EXTRACCIÓN v7.1.0
+ * LEXA SCRAPER — EXTRACCIÓN v7.2.0
  * ════════════════════════════════════════════════════════════════════════════════
  *
  * Autor:   LEXA Assistant (CTO)
  * Fecha:   Febrero 2026
  *
  * Changelog:
+ *   v7.2.0  — AUDITORÍA SENIOR COMPLETA
+ *     • FIX-001: verificarSaludPagina — enCasillas ahora se evalúa desde URL
+ *       incluso con contexto JS muerto (antes retornaba false y recovery
+ *       nunca intentaba reload porque creía que no estábamos en casillas)
+ *     • FIX-002/003: recuperarPaginaCasillas — popup close ahora scoped a
+ *       diálogos PrimeFaces (antes hacía querySelector en TODA la página,
+ *       podía hacer clic en botones de navegación reales, NO solo popups).
+ *       + Detección de sesión expirada (redirect a login después de reload)
+ *     • FIX-004: procesarNotificaciones — paginaActualTabla se resetea a 1
+ *       después de recovery (reload/goto siempre vuelve a pág 1, pero el
+ *       tracker seguía en la página anterior → navegarAPagina fallaba)
+ *     • FIX-005: abrirModalAnexos — modal detection filtra diálogos de
+ *       error/confirmación (antes confundía un diálogo de "Error" con el
+ *       modal de anexos y reportaba "modal abierto" cuando no lo estaba)
+ *     • FIX-006: cerrarModal — reescrita con indentación correcta y estructura
+ *       try/catch limpia (antes tenía indentación de 2 espacios dentro de un
+ *       bloque de 4, y un try/catch anidado confuso)
+ *     • FIX-008: procesarNotificaciones — corregido double-count de fallidas:
+ *       si descarga fallaba (fallidas++) y luego cerrarModal/tableWait lanzaba
+ *       error, el catch global hacía fallidas++ DE NUEVO. Peor: si descarga
+ *       era exitosa (exitosas++) y cerrarModal lanzaba, se contaban AMBAS.
+ *       Ahora usa flag yaContado + try/catch interno para limpieza
+ *
  *   v7.1.0  — FIX CASCADA DE FALLOS EN MODALES
  *     • FIX BUG-CASCADE-001: Detección de página muerta (evaluarSeguro=null)
  *     • FIX BUG-CASCADE-002: Recovery automático (reload/navegación a casillas)
@@ -1525,9 +1548,26 @@ async function abrirModalAnexos(page, dataRi, requestId, numNotificacion) {
 
           if (ariaHidden === 'false' || (ariaHidden !== 'true' && display !== 'none')) {
             const titulo = modal.querySelector('.ui-dialog-title');
+            const tituloTexto = titulo ? titulo.textContent.trim() : '';
+
+            // ⭐ FIX-005 v7.2.0: Si es un selector genérico (.ui-dialog), verificar
+            // que el título contenga algo relevante a anexos/lista. Si es un diálogo
+            // de error o confirmación, NO es nuestro modal.
+            if (sel === '.ui-dialog[aria-hidden="false"]') {
+              const tituloLower = tituloTexto.toLowerCase();
+              const esDialogoError = tituloLower.includes('error') ||
+                                     tituloLower.includes('mensaje') ||
+                                     tituloLower.includes('confirmación') ||
+                                     tituloLower.includes('aviso');
+              if (esDialogoError) {
+                // Es un diálogo de error/sistema, no el modal de anexos
+                return { visible: false, esDialogoError: true, titulo: tituloTexto };
+              }
+            }
+
             return {
               visible: true,
-              titulo: titulo ? titulo.textContent.substring(0, 100) : ''
+              titulo: tituloTexto.substring(0, 100)
             };
           }
         }
@@ -1913,122 +1953,106 @@ async function cerrarModal(page, requestId) {
   const ctx = `CERRAR:${requestId}`;
 
   try {
-    // ⭐ FIX: Validar que la sesión siga activa antes de intentar cerrar
+    // ⭐ FIX-006 v7.2.0: Reescrita con indentación y estructura correctas
+    // Validar que la sesión siga activa antes de intentar cerrar
     if (!page || page.isClosed()) {
       log('warn', ctx, 'Página ya cerrada, modal no necesita cerrarse');
-      return true; // Considerar exitoso porque el modal ya no existe
+      return true;
     }
 
     // ────────────────────────────────────────────────────────────────────────
-    // 1. Intentar cerrar con botón
+    // 1. Intentar cerrar con botón (evaluarSeguro en el contexto del browser)
     // ────────────────────────────────────────────────────────────────────────
-  const cerrado = await evaluarSeguro(page, (selectores) => {
+    const cerrado = await evaluarSeguro(page, (selectores) => {
 
-    // Buscar modal visible
-    let modal = document.querySelector('.ui-dialog[aria-hidden="false"]');
+      // Buscar modal visible
+      let modal = document.querySelector('.ui-dialog[aria-hidden="false"]');
 
-    if (!modal) {
-      for (const sel of selectores.modal.contenedor) {
-        modal = document.querySelector(sel);
-        if (modal && modal.getAttribute('aria-hidden') !== 'true') break;
-        modal = null;
-      }
-    }
-
-    if (!modal) {
-      return { noHayModal: true };
-    }
-
-    // ── Estrategia 1: Botón X en la esquina ──
-    const botonX = modal.querySelector('.ui-dialog-titlebar-close');
-    if (botonX) {
-      try {
-        if (typeof jQuery !== 'undefined') {
-          jQuery(botonX).trigger('click');
-        } else {
-          botonX.click();
+      if (!modal) {
+        for (const sel of selectores.modal.contenedor) {
+          modal = document.querySelector(sel);
+          if (modal && modal.getAttribute('aria-hidden') !== 'true') break;
+          modal = null;
         }
-        return { exito: true, metodo: 'boton_X' };
-      } catch (e) {
-        // Continuar con siguiente estrategia si falla
       }
-    }
 
-    // ── Estrategia 2: Botón "Cerrar" en el footer ──
-    const botones = modal.querySelectorAll('button, a.ui-commandlink');
-    for (const btn of botones) {
-      const texto = (btn.textContent || '').toLowerCase();
-      if (texto.includes('cerrar') || texto.includes('close')) {
+      if (!modal) {
+        return { noHayModal: true };
+      }
+
+      // ── Estrategia 1: Botón X en la esquina ──
+      const botonX = modal.querySelector('.ui-dialog-titlebar-close');
+      if (botonX) {
         try {
           if (typeof jQuery !== 'undefined') {
-            jQuery(btn).trigger('click');
+            jQuery(botonX).trigger('click');
           } else {
-            btn.click();
+            botonX.click();
           }
-          return { exito: true, metodo: 'boton_cerrar' };
+          return { exito: true, metodo: 'boton_X' };
         } catch (e) {
-          // Continuar con siguiente botón si falla
+          // Continuar con siguiente estrategia
         }
       }
+
+      // ── Estrategia 2: Botón "Cerrar" en el footer ──
+      const botones = modal.querySelectorAll('button, a.ui-commandlink');
+      for (const btn of botones) {
+        const texto = (btn.textContent || '').toLowerCase();
+        if (texto.includes('cerrar') || texto.includes('close')) {
+          try {
+            if (typeof jQuery !== 'undefined') {
+              jQuery(btn).trigger('click');
+            } else {
+              btn.click();
+            }
+            return { exito: true, metodo: 'boton_cerrar' };
+          } catch (e) {
+            // Continuar con siguiente botón
+          }
+        }
+      }
+
+      return { exito: false, metodo: 'ninguno' };
+
+    }, SELECTORES);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 2. Evaluar resultado del clic
+    // ────────────────────────────────────────────────────────────────────────
+    if (cerrado && cerrado.noHayModal) {
+      log('info', ctx, 'No hay modal abierto');
+      return true;
     }
 
-    return { exito: false, metodo: 'ninguno' };
+    if (cerrado && cerrado.exito) {
+      log('info', ctx, `Modal cerrado (método: ${cerrado.metodo})`);
+      await delay(500);
+      return true;
+    }
 
-  }, SELECTORES);
+    // ────────────────────────────────────────────────────────────────────────
+    // 3. Fallback: Tecla Escape
+    // ────────────────────────────────────────────────────────────────────────
+    if (page.isClosed()) {
+      log('warn', ctx, 'Página cerrada antes de Escape');
+      return true;
+    }
 
-  // ────────────────────────────────────────────────────────────────────────
-  // 2. Verificar resultado
-  // ────────────────────────────────────────────────────────────────────────
-  if (cerrado && cerrado.noHayModal) {
-    log('info', ctx, 'No hay modal abierto');
-    return true;
-  }
-
-  if (cerrado && cerrado.exito) {
-    log('info', ctx, `Modal cerrado (método: ${cerrado.metodo})`);
-    await delay(500);
-    return true;
-  }
-
-  // ────────────────────────────────────────────────────────────────────────
-  // 3. Fallback: Tecla Escape
-  // ────────────────────────────────────────────────────────────────────────
-  
-  // ⭐ FIX: Verificar sesión antes de usar keyboard
-  if (page.isClosed()) {
-    log('warn', ctx, 'Página cerrada antes de Escape, asumiendo modal cerrado');
-    return true;
-  }
-  
-  try {
     await page.keyboard.press('Escape');
     log('info', ctx, 'Modal cerrado (Escape)');
     await delay(500);
     return true;
-  } catch (e) {
-    // ⭐ FIX: Manejar específicamente error de sesión cerrada
-    if (e.message && (
-        e.message.includes('Session closed') ||
-        e.message.includes('Target closed') ||
-        e.message.includes('Protocol error'))) {
-      log('warn', ctx, 'Sesión cerrada durante cierre de modal (ignorar - modal ya no existe)');
-      return true; // Considerar exitoso
-    }
-    
-    log('warn', ctx, `Error cerrando modal: ${e.message}`);
-    return false;
-  }
-  
+
   } catch (error) {
-    // ⭐ NUEVO: Catch global para errores inesperados
-    if (error.message && (
-        error.message.includes('Session closed') ||
-        error.message.includes('Target closed'))) {
-      log('warn', ctx, 'Sesión cerrada (catch global) - asumiendo modal cerrado');
+    // Catch global: sesión cerrada = modal ya no existe
+    const msg = error.message || '';
+    if (msg.includes('Session closed') || msg.includes('Target closed') || msg.includes('Protocol error')) {
+      log('warn', ctx, `Sesión cerrada durante cierre de modal: ${msg}`);
       return true;
     }
-    
-    log('error', ctx, `Error inesperado: ${error.message}`);
+
+    log('error', ctx, `Error cerrando modal: ${msg}`);
     return false;
   }
 }
@@ -2082,8 +2106,11 @@ async function verificarSaludPagina(page, requestId) {
     });
 
     if (!test) {
-      log('warn', ctx, `Contexto JS muerto (evaluarSeguro=null). URL: ${url}`);
-      return { viva: true, enCasillas: false, tieneTabla: false, url: url, contextoMuerto: true };
+      // ⭐ FIX-001 v7.2.0: Evaluar enCasillas desde URL incluso con contexto muerto
+      // Si no evaluamos la URL, recovery nunca intenta reload (cree que no estamos en casillas)
+      const enCasillasUrl = url.includes('notificacion-bandeja') || url.includes('casillas');
+      log('warn', ctx, `Contexto JS muerto (evaluarSeguro=null). URL: ${url}, enCasillas(URL): ${enCasillasUrl}`);
+      return { viva: true, enCasillas: enCasillasUrl, tieneTabla: false, url: url, contextoMuerto: true };
     }
 
     const enCasillas = url.includes('notificacion-bandeja') || url.includes('casillas');
@@ -2133,15 +2160,26 @@ async function recuperarPaginaCasillas(page, requestId) {
         await page.reload({ waitUntil: 'networkidle2', timeout: CONFIG_EXTRACCION.timeoutRecovery });
         await delay(3000); // Esperar que PrimeFaces inicialice
 
-        // Cerrar popup de bienvenida si aparece
+        // ⭐ FIX-002a v7.2.0: Detectar si SINOE redirigió a login después del reload
+        const urlPostReload = page.url();
+        if (urlPostReload.includes('login') || urlPostReload.includes('iniciarSesion') || urlPostReload.includes('autenticacion')) {
+          log('error', ctx, 'Sesión expirada — SINOE redirigió a login después del reload');
+          return { recuperada: false, filas: 0, sesionExpirada: true };
+        }
+
+        // ⭐ FIX-002b v7.2.0: Cerrar popup SOLO en diálogos/overlays (no botones de navegación)
         try {
           await evaluarSeguro(page, () => {
-            const botones = document.querySelectorAll('button, a');
-            for (const btn of botones) {
-              const texto = (btn.textContent || '').toLowerCase();
-              if (texto.includes('aceptar') || texto.includes('cerrar') || texto.includes('ok')) {
-                btn.click();
-                return { cerrado: true };
+            // Buscar solo en diálogos modales de PrimeFaces, no en toda la página
+            const dialogos = document.querySelectorAll('.ui-dialog[aria-hidden="false"], .ui-overlaypanel, .ui-confirm-dialog');
+            for (const dlg of dialogos) {
+              const botones = dlg.querySelectorAll('button, a.ui-commandlink');
+              for (const btn of botones) {
+                const texto = (btn.textContent || '').toLowerCase().trim();
+                if (texto === 'aceptar' || texto === 'cerrar' || texto === 'ok' || texto === 'sí') {
+                  btn.click();
+                  return { cerrado: true };
+                }
               }
             }
             return { cerrado: false };
@@ -2169,15 +2207,25 @@ async function recuperarPaginaCasillas(page, requestId) {
       });
       await delay(3000);
 
-      // Cerrar popup si aparece
+      // ⭐ FIX-003a v7.2.0: Detectar redirect a login
+      const urlPostNav = page.url();
+      if (urlPostNav.includes('login') || urlPostNav.includes('iniciarSesion') || urlPostNav.includes('autenticacion')) {
+        log('error', ctx, 'Sesión expirada — SINOE redirigió a login');
+        return { recuperada: false, filas: 0, sesionExpirada: true };
+      }
+
+      // ⭐ FIX-003b v7.2.0: Cerrar popup scoped a diálogos
       try {
         await evaluarSeguro(page, () => {
-          const botones = document.querySelectorAll('button, a');
-          for (const btn of botones) {
-            const texto = (btn.textContent || '').toLowerCase();
-            if (texto.includes('aceptar') || texto.includes('cerrar')) {
-              btn.click();
-              return true;
+          const dialogos = document.querySelectorAll('.ui-dialog[aria-hidden="false"], .ui-overlaypanel, .ui-confirm-dialog');
+          for (const dlg of dialogos) {
+            const botones = dlg.querySelectorAll('button, a.ui-commandlink');
+            for (const btn of botones) {
+              const texto = (btn.textContent || '').toLowerCase().trim();
+              if (texto === 'aceptar' || texto === 'cerrar' || texto === 'ok' || texto === 'sí') {
+                btn.click();
+                return true;
+              }
             }
           }
           return false;
@@ -2279,6 +2327,9 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
       error: null
     };
 
+    // ⭐ FIX-008 v7.2.0: Flag para evitar double-count en el catch
+    let yaContado = false;
+
     // ══════════════════════════════════════════════════════════════════════
     // ⭐ v7.1.0: DETECCIÓN DE CASCADA — Si hay N fallos consecutivos,
     // la página probablemente está muerta. Intentar recovery.
@@ -2313,6 +2364,7 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
         if (recovery.recuperada) {
           log('success', ctx, `✅ Página recuperada — continuando desde notificación ${i + 1}`);
           fallosConsecutivos = 0; // Reset contador
+          paginaActualTabla = 1;  // ⭐ FIX-004 v7.2.0: Recovery siempre vuelve a pág 1
           // La tabla se re-cargó, los data-ri pueden haber cambiado
           // Las notificaciones se re-localizan por numNotificacion
         } else {
@@ -2387,6 +2439,7 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
         log('warn', ctx, `${progreso} ✗ ${detalle.error}`);
         resultado.fallidas++;
         fallosConsecutivos++;  // ⭐ v7.1.0
+        yaContado = true;
       } else {
         // Guardar PDF en el objeto de la notificación
         if (descargaResult.base64) {
@@ -2397,6 +2450,7 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
           detalle.exito = true;
           resultado.exitosas++;
           fallosConsecutivos = 0;  // ⭐ v7.1.0: Reset en éxito
+          yaContado = true;
           log('success', ctx, `${progreso} ✓ PDF descargado (${Math.round(descargaResult.base64.length / 1024)}KB)`);
         } else {
           // Clic exitoso pero sin base64 (Método C fallback)
@@ -2406,47 +2460,69 @@ async function procesarNotificaciones(page, notificaciones, requestId) {
           detalle.sinBase64 = true;
           resultado.parciales++;
           fallosConsecutivos = 0;  // ⭐ v7.1.0: Reset parcial también cuenta
+          yaContado = true;
           log('warn', ctx, `${progreso} ⚠ Clic en Consolidado OK pero PDF no capturado como base64`);
         }
       }
 
-      // ── 3. Cerrar modal ──
-      await cerrarModal(page, requestId);
+      // ── 3. Cerrar modal + esperar tabla ──
+      // ⭐ FIX-008 v7.2.0: Envuelto en su propio try/catch para que errores
+      // aquí NO lleguen al catch global que haría double-count de fallidas
+      try {
+        await cerrarModal(page, requestId);
 
-      // ══════════════════════════════════════════════════════════════════
-      // ██ FIX CRÍTICO v3.0.0: Esperar que PrimeFaces recargue la tabla
-      // ══════════════════════════════════════════════════════════════════
-      if (i < total - 1) {
-        await delay(CONFIG_EXTRACCION.pausaEntreNotificaciones);
+        // ══════════════════════════════════════════════════════════════════
+        // ██ FIX CRÍTICO v3.0.0: Esperar que PrimeFaces recargue la tabla
+        // ══════════════════════════════════════════════════════════════════
+        if (i < total - 1) {
+          await delay(CONFIG_EXTRACCION.pausaEntreNotificaciones);
 
-        // ⭐ v7.1.0: Verificar salud ANTES de esperar tabla
-        const saludPost = await verificarSaludPagina(page, requestId);
-        if (!saludPost.viva || saludPost.contextoMuerto) {
-          log('warn', ctx, `${progreso} Página muerta después de cerrar modal — recovery en siguiente iteración`);
-          fallosConsecutivos = CONFIG_EXTRACCION.maxFallosConsecutivos; // Forzar recovery
-          continue;
-        }
-
-        // Esperar que la tabla se reconstruya antes de tocar la siguiente fila
-        const recarga = await esperarTablaCargada(page, requestId);
-
-        if (!recarga.cargada) {
-          log('warn', ctx, `${progreso} Tabla no recargó después de cerrar modal, esperando extra...`);
-          await delay(3000);
-
-          // Segundo intento
-          const recarga2 = await esperarTablaCargada(page, requestId);
-          if (!recarga2.cargada) {
-            log('error', ctx, `${progreso} Tabla sigue sin cargar — forzando recovery`);
+          // ⭐ v7.1.0: Verificar salud ANTES de esperar tabla
+          const saludPost = await verificarSaludPagina(page, requestId);
+          if (!saludPost.viva || saludPost.contextoMuerto) {
+            log('warn', ctx, `${progreso} Página muerta después de cerrar modal — recovery en siguiente iteración`);
             fallosConsecutivos = CONFIG_EXTRACCION.maxFallosConsecutivos; // Forzar recovery
+            resultado.detalles.push(detalle); // ⭐ FIX-009 v7.2.0: No perder el detalle
+            continue;
+          }
+
+          // Esperar que la tabla se reconstruya antes de tocar la siguiente fila
+          const recarga = await esperarTablaCargada(page, requestId);
+
+          if (!recarga.cargada) {
+            log('warn', ctx, `${progreso} Tabla no recargó después de cerrar modal, esperando extra...`);
+            await delay(3000);
+
+            // Segundo intento
+            const recarga2 = await esperarTablaCargada(page, requestId);
+            if (!recarga2.cargada) {
+              log('error', ctx, `${progreso} Tabla sigue sin cargar — forzando recovery`);
+              fallosConsecutivos = CONFIG_EXTRACCION.maxFallosConsecutivos; // Forzar recovery
+            }
           }
         }
+      } catch (cleanupError) {
+        // ⭐ FIX-008 v7.2.0: Error en limpieza post-descarga NO debe re-contar fallidas
+        log('warn', ctx, `${progreso} Error en limpieza post-descarga: ${cleanupError.message}`);
+        try {
+          const saludPost = await verificarSaludPagina(page, requestId);
+          if (!saludPost.viva || saludPost.contextoMuerto) {
+            fallosConsecutivos = CONFIG_EXTRACCION.maxFallosConsecutivos;
+          }
+        } catch (e) { /* ignorar */ }
       }
 
     } catch (error) {
-      detalle.error = error.message;
+      // ⭐ FIX-008 v7.2.0: Solo contar si no se contó ya en el try
+      // (errores en abrirModal o descargarConsolidado antes de yaContado=true)
+      if (!yaContado) {
+        detalle.error = error.message;
+        resultado.fallidas++;
+      } else {
+        // Ya se contó arriba, solo guardar el error de limpieza para debug
+        log('warn', ctx, `${progreso} Error post-conteo: ${error.message}`);
+      }
       log('error', ctx, `${progreso} ✗ Error: ${error.message}`);
-      resultado.fallidas++;
       fallosConsecutivos++;  // ⭐ v7.1.0
 
       // Intentar cerrar modal si quedó abierto
