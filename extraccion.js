@@ -1,31 +1,25 @@
 /**
  * ════════════════════════════════════════════════════════════════════════════════
- * LEXA SCRAPER — EXTRACCIÓN v6.1.0 
+ * LEXA SCRAPER — EXTRACCIÓN v7.0.0
  * ════════════════════════════════════════════════════════════════════════════════
  *
  * Autor:   LEXA Assistant (CTO)
  * Fecha:   Febrero 2026
  *
  * Changelog:
- *   v6.1.0  — AUDITORÍA PROFESIONAL — 7 BUGS CRÍTICOS CORREGIDOS
- *     • FIX BUG-CDP-001: Timeout se reinicia en downloadWillBegin
- *     • FIX BUG-CDP-002: Variable downloadTimeout con let (reasignable)
- *     • FIX BUG-CDP-003: Listeners CDP se eliminan (evita memory leak)
- *     • FIX BUG-CDP-004: Lectura de archivo con reintentos + backoff
- *     • FIX BUG-CDP-005: fs.rmdir → fs.rm (API moderna)
- *     • FIX BUG-CDP-006: Timeout se limpia en catch
- *     • MEJORA: Logging detallado de reintentos y cleanup
- *
- *   v6.0.0  — SOLUCIÓN CDP PARA DESCARGAS
- *     • FIX CRÍTICO: SINOE usa Content-Disposition: attachment
- *       page.on('response') NO captura descargas directas
- *     • NUEVA IMPLEMENTACIÓN: Chrome DevTools Protocol (CDP)
- *       - Browser.setDownloadBehavior configura carpeta de descarga
- *       - Browser.downloadProgress detecta cuando descarga completa
- *       - Lee archivo del disco y convierte a base64
- *     • TIMEOUT aumentado a 60s (PDFs grandes)
- *     • Validación magic number %PDF
- *     • Cleanup automático de archivos temporales
+ *   v7.0.0  — FIX CRÍTICO: DESCARGA CROSS-CONTAINER
+ *     • FIX BUG FATAL: lexa-scraper y browserless son contenedores Docker
+ *       separados. CDP Browser.downloadProgress descargaba al filesystem
+ *       de browserless, pero el scraper intentaba leer de su propio
+ *       filesystem → ENOENT siempre.
+ *     • NUEVA ESTRATEGIA: CDP Fetch domain (intercepta response en memoria)
+ *       - Fetch.enable intercepta responses HTTP en fase Response
+ *       - Fetch.getResponseBody obtiene el PDF como base64 directo
+ *       - CERO operaciones de filesystem (no necesita fs, path, crypto)
+ *       - Funciona sin importar la arquitectura de contenedores
+ *     • Eliminadas dependencias: fs, path, crypto (ya no se necesitan)
+ *     • Timeout 60s mantenido para PDFs grandes
+ *     • Validación magic number %PDF mantenida
  *
  *   v5.5.0  — AUDITORÍA SENIOR — FIX CRÍTICO "0 NOTIFICACIONES"
  *     • FIX BUG-007: Verificación de tabla antes de aplicar filtro
@@ -45,9 +39,6 @@
 // ════════════════════════════════════════════════════════════════════════════════
 
 const core = require('./core');
-const fs = require('fs').promises;
-const path = require('path');
-const crypto = require('crypto');
 
 const {
   delay,
@@ -1538,44 +1529,46 @@ async function abrirModalAnexos(page, dataRi, requestId, numNotificacion) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// PASO 15.2: DESCARGAR CONSOLIDADO COMO BASE64
+// PASO 15.2: DESCARGAR CONSOLIDADO CON CDP FETCH (v7.0.0)
 // ════════════════════════════════════════════════════════════════════════════════
 
 /**
- * Descarga el PDF consolidado desde el modal de anexos abierto.
+ * Descarga el PDF consolidado usando CDP Fetch domain.
  *
- * ESTRATEGIA DE CAPTURA:
- *   1. Buscar el botón/link "Consolidado" (o "btnDescargaTodo")
- *   2. Si es un <a> con href → capturar vía fetch() dentro del navegador
- *   3. Si es un <button> que dispara AJAX → interceptar response con
- *      page.on('response') y capturar el PDF vía response.buffer()
- *   4. Retornar el PDF como base64 crudo (sin prefijo data:)
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │  v7.0.0 — CAMBIO ARQUITECTÓNICO CRÍTICO                                    │
+ * │                                                                            │
+ * │  PROBLEMA: lexa-scraper y browserless son contenedores Docker separados.   │
+ * │  La v6.x usaba Browser.setDownloadBehavior que descargaba al filesystem    │
+ * │  de browserless. El scraper intentaba leer de SU filesystem → ENOENT.     │
+ * │                                                                            │
+ * │  SOLUCIÓN: CDP Fetch domain intercepta el HTTP response ANTES de que       │
+ * │  Chrome lo procese como descarga. Fetch.getResponseBody obtiene el PDF     │
+ * │  como base64 directamente en memoria. CERO operaciones de filesystem.     │
+ * │  Funciona sin importar dónde estén los contenedores.                      │
+ * └─────────────────────────────────────────────────────────────────────────────┘
  *
- * @param {Page}   page      - Instancia de Puppeteer page
- * @param {string} requestId - ID único para logs
- * @returns {Promise<{exito: boolean, base64?: string, nombre?: string, error?: string}>}
- */
-
-// ════════════════════════════════════════════════════════════════════════════════
-// PASO 15.2: DESCARGAR CONSOLIDADO CON CDP (v6.0.0)
-// ════════════════════════════════════════════════════════════════════════════════
-/**
- * Descarga el PDF consolidado usando CDP (Chrome DevTools Protocol)
- * 
+ * FLUJO:
+ *   1. Buscar botón "Consolidado" en el modal
+ *   2. Crear CDP session + habilitar Fetch interceptación en fase Response
+ *   3. Clic en Consolidado → SINOE envía POST con PDF como attachment
+ *   4. Fetch.requestPaused detecta Content-Disposition: attachment
+ *   5. Fetch.getResponseBody obtiene el PDF como base64 en memoria
+ *   6. Fetch.fulfillRequest deja pasar el response al browser
+ *   7. Retornar base64 directamente (sin tocar disco)
+ *
  * @param {Page}   page      - Instancia de Puppeteer page
  * @param {string} requestId - ID único para logs
  * @returns {Promise<{exito: boolean, base64?: string, nombre?: string, error?: string}>}
  */
 async function descargarConsolidado(page, requestId) {
   const ctx = `DESCARGA:${requestId}`;
-  const downloadId = crypto.randomUUID().substring(0, 8);
-  const downloadPath = `/tmp/sinoe-downloads/${downloadId}`;
-  
+
   let cdpSession = null;
-  let downloadTimeout = null; // ⭐ FIX BUG-CDP-002: let en vez de const (reasignable)
-  let downloadWillBeginHandler = null; // ⭐ FIX BUG-CDP-003: Referencias para cleanup
-  let downloadProgressHandler = null;
-  
+  let downloadTimeout = null;
+  let fetchHandler = null;
+  let fetchEnabled = false;
+
   try {
     log('info', ctx, 'Buscando botón Consolidado...');
 
@@ -1642,101 +1635,131 @@ async function descargarConsolidado(page, requestId) {
     log('info', ctx, `Botón encontrado: ${infoBoton.metodo} (${infoBoton.botonId})`);
 
     // ────────────────────────────────────────────────────────────────────────
-    // PASO 2: Configurar CDP para capturar descarga
+    // PASO 2: Configurar CDP Fetch para interceptar response HTTP
     // ────────────────────────────────────────────────────────────────────────
-    
-    // Crear directorio de descargas
-    try {
-      await fs.mkdir(downloadPath, { recursive: true });
-      log('debug', ctx, `Directorio creado: ${downloadPath}`);
-    } catch (e) {
-      log('warn', ctx, `Error creando directorio: ${e.message}`);
-    }
 
-    // Obtener CDP session
     cdpSession = await page.target().createCDPSession();
-    
-    // Configurar comportamiento de descarga
-    await cdpSession.send('Browser.setDownloadBehavior', {
-      behavior: 'allow',
-      downloadPath: downloadPath,
-      eventsEnabled: true
-    });
-    
-    log('success', ctx, '✓ CDP configurado para capturar descargas');
 
-    // Promise que se resolverá cuando la descarga complete
-    let downloadCompleteResolve;
-    let downloadCompleteReject;
-    
-    const downloadCompletePromise = new Promise((resolve, reject) => {
-      downloadCompleteResolve = resolve;
-      downloadCompleteReject = reject;
-    });
+    // Promise que se resolverá cuando capturemos el PDF
+    const capturaPromise = new Promise((resolve, reject) => {
 
-    // Timeout inicial (será reiniciado cuando comience la descarga)
-    downloadTimeout = setTimeout(() => {
-      downloadCompleteReject(new Error('Timeout: Descarga no inició en 60s'));
-    }, 60000);
-
-    // Variables para tracking
-    let downloadGuid = null;
-    let downloadedFileName = null;
-
-    // ⭐ FIX BUG-CDP-003: Definir handlers como funciones nominadas para poder eliminarlos
-    downloadWillBeginHandler = (event) => {
-      downloadGuid = event.guid;
-      downloadedFileName = event.suggestedFilename || 'consolidado.pdf';
-      
-      // ⭐ FIX BUG-CDP-001: Cancelar timeout inicial y crear uno nuevo desde que inicia descarga
-      if (downloadTimeout) {
-        clearTimeout(downloadTimeout);
-        log('debug', ctx, 'Timeout inicial cancelado, iniciando timeout de descarga');
-      }
-      
+      // Timeout de 60s
       downloadTimeout = setTimeout(() => {
-        downloadCompleteReject(new Error('Timeout: Descarga no completada en 60s desde inicio'));
+        reject(new Error('Timeout: PDF no capturado en 60s después del clic'));
       }, 60000);
-      
-      log('info', ctx, `📥 Descarga iniciada: ${downloadedFileName} (guid: ${downloadGuid})`);
-    };
 
-    downloadProgressHandler = (event) => {
-      if (event.state === 'inProgress') {
-        const progress = event.receivedBytes && event.totalBytes 
-          ? Math.round((event.receivedBytes / event.totalBytes) * 100)
-          : '?';
-        log('debug', ctx, `📊 Progreso: ${progress}% (${event.receivedBytes} bytes)`);
-      }
-      
-      if (event.state === 'completed') {
-        if (downloadTimeout) {
-          clearTimeout(downloadTimeout);
-          downloadTimeout = null;
+      // Handler para responses interceptados por Fetch domain
+      fetchHandler = async (event) => {
+        const { requestId: fetchReqId, responseStatusCode, responseHeaders } = event;
+        const headers = responseHeaders || [];
+
+        // Buscar headers relevantes (case-insensitive)
+        const contentDisp = headers.find(h => h.name.toLowerCase() === 'content-disposition');
+        const contentType = headers.find(h => h.name.toLowerCase() === 'content-type');
+        const contentTypeVal = (contentType && contentType.value) ? contentType.value.toLowerCase() : '';
+        const contentDispVal = (contentDisp && contentDisp.value) ? contentDisp.value.toLowerCase() : '';
+
+        // Detectar si es una descarga (PDF o attachment)
+        const esDescarga =
+          contentDispVal.includes('attachment') ||
+          contentTypeVal.includes('application/pdf') ||
+          contentTypeVal.includes('application/octet-stream') ||
+          contentTypeVal.includes('application/force-download') ||
+          contentTypeVal.includes('application/x-download');
+
+        if (esDescarga && responseStatusCode === 200) {
+          // ═══════════════════════════════════════════════════════════════
+          // ¡PDF DETECTADO! Capturar el body directamente en memoria
+          // ═══════════════════════════════════════════════════════════════
+          log('info', ctx, `📥 PDF detectado en response HTTP`);
+          log('info', ctx, `   Content-Type: ${contentTypeVal}`);
+          log('info', ctx, `   Content-Disposition: ${contentDispVal}`);
+
+          try {
+            // Obtener el body del response (viene como base64 del CDP)
+            const { body, base64Encoded } = await cdpSession.send('Fetch.getResponseBody', {
+              requestId: fetchReqId
+            });
+
+            // Convertir a base64 si no lo es ya
+            const pdfBase64 = base64Encoded
+              ? body
+              : Buffer.from(body, 'utf-8').toString('base64');
+
+            // Calcular tamaño real del PDF
+            const tamanoBytes = Math.round(pdfBase64.length * 0.75);
+            log('success', ctx, `✅ PDF capturado en memoria: ${Math.round(tamanoBytes / 1024)}KB`);
+
+            // Extraer nombre del archivo del Content-Disposition
+            let pdfFileName = 'consolidado.pdf';
+            if (contentDisp && contentDisp.value) {
+              // Intentar filename*= (RFC 5987, con encoding)
+              const matchStar = contentDisp.value.match(/filename\*=(?:UTF-8''|utf-8'')([^;\r\n]+)/i);
+              if (matchStar) {
+                pdfFileName = decodeURIComponent(matchStar[1].trim());
+              } else {
+                // Intentar filename= (simple)
+                const matchSimple = contentDisp.value.match(/filename=["']?([^"';\r\n]+)/i);
+                if (matchSimple) {
+                  pdfFileName = matchSimple[1].trim().replace(/^"|"$/g, '');
+                  // Decodificar si tiene encoding URL
+                  try { pdfFileName = decodeURIComponent(pdfFileName); } catch (e) { /* ignorar */ }
+                }
+              }
+            }
+            log('info', ctx, `   Nombre: ${pdfFileName}`);
+
+            // Dejar pasar el response original al browser (sin re-enviar body)
+            await cdpSession.send('Fetch.continueResponse', {
+              requestId: fetchReqId
+            }).catch((continueErr) => {
+              log('debug', ctx, `continueResponse falló (${continueErr.message}) — ignorar`);
+            });
+
+            // Limpiar timeout
+            if (downloadTimeout) {
+              clearTimeout(downloadTimeout);
+              downloadTimeout = null;
+            }
+
+            resolve({
+              base64: pdfBase64,
+              fileName: pdfFileName,
+              tamano: tamanoBytes
+            });
+
+          } catch (bodyError) {
+            log('warn', ctx, `Error obteniendo body del response: ${bodyError.message}`);
+            // Dejar pasar el response para no bloquear la página
+            await cdpSession.send('Fetch.continueResponse', { requestId: fetchReqId }).catch(() => {});
+            // NO rechazar la promise aquí — puede haber otro response que sí funcione
+          }
+
+        } else {
+          // No es PDF — dejar pasar inmediatamente (CRÍTICO para no bloquear la página)
+          await cdpSession.send('Fetch.continueResponse', { requestId: fetchReqId }).catch(() => {});
         }
-        log('success', ctx, `✅ Descarga completada: ${downloadedFileName}`);
-        downloadCompleteResolve({ fileName: downloadedFileName, guid: event.guid });
-      }
-      
-      if (event.state === 'canceled' || event.state === 'interrupted') {
-        if (downloadTimeout) {
-          clearTimeout(downloadTimeout);
-          downloadTimeout = null;
-        }
-        downloadCompleteReject(new Error(`Descarga ${event.state}`));
-      }
-    };
-    
-    // Registrar listeners
-    cdpSession.on('Browser.downloadWillBegin', downloadWillBeginHandler);
-    cdpSession.on('Browser.downloadProgress', downloadProgressHandler);
+      };
+
+      // Registrar handler ANTES de habilitar Fetch
+      cdpSession.on('Fetch.requestPaused', fetchHandler);
+    });
+
+    // Habilitar interceptación de responses HTTP
+    // urlPattern '*' intercepta TODAS las responses (las no-PDF se pasan inmediatamente)
+    await cdpSession.send('Fetch.enable', {
+      patterns: [{ urlPattern: '*', requestStage: 'Response' }]
+    });
+    fetchEnabled = true;
+
+    log('success', ctx, '✓ CDP Fetch configurado — interceptando responses HTTP');
 
     // ────────────────────────────────────────────────────────────────────────
     // PASO 3: Hacer clic en Consolidado
     // ────────────────────────────────────────────────────────────────────────
-    
+
     log('info', ctx, 'Haciendo clic en Consolidado...');
-    
+
     const clicOk = await evaluarSeguro(page, (botonId) => {
       let boton = null;
 
@@ -1780,135 +1803,71 @@ async function descargarConsolidado(page, requestId) {
       throw new Error(clicOk ? clicOk.error : 'Error desconocido al hacer clic');
     }
 
-    log('success', ctx, '✓ Clic realizado, esperando descarga...');
+    log('success', ctx, '✓ Clic realizado, esperando PDF en response HTTP...');
 
     // ────────────────────────────────────────────────────────────────────────
-    // PASO 4: Esperar a que la descarga complete
+    // PASO 4: Esperar captura del PDF (máx 60s)
     // ────────────────────────────────────────────────────────────────────────
-    
-    const downloadResult = await downloadCompletePromise;
-    
-    log('info', ctx, `Descarga completa, leyendo archivo: ${downloadResult.fileName}`);
+
+    const resultado = await capturaPromise;
 
     // ────────────────────────────────────────────────────────────────────────
-    // PASO 5: Leer archivo del disco y convertir a base64
+    // PASO 5: Validar que es un PDF real (magic number %PDF)
     // ────────────────────────────────────────────────────────────────────────
-    
-    const filePath = path.join(downloadPath, downloadResult.fileName);
-    
-    // ⭐ FIX BUG-CDP-004: Reintentos con backoff para lectura de archivo
-    // El evento 'completed' no garantiza que el archivo esté completamente escrito en disco
-    log('info', ctx, 'Esperando escritura completa del archivo en disco...');
-    
-    let fileBuffer;
-    const maxRetries = 5;
-    let lastError = null;
-    
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        // Backoff exponencial: 500ms, 700ms, 1100ms, 1700ms, 2500ms
-        const waitTime = 500 + (i * 400);
-        await delay(waitTime);
-        
-        // Intentar leer archivo
-        fileBuffer = await fs.readFile(filePath);
-        
-        // Validar que el archivo tiene contenido
-        if (fileBuffer.length === 0) {
-          throw new Error('Archivo vacío');
-        }
-        
-        log('debug', ctx, `✓ Archivo leído exitosamente: ${fileBuffer.length} bytes (intento ${i + 1}/${maxRetries})`);
-        break; // Lectura exitosa
-        
-      } catch (readError) {
-        lastError = readError;
-        
-        if (i < maxRetries - 1) {
-          log('warn', ctx, `Intento ${i + 1}/${maxRetries} falló: ${readError.message} — reintentando...`);
-        } else {
-          throw new Error(`Error leyendo archivo después de ${maxRetries} intentos: ${readError.message}`);
-        }
-      }
-    }
-    
-    // Verificar que fileBuffer tiene datos
-    if (!fileBuffer || fileBuffer.length === 0) {
-      throw new Error('Archivo vacío o no legible después de reintentos');
+
+    const pdfBuffer = Buffer.from(resultado.base64, 'base64');
+    const magicNumber = pdfBuffer.toString('hex', 0, 4);
+
+    if (magicNumber !== '25504446') { // %PDF en hex
+      throw new Error(`Archivo capturado no es PDF válido (magic: ${magicNumber}, primeros bytes: "${pdfBuffer.toString('utf-8', 0, 20)}")`);
     }
 
-    // Validar que es un PDF
-    const magicNumber = fileBuffer.toString('hex', 0, 4);
-    if (magicNumber !== '25504446') { // %PDF
-      throw new Error(`Archivo no es PDF (magic: ${magicNumber})`);
-    }
-
-    // Convertir a base64
-    const base64 = fileBuffer.toString('base64');
-    
-    log('success', ctx, `✅ PDF convertido: ${Math.round(base64.length / 1024)}KB base64`);
-
-    // ────────────────────────────────────────────────────────────────────────
-    // PASO 6: Limpiar archivos temporales
-    // ────────────────────────────────────────────────────────────────────────
-    
-    try {
-      await fs.unlink(filePath);
-      // ⭐ FIX BUG-CDP-005: fs.rmdir deprecated en Node 14+, usar fs.rm
-      await fs.rm(downloadPath, { recursive: true, force: true });
-      log('debug', ctx, 'Archivos temporales eliminados');
-    } catch (cleanupError) {
-      log('warn', ctx, `Error limpiando archivos: ${cleanupError.message}`);
-    }
+    log('success', ctx, `✅ PDF validado: ${Math.round(pdfBuffer.length / 1024)}KB — ${resultado.fileName}`);
 
     return {
       exito: true,
-      base64: base64,
-      nombre: downloadResult.fileName,
-      tamano: fileBuffer.length
+      base64: resultado.base64,
+      nombre: resultado.fileName,
+      tamano: pdfBuffer.length
     };
 
   } catch (error) {
-    // ⭐ FIX BUG-CDP-006: Limpiar timeout si hay error
+    // Limpiar timeout si hay error
     if (downloadTimeout) {
       clearTimeout(downloadTimeout);
       downloadTimeout = null;
       log('debug', ctx, 'Timeout cancelado debido a error');
     }
-    
+
     log('error', ctx, `Error: ${error.message}`);
-    
-    // Limpiar directorio temporal si existe
-    try {
-      await fs.rm(downloadPath, { recursive: true, force: true });
-      log('debug', ctx, 'Directorio temporal limpiado después de error');
-    } catch (e) {
-      // Ignorar errores de cleanup
-    }
-    
+
     return {
       exito: false,
       error: error.message
     };
-    
+
   } finally {
-    // ⭐ FIX BUG-CDP-003: Eliminar listeners antes de cerrar CDP session
+    // Cleanup CDP: deshabilitar Fetch, remover handler, cerrar session
     if (cdpSession) {
       try {
-        if (downloadWillBeginHandler) {
-          cdpSession.off('Browser.downloadWillBegin', downloadWillBeginHandler);
+        // Deshabilitar interceptación para no bloquear requests futuros
+        if (fetchEnabled) {
+          await cdpSession.send('Fetch.disable').catch(() => {});
         }
-        if (downloadProgressHandler) {
-          cdpSession.off('Browser.downloadProgress', downloadProgressHandler);
+
+        // Remover handler
+        if (fetchHandler) {
+          cdpSession.off('Fetch.requestPaused', fetchHandler);
         }
-        
+
+        // Cerrar CDP session
         await cdpSession.detach();
-        log('debug', ctx, 'CDP session cerrada y listeners eliminados');
+        log('debug', ctx, 'CDP session cerrada y Fetch deshabilitado');
       } catch (e) {
         log('warn', ctx, `Error cerrando CDP: ${e.message}`);
       }
     }
-    
+
     // Limpiar timeout final si quedó pendiente
     if (downloadTimeout) {
       clearTimeout(downloadTimeout);
