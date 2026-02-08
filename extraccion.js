@@ -1559,10 +1559,6 @@ async function abrirModalAnexos(page, dataRi, requestId, numNotificacion) {
 // ════════════════════════════════════════════════════════════════════════════════
 // PASO 15.2: DESCARGAR CONSOLIDADO CON CDP (v6.0.0)
 // ════════════════════════════════════════════════════════════════════════════════
-
-const path = require('path');
-const crypto = require('crypto');
-
 /**
  * Descarga el PDF consolidado usando CDP (Chrome DevTools Protocol)
  * 
