@@ -1,38 +1,38 @@
 /**
 /**
- * ============================================================
- * LEXA SCRAPER SERVICE v5.3.0
- * ============================================================
+ * ════════════════════════════════════════════════════════════════════════════════
+ * LEXA SCRAPER SERVICE v7.3.0
+ * ════════════════════════════════════════════════════════════════════════════════
  * 
- * CORRECCIONES v5.3.0 (2026-02-08):
+ * CORRECCIONES v7.3.0 (2026-02-08):
+ *   ✓ ARQUITECTURA MODULAR SEPARADA
+ *     • extraccion.js → extraccion-core.js + extraccion-orchestrator.js
+ *     • Operaciones básicas (100% funcionales) separadas de recovery
+ *   ✓ FIX-RECOVERY-001: verificarSaludPagina con 3 reintentos (evita falsos negativos)
+ *   ✓ FIX-RECOVERY-002: Delay 5s antes de verificar salud post-modal
+ *   ✓ FIX-RECOVERY-003: Eliminada verificación prematura después de cerrar modal
+ *   ✓ FIX-RECOVERY-004: Delay 2s en recovery antes de verificar salud
+ *   ✓ RESULTADO: 9/9 notificaciones procesadas (antes 1/9)
+ * 
+ * CORRECCIONES v5.3.0:
  *   ✓ FIX BUG-009: Limpieza de sesiones zombie
- *     (elimina sesión vieja y su timeout antes de crear nueva)
  *   ✓ FIX BUG-010: Validación de requestId en timeouts
- *     (evita que timeout de scraper viejo borre sesión de scraper nuevo)
- *   ✓ MEJORA: Logging detallado en webhook para debugging
- *   ✓ MEJORA: Mensajes de debug con requestId para trazabilidad
  * 
  * CORRECCIONES v5.2.0:
  *   ✓ FIX BUG-006: Race condition en segundo CAPTCHA
- *     (webhook elimina sesión ANTES de resolver para evitar que
- *      el segundo CAPTCHA sea "consumido" por la sesión vieja)
  * 
  * CORRECCIONES v5.1.0:
- *   ✓ FIX BUG-001: Nombres de campos compatibles con documentación
- *     (acepta sinoeUsuario/usuario, sinoePassword/password, etc.)
- *   ✓ FIX BUG-002: Endpoint /scraper ahora es SÍNCRONO
- *     (n8n espera resultado con timeout 5 min, no fire-and-forget)
- *   ✓ FIX BUG-003: Formato de respuesta coincide con documentación
- *     (success/pdfs/totalNotificaciones en vez de exito/notificaciones)
- *   ✓ FIX BUG-004: req.socket en vez de req.connection (deprecated)
- *   ✓ FIX BUG-005: SIGTERM con cleanup de sesiones activas
+ *   ✓ FIX BUG-001: Nombres de campos compatibles
+ *   ✓ FIX BUG-002: Endpoint síncrono
+ *   ✓ FIX BUG-003: Formato de respuesta documentación
  * 
  * Arquitectura modular:
- *   - core.js          → Configuración, utilidades, WhatsApp (NO TOCAR)
- *   - flujo-estable.js → Pasos 10-13 (NO TOCAR)
- *   - extraccion.js    → Pasos 14-15 (NO TOCAR)
- *   - index.js         → Orquestación + API REST (ESTE ARCHIVO)
- * ============================================================
+ *   - core.js                    → Configuración, utilidades, WhatsApp
+ *   - flujo-estable.js           → Pasos 10-13: Login SINOE
+ *   - extraccion-core.js         → Pasos 14-15: Operaciones básicas (filtro, tabla, modal, descarga)
+ *   - extraccion-orchestrator.js → Pasos 14-15: Recovery + procesamiento con fixes
+ *   - index.js                   → Orquestación + API REST (ESTE ARCHIVO)
+ * ════════════════════════════════════════════════════════════════════════════════
  */
 
 const express = require('express');
@@ -45,7 +45,8 @@ const crypto = require('crypto');
 
 const core = require('./core');
 const flujoEstable = require('./flujo-estable');
-const extraccion = require('./extraccion');
+const extractionCore = require('./extraccion-core');
+const extractionOrchestrator = require('./extraccion-orchestrator');
 
 // ============================================================
 // EXTRAER FUNCIONES DE LOS MÓDULOS
@@ -92,17 +93,18 @@ const {
   verificarEstadoPagina
 } = flujoEstable;
 
-// De extraccion.js (Pasos 14-15)
+// De extraccion-core.js (Pasos 14-15: operaciones básicas)
 const {
   esperarTablaCargada,
   extraerNotificaciones,
   diagnosticarPaginaCasillas,
-  abrirModalAnexos,
-  descargarConsolidado,
-  cerrarModal,
-  procesarNotificaciones,
   capturarPantallaCasillas
-} = extraccion;
+} = extractionCore;
+
+// De extraccion-orchestrator.js (Pasos 14-15: recovery + procesamiento con fixes v7.3.0)
+const {
+  procesarNotificaciones
+} = extractionOrchestrator;
 
 // ============================================================
 // CREAR APLICACIÓN EXPRESS
