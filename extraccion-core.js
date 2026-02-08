@@ -1146,21 +1146,24 @@ async function extraerNotificaciones(page, requestId, opciones = {}) {
   //         Esto evita que PrimeFaces recargue la tabla vía AJAX y la deje
   //         vacía temporalmente, causando que se extraigan 0 notificaciones.
   // ────────────────────────────────────────────────────────────────────────
+  
+  let estadoActual = null; // ⭐ FIX v7.3.1: Declarar aquí para tener scope en PASO 2
+  
   if (forzarSinFiltro) {
     log('info', ctx, 'PASO 0: forzarSinFiltro=true → Saltando verificación y filtro');
     aplicarFiltro = false;
   } else {
     log('info', ctx, 'PASO 0: Verificando estado actual de la tabla...');
 
-    const estadoActual = await verificarEstadoTablaActual(page, requestId);
+    estadoActual = await verificarEstadoTablaActual(page, requestId);
 
-    if (estadoActual.tieneFilas && estadoActual.cantidadFilas > 0) {
+    if (estadoActual && estadoActual.tieneFilas && estadoActual.cantidadFilas > 0) {
       log('success', ctx, '════════════════════════════════════════════════════════');
       log('success', ctx, `⭐ TABLA YA TIENE ${estadoActual.cantidadFilas} FILAS VISIBLES`);
       log('success', ctx, '   → NO se aplicará filtro de fechas (evita romper DOM)');
       log('success', ctx, '════════════════════════════════════════════════════════');
       aplicarFiltro = false;
-    } else if (estadoActual.estadoCarga === 'cargando') {
+    } else if (estadoActual && estadoActual.estadoCarga === 'cargando') {
       log('info', ctx, 'Tabla en estado de carga, esperando estabilización...');
       await delay(CONFIG_EXTRACCION.esperaPostClic);
     } else {
@@ -1191,22 +1194,33 @@ async function extraerNotificaciones(page, requestId, opciones = {}) {
   // ────────────────────────────────────────────────────────────────────────
   // PASO 2: Esperar que la tabla cargue y esté estable
   // ────────────────────────────────────────────────────────────────────────
-  log('info', ctx, 'PASO 2: Esperando carga de tabla...');
+  
+  // ⭐ FIX v7.3.1: Si ya verificamos filas en PASO 0, saltar esperarTablaCargada
+  // (evita timeout por inestabilidad de PrimeFaces)
+  let cantidadFilasVerificadas = 0;
+  
+  if (!forzarSinFiltro && estadoActual && estadoActual.tieneFilas && estadoActual.cantidadFilas > 0) {
+    log('info', ctx, `PASO 2: ⚡ Saltando esperarTablaCargada (${estadoActual.cantidadFilas} filas ya verificadas en PASO 0)`);
+    cantidadFilasVerificadas = estadoActual.cantidadFilas;
+  } else {
+    log('info', ctx, 'PASO 2: Esperando carga de tabla...');
 
-  const estadoCarga = await esperarTablaCargada(page, requestId);
+    const estadoCarga = await esperarTablaCargada(page, requestId);
 
-  if (!estadoCarga.cargada) {
-    log('error', ctx, '❌ Tabla no cargó correctamente');
-    await diagnosticarPaginaCasillas(page, requestId);
-    return [];
+    if (!estadoCarga.cargada) {
+      log('error', ctx, '❌ Tabla no cargó correctamente');
+      await diagnosticarPaginaCasillas(page, requestId);
+      return [];
+    }
+
+    if (!estadoCarga.tieneFilas) {
+      log('info', ctx, '✓ Tabla cargada pero no hay notificaciones');
+      return [];
+    }
+
+    cantidadFilasVerificadas = estadoCarga.cantidadFilas;
+    log('success', ctx, `✓ Tabla cargada y estable — ${estadoCarga.cantidadFilas} filas detectadas`);
   }
-
-  if (!estadoCarga.tieneFilas) {
-    log('info', ctx, '✓ Tabla cargada pero no hay notificaciones');
-    return [];
-  }
-
-  log('success', ctx, `✓ Tabla cargada y estable — ${estadoCarga.cantidadFilas} filas detectadas`);
 
   // ────────────────────────────────────────────────────────────────────────
   // PASO 3: Extraer notificaciones de la primera página
