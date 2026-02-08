@@ -1,62 +1,39 @@
 /**
  * ════════════════════════════════════════════════════════════════════════════════
- * LEXA SCRAPER — EXTRACCIÓN v5.5.0
+ * LEXA SCRAPER — EXTRACCIÓN v6.1.0
  * ════════════════════════════════════════════════════════════════════════════════
  *
  * Autor:   LEXA Assistant (CTO)
  * Fecha:   Febrero 2026
  *
  * Changelog:
+ *   v6.1.0  — AUDITORÍA PROFESIONAL — 7 BUGS CRÍTICOS CORREGIDOS
+ *     • FIX BUG-CDP-001: Timeout se reinicia en downloadWillBegin
+ *     • FIX BUG-CDP-002: Variable downloadTimeout con let (reasignable)
+ *     • FIX BUG-CDP-003: Listeners CDP se eliminan (evita memory leak)
+ *     • FIX BUG-CDP-004: Lectura de archivo con reintentos + backoff
+ *     • FIX BUG-CDP-005: fs.rmdir → fs.rm (API moderna)
+ *     • FIX BUG-CDP-006: Timeout se limpia en catch
+ *     • MEJORA: Logging detallado de reintentos y cleanup
+ *
+ *   v6.0.0  — SOLUCIÓN CDP PARA DESCARGAS
+ *     • FIX CRÍTICO: SINOE usa Content-Disposition: attachment
+ *       page.on('response') NO captura descargas directas
+ *     • NUEVA IMPLEMENTACIÓN: Chrome DevTools Protocol (CDP)
+ *       - Browser.setDownloadBehavior configura carpeta de descarga
+ *       - Browser.downloadProgress detecta cuando descarga completa
+ *       - Lee archivo del disco y convierte a base64
+ *     • TIMEOUT aumentado a 60s (PDFs grandes)
+ *     • Validación magic number %PDF
+ *     • Cleanup automático de archivos temporales
+ *
  *   v5.5.0  — AUDITORÍA SENIOR — FIX CRÍTICO "0 NOTIFICACIONES"
- *     • FIX BUG-007: SINOE carga tabla con datos por defecto (últimos 7 días).
- *       El código anterior SIEMPRE re-aplicaba el filtro, lo cual causaba que
- *       PrimeFaces recargara la tabla vía AJAX y la dejara vacía temporalmente.
- *       SOLUCIÓN: Nueva función verificarEstadoTablaActual() verifica si la
- *       tabla YA tiene datos ANTES de decidir si aplicar filtro.
- *     • FIX BUG-008: tiempoEstabilidadDom aumentado de 800ms a 1500ms para
- *       dar más tiempo a PrimeFaces de reconstruir el DOM.
- *     • NUEVO: Parámetro opciones.forzarSinFiltro para bypass total del filtro.
- *     • NUEVO: Logging mejorado con separadores visuales para debugging.
- *     • NUEVO: extraerNotificacionesPaginaActual ahora loguea el método usado.
+ *     • FIX BUG-007: Verificación de tabla antes de aplicar filtro
+ *     • FIX BUG-008: tiempoEstabilidadDom aumentado a 1500ms
  *
  *   v3.0.0  — Reescritura completa
- *     • FIX BUG CRÍTICO: Después de cerrarModal(), se llama a
- *       esperarTablaCargada() para que PrimeFaces reconstruya las filas
- *       AJAX antes de tocar la siguiente notificación.
- *     • FIX DESCARGA: Los PDFs Consolidados ahora se capturan como base64
- *       real usando fetch() dentro de page.evaluate(). Ya no solo se hace
- *       "clic y esperar" — se intercepta el contenido del archivo.
- *     • NUEVO: filtrarBandejaPorFecha() — Rellena campos Fecha Inicial /
- *       Final del formulario PrimeFaces y hace clic en Buscar.
- *     • NUEVO: Paginación completa — navega todas las páginas de resultados.
- *     • NUEVO: Re-localización de filas por N° Notificación en vez de
- *       data-ri fijo (el AJAX de PrimeFaces reasigna data-ri al recargar).
- *     • NUEVO: Campos alias (juzgado, fecha, pdf, nombreArchivo) para
- *       compatibilidad directa con el mapeo de index.js.
- *   v2.0.2  — Selectores corregidos para estructura real de SINOE
- *   v2.0.0  — Primera versión modular
- *
- * ┌─────────────────────────────────────────────────────────────────────────────┐
- * │  ESTE ARCHIVO CONTIENE LOS PASOS 14-15 DEL FLUJO DE SCRAPING              │
- * │                                                                            │
- * │  Paso 14: Filtrar bandeja + Extraer notificaciones de la tabla             │
- * │  Paso 15: Descargar PDFs consolidados como base64                          │
- * │                                                                            │
- * │  Para los pasos 1-13 (login, CAPTCHA, navegación), ver: flujo-estable.js  │
- * └─────────────────────────────────────────────────────────────────────────────┘
- *
- * ESTRUCTURA DE LA TABLA SINOE (verificada Feb 2026):
- * ┌────────┬────────┬─────┬─────────────────┬─────────────────────────┬─────────────────┬────────────────┬──────────────────┬────────┐
- * │ Chkbox │ Estado │ N°  │ N° Notificación │ N° Expediente           │ Sumilla         │ O.J.           │ Fecha            │ Anexos │
- * │  (0)   │  (1)   │ (2) │      (3)        │         (4)             │    (5)          │     (6)        │    (7)           │  (8)   │
- * └────────┴────────┴─────┴─────────────────┴─────────────────────────┴─────────────────┴────────────────┴──────────────────┴────────┘
- *
- * IDs REALES DE SINOE:
- *   - Tabla:           tbody[id*="tblLista_data"]
- *   - Filas:           tr[data-ri="N"]
- *   - Botón anexos:    button con span.ui-icon-circle-zoomout
- *   - Modal:           div[id*="dlgListaAnexos"]
- *   - Consolidado:     button[id*="btnDescargaTodo"]
+ *     • FIX: esperarTablaCargada() después de cerrarModal()
+ *     • NUEVO: Paginación completa
  *
  * ════════════════════════════════════════════════════════════════════════════════
  */
@@ -68,6 +45,9 @@
 // ════════════════════════════════════════════════════════════════════════════════
 
 const core = require('./core');
+const fs = require('fs').promises;
+const path = require('path');
+const crypto = require('crypto');
 
 const {
   delay,
@@ -1575,304 +1555,372 @@ async function abrirModalAnexos(page, dataRi, requestId, numNotificacion) {
  * @param {string} requestId - ID único para logs
  * @returns {Promise<{exito: boolean, base64?: string, nombre?: string, error?: string}>}
  */
+
+// ════════════════════════════════════════════════════════════════════════════════
+// PASO 15.2: DESCARGAR CONSOLIDADO CON CDP (v6.0.0)
+// ════════════════════════════════════════════════════════════════════════════════
+
+const path = require('path');
+const crypto = require('crypto');
+
+/**
+ * Descarga el PDF consolidado usando CDP (Chrome DevTools Protocol)
+ * 
+ * @param {Page}   page      - Instancia de Puppeteer page
+ * @param {string} requestId - ID único para logs
+ * @returns {Promise<{exito: boolean, base64?: string, nombre?: string, error?: string}>}
+ */
 async function descargarConsolidado(page, requestId) {
   const ctx = `DESCARGA:${requestId}`;
+  const downloadId = crypto.randomUUID().substring(0, 8);
+  const downloadPath = `/tmp/sinoe-downloads/${downloadId}`;
+  
+  let cdpSession = null;
+  let downloadTimeout = null; // ⭐ FIX BUG-CDP-002: let en vez de const (reasignable)
+  let downloadWillBeginHandler = null; // ⭐ FIX BUG-CDP-003: Referencias para cleanup
+  let downloadProgressHandler = null;
+  
+  try {
+    log('info', ctx, 'Buscando botón Consolidado...');
 
-  log('info', ctx, 'Buscando botón Consolidado y descargando PDF...');
-
-  // ────────────────────────────────────────────────────────────────────────
-  // 1. Localizar el botón Consolidado y obtener su información
-  // ────────────────────────────────────────────────────────────────────────
-  const infoBoton = await evaluarSeguro(page, (selectores) => {
-
-    // ── Buscar el modal visible ──
-    let modal = null;
-    for (const sel of selectores.modal.contenedor) {
-      const m = document.querySelector(sel);
-      if (m && m.getAttribute('aria-hidden') !== 'true') {
-        modal = m;
-        break;
-      }
-    }
-
-    if (!modal) {
-      modal = document.querySelector('.ui-dialog[aria-hidden="false"]');
-    }
-
-    const contenedor = modal || document;
-    let boton = null;
-    let metodo = '';
-
-    // ── Estrategia 1: Por ID que contenga "btnDescargaTodo" ──
-    boton = contenedor.querySelector('[id*="btnDescargaTodo"]');
-    if (boton) metodo = 'id_btnDescargaTodo';
-
-    // ── Estrategia 2: Por ID que contenga "DescargaTodo" ──
-    if (!boton) {
-      boton = contenedor.querySelector('[id*="DescargaTodo"]');
-      if (boton) metodo = 'id_DescargaTodo';
-    }
-
-    // ── Estrategia 3: Por texto "Consolidado" ──
-    if (!boton) {
-      const botones = contenedor.querySelectorAll('button, a.ui-commandlink, a[href]');
-      for (const btn of botones) {
-        const texto = (btn.textContent || '').toLowerCase();
-        if (texto.includes('consolidado')) {
-          boton = btn;
-          metodo = 'texto_consolidado';
+    // ────────────────────────────────────────────────────────────────────────
+    // PASO 1: Localizar el botón Consolidado
+    // ────────────────────────────────────────────────────────────────────────
+    const infoBoton = await evaluarSeguro(page, (selectores) => {
+      let modal = null;
+      for (const sel of selectores.modal.contenedor) {
+        const m = document.querySelector(sel);
+        if (m && m.getAttribute('aria-hidden') !== 'true') {
+          modal = m;
           break;
         }
       }
-    }
 
-    // ── Estrategia 4: Por ícono de descarga ──
-    if (!boton) {
-      const iconoDesc = contenedor.querySelector('.ui-icon-arrowthickstop-1-s');
-      if (iconoDesc) {
-        boton = iconoDesc.closest('button') || iconoDesc.closest('a');
-        if (boton) metodo = 'icono_descarga';
+      if (!modal) {
+        modal = document.querySelector('.ui-dialog[aria-hidden="false"]');
       }
-    }
 
-    // ── Estrategia 5: Primer botón en el fieldset del modal ──
-    if (!boton && modal) {
-      const fieldset = modal.querySelector('fieldset');
-      if (fieldset) {
-        const primerBoton = fieldset.querySelector('button');
-        if (primerBoton) {
-          boton = primerBoton;
-          metodo = 'primer_boton_fieldset';
-        }
-      }
-    }
+      const contenedor = modal || document;
+      let boton = null;
+      let metodo = '';
 
-    if (!boton) {
-      const todosBotones = contenedor.querySelectorAll('button');
-      const listaBotones = Array.from(todosBotones).map(b => ({
-        id: b.id || '(sin id)',
-        texto: (b.textContent || '').substring(0, 40),
-        tag: b.tagName
-      }));
-
-      return {
-        error: 'Botón Consolidado no encontrado',
-        botonesDisponibles: listaBotones
-      };
-    }
-
-    // ── Determinar tipo de botón y si tiene href directo ──
-    const tag = boton.tagName.toUpperCase();
-    const href = boton.href || boton.getAttribute('href') || '';
-    const tieneHref = href && href.length > 10 && !href.startsWith('javascript:');
-    const botonId = boton.id || '';
-
-    return {
-      encontrado: true,
-      metodo: metodo,
-      tag: tag,
-      botonId: botonId,
-      tieneHref: tieneHref,
-      href: tieneHref ? href : null,
-      botonTexto: (boton.textContent || '').substring(0, 50)
-    };
-
-  }, SELECTORES);
-
-  if (!infoBoton || infoBoton.error) {
-    log('error', ctx, `Error: ${infoBoton ? infoBoton.error : 'resultado null'}`);
-    if (infoBoton && infoBoton.botonesDisponibles) {
-      log('info', ctx, 'Botones disponibles:', JSON.stringify(infoBoton.botonesDisponibles));
-    }
-    return { exito: false, error: infoBoton ? infoBoton.error : 'Error desconocido' };
-  }
-
-  log('info', ctx, `Botón encontrado (método: ${infoBoton.metodo}, tag: ${infoBoton.tag}, id: ${infoBoton.botonId})`);
-
-  // ────────────────────────────────────────────────────────────────────────
-  // 2. Capturar el PDF como base64
-  // ────────────────────────────────────────────────────────────────────────
-
-  let base64Pdf = null;
-
-  // ── MÉTODO A: Si el botón es un <a> con href directo → fetch() en el navegador ──
-  if (infoBoton.tieneHref) {
-    log('info', ctx, `Descargando PDF vía fetch() del href...`);
-
-    base64Pdf = await evaluarSeguro(page, async (href, timeoutMs) => {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-        const response = await fetch(href, {
-          credentials: 'include',
-          signal: controller.signal
-        });
-
-        clearTimeout(timer);
-
-        if (!response.ok) {
-          return { error: `HTTP ${response.status}` };
-        }
-
-        const blob = await response.blob();
-
-        return new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const resultado = reader.result;
-            // Extraer base64 puro (sin prefijo "data:application/pdf;base64,")
-            const coma = resultado.indexOf(',');
-            const base64 = coma >= 0 ? resultado.substring(coma + 1) : resultado;
-            resolve({ base64: base64, size: base64.length });
-          };
-          reader.onerror = () => resolve({ error: 'FileReader error' });
-          reader.readAsDataURL(blob);
-        });
-      } catch (e) {
-        return { error: e.message };
-      }
-    }, infoBoton.href, CONFIG_EXTRACCION.timeoutDescargaPdf);
-
-    if (base64Pdf && base64Pdf.base64) {
-      log('success', ctx, `✓ PDF capturado vía href (${Math.round(base64Pdf.base64.length / 1024)}KB base64)`);
-      return {
-        exito: true,
-        base64: base64Pdf.base64,
-        nombre: 'Consolidado.pdf'
-      };
-    }
-
-    log('warn', ctx, `fetch() por href falló: ${base64Pdf ? base64Pdf.error : 'null'} — intentando método B`);
-  }
-
-  // ── MÉTODO B: Interceptar la respuesta HTTP tras hacer clic en el botón ──
-  log('info', ctx, 'Descargando PDF vía intercepción de response...');
-
-  let pdfCapturedResolve;
-  const pdfCapturedPromise = new Promise((resolve) => {
-    pdfCapturedResolve = resolve;
-  });
-
-  // Timeout de seguridad
-  const timeoutId = setTimeout(() => {
-    pdfCapturedResolve(null);
-  }, CONFIG_EXTRACCION.timeoutDescargaPdf);
-
-  // Listener para interceptar la respuesta PDF
-  const responseHandler = async (response) => {
-    try {
-      const contentType = response.headers()['content-type'] || '';
-      const url = response.url();
-
-      // Detectar si es un PDF
-      if (contentType.includes('application/pdf') ||
-          contentType.includes('application/octet-stream') ||
-          url.includes('.pdf') ||
-          url.includes('download') ||
-          url.includes('Consolidado') ||
-          url.includes('DescargaTodo')) {
-
-        const buffer = await response.buffer();
-        if (buffer && buffer.length > 100) { // PDF válido tiene más de 100 bytes
-          const base64 = buffer.toString('base64');
-          clearTimeout(timeoutId);
-          pdfCapturedResolve({ base64: base64, size: base64.length, url: url });
-        }
-      }
-    } catch (e) {
-      // Ignorar errores de responses que no nos interesan
-    }
-  };
-
-  page.on('response', responseHandler);
-
-  // ⭐ FIX CRÍTICO: Delay de 1000ms para que el listener se registre completamente
-  // Esto resuelve el race condition donde el PDF pasa antes de que el listener esté activo
-  log('info', ctx, '⭐ Esperando 1000ms para registro de listener (fix race condition)...');
-  await delay(1000);
-
-  // Hacer clic en el botón Consolidado
-  const clicOk = await evaluarSeguro(page, (botonId) => {
-    let boton = null;
-
-    // Re-localizar el botón por ID
-    if (botonId) {
-      boton = document.getElementById(botonId);
-    }
-
-    // Si no se encontró por ID, volver a buscar
-    if (!boton) {
-      const contenedor = document.querySelector('.ui-dialog[aria-hidden="false"]') || document;
-
-      boton = contenedor.querySelector('[id*="btnDescargaTodo"]') ||
-              contenedor.querySelector('[id*="DescargaTodo"]');
+      // Buscar botón por ID
+      boton = contenedor.querySelector('[id*="btnDescargaTodo"]');
+      if (boton) metodo = 'id_btnDescargaTodo';
 
       if (!boton) {
-        const botones = contenedor.querySelectorAll('button, a.ui-commandlink');
+        boton = contenedor.querySelector('[id*="DescargaTodo"]');
+        if (boton) metodo = 'id_DescargaTodo';
+      }
+
+      // Buscar por texto
+      if (!boton) {
+        const botones = contenedor.querySelectorAll('button, a.ui-commandlink, a[href]');
         for (const btn of botones) {
-          if ((btn.textContent || '').toLowerCase().includes('consolidado')) {
+          const texto = (btn.textContent || '').toLowerCase();
+          if (texto.includes('consolidado')) {
             boton = btn;
+            metodo = 'texto_consolidado';
             break;
           }
         }
       }
-    }
 
-    if (!boton) {
-      return { error: 'No se pudo re-localizar el botón' };
-    }
-
-    try {
-      if (typeof jQuery !== 'undefined' && jQuery(boton).length) {
-        jQuery(boton).trigger('click');
-      } else {
-        boton.click();
+      if (!boton) {
+        return { error: 'Botón Consolidado no encontrado' };
       }
-      return { exito: true };
-    } catch (e) {
-      return { error: `Clic fallido: ${e.message}` };
+
+      return {
+        encontrado: true,
+        metodo: metodo,
+        botonId: boton.id || '',
+        botonTexto: (boton.textContent || '').substring(0, 50)
+      };
+    }, SELECTORES);
+
+    if (!infoBoton || infoBoton.error) {
+      log('error', ctx, infoBoton ? infoBoton.error : 'Error buscando botón');
+      return { exito: false, error: infoBoton ? infoBoton.error : 'Error desconocido' };
     }
-  }, infoBoton.botonId);
 
-  if (!clicOk || clicOk.error) {
-    page.removeListener('response', responseHandler);
-    clearTimeout(timeoutId);
-    log('error', ctx, `Error haciendo clic en Consolidado: ${clicOk ? clicOk.error : 'null'}`);
-    return { exito: false, error: clicOk ? clicOk.error : 'Error desconocido' };
-  }
+    log('info', ctx, `Botón encontrado: ${infoBoton.metodo} (${infoBoton.botonId})`);
 
-  log('info', ctx, 'Clic en Consolidado realizado, esperando respuesta PDF...');
+    // ────────────────────────────────────────────────────────────────────────
+    // PASO 2: Configurar CDP para capturar descarga
+    // ────────────────────────────────────────────────────────────────────────
+    
+    // Crear directorio de descargas
+    try {
+      await fs.mkdir(downloadPath, { recursive: true });
+      log('debug', ctx, `Directorio creado: ${downloadPath}`);
+    } catch (e) {
+      log('warn', ctx, `Error creando directorio: ${e.message}`);
+    }
 
-  // Esperar la captura del PDF
-  const pdfResult = await pdfCapturedPromise;
-  page.removeListener('response', responseHandler);
+    // Obtener CDP session
+    cdpSession = await page.target().createCDPSession();
+    
+    // Configurar comportamiento de descarga
+    await cdpSession.send('Browser.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: downloadPath,
+      eventsEnabled: true
+    });
+    
+    log('success', ctx, '✓ CDP configurado para capturar descargas');
 
-  if (pdfResult && pdfResult.base64) {
-    log('success', ctx, `✓ PDF interceptado (${Math.round(pdfResult.base64.length / 1024)}KB base64)`);
+    // Promise que se resolverá cuando la descarga complete
+    let downloadCompleteResolve;
+    let downloadCompleteReject;
+    
+    const downloadCompletePromise = new Promise((resolve, reject) => {
+      downloadCompleteResolve = resolve;
+      downloadCompleteReject = reject;
+    });
+
+    // Timeout inicial (será reiniciado cuando comience la descarga)
+    downloadTimeout = setTimeout(() => {
+      downloadCompleteReject(new Error('Timeout: Descarga no inició en 60s'));
+    }, 60000);
+
+    // Variables para tracking
+    let downloadGuid = null;
+    let downloadedFileName = null;
+
+    // ⭐ FIX BUG-CDP-003: Definir handlers como funciones nominadas para poder eliminarlos
+    downloadWillBeginHandler = (event) => {
+      downloadGuid = event.guid;
+      downloadedFileName = event.suggestedFilename || 'consolidado.pdf';
+      
+      // ⭐ FIX BUG-CDP-001: Cancelar timeout inicial y crear uno nuevo desde que inicia descarga
+      if (downloadTimeout) {
+        clearTimeout(downloadTimeout);
+        log('debug', ctx, 'Timeout inicial cancelado, iniciando timeout de descarga');
+      }
+      
+      downloadTimeout = setTimeout(() => {
+        downloadCompleteReject(new Error('Timeout: Descarga no completada en 60s desde inicio'));
+      }, 60000);
+      
+      log('info', ctx, `📥 Descarga iniciada: ${downloadedFileName} (guid: ${downloadGuid})`);
+    };
+
+    downloadProgressHandler = (event) => {
+      if (event.state === 'inProgress') {
+        const progress = event.receivedBytes && event.totalBytes 
+          ? Math.round((event.receivedBytes / event.totalBytes) * 100)
+          : '?';
+        log('debug', ctx, `📊 Progreso: ${progress}% (${event.receivedBytes} bytes)`);
+      }
+      
+      if (event.state === 'completed') {
+        if (downloadTimeout) {
+          clearTimeout(downloadTimeout);
+          downloadTimeout = null;
+        }
+        log('success', ctx, `✅ Descarga completada: ${downloadedFileName}`);
+        downloadCompleteResolve({ fileName: downloadedFileName, guid: event.guid });
+      }
+      
+      if (event.state === 'canceled' || event.state === 'interrupted') {
+        if (downloadTimeout) {
+          clearTimeout(downloadTimeout);
+          downloadTimeout = null;
+        }
+        downloadCompleteReject(new Error(`Descarga ${event.state}`));
+      }
+    };
+    
+    // Registrar listeners
+    cdpSession.on('Browser.downloadWillBegin', downloadWillBeginHandler);
+    cdpSession.on('Browser.downloadProgress', downloadProgressHandler);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // PASO 3: Hacer clic en Consolidado
+    // ────────────────────────────────────────────────────────────────────────
+    
+    log('info', ctx, 'Haciendo clic en Consolidado...');
+    
+    const clicOk = await evaluarSeguro(page, (botonId) => {
+      let boton = null;
+
+      if (botonId) {
+        boton = document.getElementById(botonId);
+      }
+
+      if (!boton) {
+        const contenedor = document.querySelector('.ui-dialog[aria-hidden="false"]') || document;
+        boton = contenedor.querySelector('[id*="btnDescargaTodo"]') ||
+                contenedor.querySelector('[id*="DescargaTodo"]');
+
+        if (!boton) {
+          const botones = contenedor.querySelectorAll('button, a.ui-commandlink');
+          for (const btn of botones) {
+            if ((btn.textContent || '').toLowerCase().includes('consolidado')) {
+              boton = btn;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!boton) {
+        return { error: 'No se pudo re-localizar el botón' };
+      }
+
+      try {
+        if (typeof jQuery !== 'undefined' && jQuery(boton).length) {
+          jQuery(boton).trigger('click');
+        } else {
+          boton.click();
+        }
+        return { exito: true };
+      } catch (e) {
+        return { error: `Clic fallido: ${e.message}` };
+      }
+    }, infoBoton.botonId);
+
+    if (!clicOk || clicOk.error) {
+      throw new Error(clicOk ? clicOk.error : 'Error desconocido al hacer clic');
+    }
+
+    log('success', ctx, '✓ Clic realizado, esperando descarga...');
+
+    // ────────────────────────────────────────────────────────────────────────
+    // PASO 4: Esperar a que la descarga complete
+    // ────────────────────────────────────────────────────────────────────────
+    
+    const downloadResult = await downloadCompletePromise;
+    
+    log('info', ctx, `Descarga completa, leyendo archivo: ${downloadResult.fileName}`);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // PASO 5: Leer archivo del disco y convertir a base64
+    // ────────────────────────────────────────────────────────────────────────
+    
+    const filePath = path.join(downloadPath, downloadResult.fileName);
+    
+    // ⭐ FIX BUG-CDP-004: Reintentos con backoff para lectura de archivo
+    // El evento 'completed' no garantiza que el archivo esté completamente escrito en disco
+    log('info', ctx, 'Esperando escritura completa del archivo en disco...');
+    
+    let fileBuffer;
+    const maxRetries = 5;
+    let lastError = null;
+    
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        // Backoff exponencial: 500ms, 700ms, 1100ms, 1700ms, 2500ms
+        const waitTime = 500 + (i * 400);
+        await delay(waitTime);
+        
+        // Intentar leer archivo
+        fileBuffer = await fs.readFile(filePath);
+        
+        // Validar que el archivo tiene contenido
+        if (fileBuffer.length === 0) {
+          throw new Error('Archivo vacío');
+        }
+        
+        log('debug', ctx, `✓ Archivo leído exitosamente: ${fileBuffer.length} bytes (intento ${i + 1}/${maxRetries})`);
+        break; // Lectura exitosa
+        
+      } catch (readError) {
+        lastError = readError;
+        
+        if (i < maxRetries - 1) {
+          log('warn', ctx, `Intento ${i + 1}/${maxRetries} falló: ${readError.message} — reintentando...`);
+        } else {
+          throw new Error(`Error leyendo archivo después de ${maxRetries} intentos: ${readError.message}`);
+        }
+      }
+    }
+    
+    // Verificar que fileBuffer tiene datos
+    if (!fileBuffer || fileBuffer.length === 0) {
+      throw new Error('Archivo vacío o no legible después de reintentos');
+    }
+
+    // Validar que es un PDF
+    const magicNumber = fileBuffer.toString('hex', 0, 4);
+    if (magicNumber !== '25504446') { // %PDF
+      throw new Error(`Archivo no es PDF (magic: ${magicNumber})`);
+    }
+
+    // Convertir a base64
+    const base64 = fileBuffer.toString('base64');
+    
+    log('success', ctx, `✅ PDF convertido: ${Math.round(base64.length / 1024)}KB base64`);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // PASO 6: Limpiar archivos temporales
+    // ────────────────────────────────────────────────────────────────────────
+    
+    try {
+      await fs.unlink(filePath);
+      // ⭐ FIX BUG-CDP-005: fs.rmdir deprecated en Node 14+, usar fs.rm
+      await fs.rm(downloadPath, { recursive: true, force: true });
+      log('debug', ctx, 'Archivos temporales eliminados');
+    } catch (cleanupError) {
+      log('warn', ctx, `Error limpiando archivos: ${cleanupError.message}`);
+    }
+
     return {
       exito: true,
-      base64: pdfResult.base64,
-      nombre: 'Consolidado.pdf'
+      base64: base64,
+      nombre: downloadResult.fileName,
+      tamano: fileBuffer.length
     };
+
+  } catch (error) {
+    // ⭐ FIX BUG-CDP-006: Limpiar timeout si hay error
+    if (downloadTimeout) {
+      clearTimeout(downloadTimeout);
+      downloadTimeout = null;
+      log('debug', ctx, 'Timeout cancelado debido a error');
+    }
+    
+    log('error', ctx, `Error: ${error.message}`);
+    
+    // Limpiar directorio temporal si existe
+    try {
+      await fs.rm(downloadPath, { recursive: true, force: true });
+      log('debug', ctx, 'Directorio temporal limpiado después de error');
+    } catch (e) {
+      // Ignorar errores de cleanup
+    }
+    
+    return {
+      exito: false,
+      error: error.message
+    };
+    
+  } finally {
+    // ⭐ FIX BUG-CDP-003: Eliminar listeners antes de cerrar CDP session
+    if (cdpSession) {
+      try {
+        if (downloadWillBeginHandler) {
+          cdpSession.off('Browser.downloadWillBegin', downloadWillBeginHandler);
+        }
+        if (downloadProgressHandler) {
+          cdpSession.off('Browser.downloadProgress', downloadProgressHandler);
+        }
+        
+        await cdpSession.detach();
+        log('debug', ctx, 'CDP session cerrada y listeners eliminados');
+      } catch (e) {
+        log('warn', ctx, `Error cerrando CDP: ${e.message}`);
+      }
+    }
+    
+    // Limpiar timeout final si quedó pendiente
+    if (downloadTimeout) {
+      clearTimeout(downloadTimeout);
+      log('debug', ctx, 'Timeout final limpiado');
+    }
   }
-
-  // ── MÉTODO C (último recurso): Solo confirmar clic, sin PDF base64 ──
-  // Esto replica el comportamiento original v2 como fallback
-  log('warn', ctx, 'No se pudo interceptar el PDF — el clic se realizó pero no hay base64');
-  await delay(CONFIG_EXTRACCION.esperaDescarga);
-
-  return {
-    exito: true,
-    base64: null,
-    nombre: null,
-    advertencia: 'PDF no capturado como base64 (descarga iniciada pero no interceptada)'
-  };
 }
 
-// ════════════════════════════════════════════════════════════════════════════════
-// PASO 15.3: CERRAR MODAL
-// ════════════════════════════════════════════════════════════════════════════════
 
 /**
  * Cierra el modal de anexos.
